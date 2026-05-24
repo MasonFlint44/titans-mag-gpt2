@@ -4046,10 +4046,10 @@ correctness-critical decision the audit found.
 | ✓ NS5 explicitly disables autocast — `G @ G.mT` runs fp32 (NOT bf16) under ambient autocast scope | 1.6 | G226 |
 | Consolidated try/finally block uses CONSISTENT 4-space indentation (not mixed 2-2-4) | 4.5 | G227 |
 | ✓ `step()` T-token sequential matches reference manual loop | 1.7 | step semantics |
-| `_forward_chunk_sequential` ≠ T-many `step()` calls (conv sees full chunk) | 1.8 | G154 |
-| `_forward_chunk_sequential` precomputes per-t boundary mask on CPU (no per-token GPU sync) | 1.8 | G202 |
-| `_forward_chunk_sequential` lazy-builds `init_M` only when a doc boundary fires | 1.8 | G211 |
-| NMM memorizes single key→value pair (overfit) | 1.8 | end-to-end correctness |
+| ✓ `_forward_chunk_sequential` ≠ T-many `step()` calls (conv sees full chunk) | 1.8 | G154 |
+| ✓ `_forward_chunk_sequential` precomputes per-t boundary mask on CPU (no per-token GPU sync) | 1.8 | G202 |
+| ✓ `_forward_chunk_sequential` lazy-builds `init_M` only when a doc boundary fires | 1.8 | G211 |
+| ✓ NMM memorizes single key→value pair (overfit) | 1.8 | end-to-end correctness |
 | ✓ reset_state on doc boundaries leaves unmasked entries byte-identical | 1.9 | G149 |
 | ✓ detach_states handles `None` (first-step case) | 1.9 | G149 |
 | CausalSelfAttention with `_aug_mask(T)` produces correct persistent/causal pattern | 2.0 | attention mask |

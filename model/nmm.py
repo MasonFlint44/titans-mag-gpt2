@@ -337,3 +337,85 @@ class NeuralMemoryModule(nn.Module):
         # Write-then-read: query the freshly-updated M_t.
         y_t = self.out_scale * self._batched_retrieve(M_t, q_hat)
         return y_t, (M_t, S_t)
+
+    def _forward_chunk_sequential(
+        self,
+        x_chunk: torch.Tensor,
+        state_in: tuple,
+        doc_boundaries,
+    ) -> tuple:
+        """Training-path chunked forward: pre-project the full chunk, then loop
+        only over the recurrent state update.
+
+        Per-token step() in a training loop would feed the conv a 1-token
+        window (3 of 4 kernel weights dead). The pre-projection here lets
+        the conv see up-to-k tokens of causal context for every output.
+
+        Two performance/memory guards:
+        - init_M is lazy-built only when a doc boundary actually fires
+          (zero-cost on the common no-boundary chunk).
+        - The per-position "any boundary?" mask is computed once on CPU
+          to avoid T implicit GPU->CPU syncs from `tensor.any()` inside
+          a Python `if`.
+        """
+        if self.nmm_spectral_norm != self._spectral_norm_at_init:
+            raise RuntimeError(
+                "nmm_spectral_norm was mutated after construction "
+                f"(init={self._spectral_norm_at_init}, "
+                f"now={self.nmm_spectral_norm}). The cached "
+                "per_sample_grad_fn's reduction is locked at __init__; "
+                "rebuild the module to change spectral_norm."
+            )
+
+        B, T, _ = x_chunk.shape
+        # Full-chunk projection — conv sees up-to-k tokens per output.
+        k_hat_chunk = F.normalize(F.silu(self.k_proj(x_chunk)), dim=-1)
+        q_hat_chunk = F.normalize(F.silu(self.q_proj(x_chunk)), dim=-1)
+        v_chunk = F.silu(self.v_proj(x_chunk))
+        theta_chunk = torch.sigmoid(self.W_theta(x_chunk)).squeeze(-1)
+        eta_chunk = torch.sigmoid(self.W_eta(x_chunk)).squeeze(-1)
+        alpha_chunk = torch.sigmoid(self.W_alpha(x_chunk)).squeeze(-1)
+
+        # Lazy: don't allocate init_M unless a boundary fires.
+        init_M = None
+        M, S = state_in
+        y_list = []
+
+        # CPU-side per-position boundary mask — avoids T GPU<->CPU syncs.
+        if doc_boundaries is not None:
+            any_boundary_per_t = doc_boundaries.any(dim=0).cpu().tolist()
+        else:
+            any_boundary_per_t = [False] * T
+
+        for t in range(T):
+            if any_boundary_per_t[t]:
+                if init_M is None:
+                    init_M = self._build_init_M(B, x_chunk.device)
+                M, S = reset_state((M, S), doc_boundaries[:, t], init_M)
+
+            k_hat_t = k_hat_chunk[:, t, :]
+            q_hat_t = q_hat_chunk[:, t, :]
+            v_t = v_chunk[:, t, :]
+            theta_t = theta_chunk[:, t]
+            eta_t = eta_chunk[:, t]
+            alpha_t = alpha_chunk[:, t]
+
+            g_t = self.per_sample_grad_fn(M, k_hat_t, v_t)
+            if self.nmm_spectral_norm:
+                g_tilde = {key: newton_schulz5(g) for key, g in g_t.items()}
+            else:
+                g_tilde = g_t
+
+            S = _dict_sub(_scale(eta_t, S), _scale(theta_t, g_tilde))
+            M = _dict_add(_scale(1.0 - alpha_t, M), S)
+
+            y_t = self.out_scale * self._batched_retrieve(M, q_hat_t)
+            y_list.append(y_t)
+
+        y_chunk = torch.stack(y_list, dim=1)
+        return y_chunk, (M, S)
+
+    def forward_chunk(self, x_chunk, state_in, doc_boundaries):
+        """Thin wrapper around _forward_chunk_sequential. Phase 6 replaces
+        this with a dispatcher that selects between scan and sequential."""
+        return self._forward_chunk_sequential(x_chunk, state_in, doc_boundaries)
