@@ -355,6 +355,18 @@ def run_training(
     NCCL teardown (try/finally with destroy_process_group, G225/G227) lives
     in the entry-point script that wraps this call, not here — keeps this
     function single-purpose and reusable from notebooks / tests.
+
+    Training continues until `step >= max_steps`. When the loader exhausts
+    mid-training (max_steps > batches-per-epoch), the iterator is rebuilt
+    and iteration continues — matching PLAN.md §4.5's
+    `for epoch in range(N_EPOCHS):` structure. Without this, small corpora
+    silently early-stop after one pass and the user sees max_steps not
+    reached with no error.
+
+    On a partial cycle at corpus end under DDP, we discard the cycle's
+    accumulated grads and end training — re-iterating mid-cycle would
+    re-process the same micro-batches across ranks asymmetrically and
+    drift them.
     """
     import contextlib
 
@@ -375,8 +387,18 @@ def run_training(
                 batch = None
 
             if batch is None and accum_i == 0:
-                # Loader exhausted exactly at cycle boundary; clean stop.
-                return
+                # Loader exhausted exactly at cycle boundary. If we still
+                # have steps left, restart the iterator (next epoch); reset
+                # nmm_states since the new pass through the corpus is a
+                # fresh context. Returning here would be the silent-early-
+                # stop bug.
+                micro_batches = iter(loader)
+                nmm_states = None
+                try:
+                    batch = next(micro_batches)
+                except StopIteration:
+                    # Empty loader — nothing to do; stop.
+                    return
 
             if is_partial_cycle(batch, accum_i):
                 # G214/G222: under DDP, this cycle's micro-batches ran with

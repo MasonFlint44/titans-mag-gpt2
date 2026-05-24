@@ -87,6 +87,52 @@ def test_run_training_with_grad_accum_single_gpu():
     )
 
 
+def test_run_training_restarts_loader_on_exhaustion_to_reach_max_steps():
+    """The naive single-iter(loader) outside the while loop silently early-stops
+    when max_steps > batches-per-epoch on a small corpus. PLAN.md §4.5 wraps
+    in `for epoch in range(N_EPOCHS):` — verify run_training does the equivalent
+    by restarting the iterator on StopIteration."""
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=8, vocab_size=32,
+        block_size=64, chunk_size=4, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=2,
+        finetune_mode=False,
+    )
+    from model.titans_gpt2 import TitansMAGGPT2
+    model = TitansMAGGPT2(cfg)
+    optimizer = build_optimizer(model)
+    torch.manual_seed(0)
+    # Small corpus: 4 streams × 4 chunks each = 16 batches/epoch.
+    stream = torch.randint(0, cfg.vocab_size, (4 * 4 * 4,))  # 64 tokens
+    loader = ParallelStreamLoader(
+        stream, batch_size=4, chunk_size=4, eot_id=50256,
+    )
+    assert len(loader) == 4  # batches per epoch
+
+    # Count actual model.forward calls to verify multiple epochs ran.
+    call_count = {"n": 0}
+    orig = model.forward
+
+    def counting(*a, **kw):
+        call_count["n"] += 1
+        return orig(*a, **kw)
+
+    model.forward = counting
+
+    # max_steps = 10 > 4 batches/epoch. With the bug, run_training would stop
+    # after ~4 calls; with the fix, it runs to 10.
+    run_training(
+        model=model, optimizer=optimizer, loader=loader,
+        device=torch.device("cpu"),
+        max_steps=10, warmup_steps=2,
+        log_every=1000,  # silence
+    )
+    assert call_count["n"] == 10, (
+        f"expected 10 forward calls (max_steps), got {call_count['n']} — "
+        f"loader exhausted at 4 batches; iter restart missing?"
+    )
+
+
 def test_run_training_advances_params():
     """A successful loop must change at least one param."""
     cfg, model, opt, loader = _tiny_setup_with_loader()
