@@ -4098,11 +4098,11 @@ correctness-critical decision the audit found.
 | ✓ Resume sequence ends with `model.train()` (defense against prior eval-mode code) | 4.3 | G221 |
 | ✓ `torch.load(..., weights_only=False)` succeeds on saved checkpoint | 4.3 | G168 |
 | ✓ `compute_nmm_norm(None) is None`; non-None returns one float per layer | 4.3 | G172 |
-| `generate` chunks prompts > block_size (full prompt seen by NMM) | 5.1 | G176 |
-| `generate` applies temperature, then top_k, THEN softmax | 5.1 | G173 |
-| `generate(model, prompt, tokenizer=tok)` reuses caller's tokenizer instance | 5.1 | G208 |
-| `generate` / `perplexity` restore `model.training` post-exit (try/finally) | 5.1, 5.2 | G161 |
-| Perplexity baseline within 5% of HF GPT-2 (NMM zeroed, eval mode + no_grad) | 5.2 | G156 |
+| ✓ `generate` chunks prompts > block_size (full prompt seen by NMM) | 5.1 | G176 |
+| ✓ `generate` applies temperature, then top_k, THEN softmax | 5.1 | G173 |
+| ✓ `generate(model, prompt, tokenizer=tok)` reuses caller's tokenizer instance | 5.1 | G208 |
+| ✓ `generate` / `perplexity` restore `model.training` post-exit (try/finally) | 5.1, 5.2 | G161 |
+| ✓ Perplexity baseline within 5% of HF GPT-2 (NMM zeroed, eval mode + no_grad) | 5.2 | G156 |
 | Scan path output matches sequential to <5% relative error | 6.1 | scan approximation |
 | Scan dispatcher gates on `torch.is_grad_enabled()` (NOT `self.training`) | 6.2 | G164 |
 | `_HAS_ASSOC_SCAN` resolves via documented or private import path; both succeed | 6.2 | G215 |
