@@ -472,13 +472,21 @@ def run_training(
             )
 
         if (
-            rank == 0
-            and save_every is not None
+            save_every is not None
             and save_path is not None
             and step > 0
             and step % save_every == 0
         ):
-            save_checkpoint(save_path, model, optimizer, step, config)
+            # G199: rank 0 owns the write; all ranks barrier afterwards so
+            # the non-rank-0 processes don't race into the next iteration
+            # while rank 0 is still flushing to disk. Without the barrier,
+            # rank 0 falls behind on the next all-reduce and the timeout
+            # eventually fires on large checkpoints (1.5B-XL ~ 6 GB).
+            if rank == 0:
+                save_checkpoint(save_path, model, optimizer, step, config)
+            if is_distributed:
+                import torch.distributed as dist
+                dist.barrier()
 
         step += 1
         if not cycle_completed:

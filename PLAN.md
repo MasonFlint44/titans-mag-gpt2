@@ -4081,7 +4081,7 @@ correctness-critical decision the audit found.
 | ✓ `apply_lr` scales all 4 param groups; preserves 1:1:3:3 ratio | 4.3 | G157 |
 | ✓ `apply_lr` respects user-supplied `max_steps`/`warmup_steps` (NOT defaults) | 4.3 | G175 |
 | ✓ `base_lrs` constants survive `optimizer.load_state_dict` deflation | 4.3 | G162 |
-| DDP-aware checkpoint save fires only on rank 0; barrier follows | 4.3, 4.5 | G199 (ddp-marked) |
+| ✓ DDP-aware checkpoint save fires only on rank 0; barrier follows | 4.3, 4.5 | G199 (structural test; ddp runtime untested) |
 | Consolidated loop wraps with DDP after `.to(device)`, before optimizer | 4.5 | G201 (ddp-marked) |
 | `init_process_group` called once before DDP wrap; `destroy_process_group` at end | 4.5 | G201 (ddp-marked) |
 | Per-rank seed differs after model construction (dropout masks diverge) | 4.5 | G204 (ddp-marked) |
