@@ -4077,10 +4077,10 @@ correctness-critical decision the audit found.
 | ✓ Injected `loss = loss + nan` does NOT corrupt parameters | 4.2 | G158 |
 | ✓ NaN-skip resets `nmm_states` to None (caller's next call re-initializes) | 4.2 | G213 |
 | NaN-skip in accumulation block also resets `nmm_states` to None | 4.5 | G217 |
-| bf16 autocast: backward + clip + step run in fp32 | 4.2 | G159 |
-| `apply_lr` scales all 4 param groups; preserves 1:1:3:3 ratio | 4.3 | G157 |
-| `apply_lr` respects user-supplied `max_steps`/`warmup_steps` (NOT defaults) | 4.3 | G175 |
-| `base_lrs` constants survive `optimizer.load_state_dict` deflation | 4.3 | G162 |
+| ✓ bf16 autocast: backward + clip + step run in fp32 | 4.2 | G159 |
+| ✓ `apply_lr` scales all 4 param groups; preserves 1:1:3:3 ratio | 4.3 | G157 |
+| ✓ `apply_lr` respects user-supplied `max_steps`/`warmup_steps` (NOT defaults) | 4.3 | G175 |
+| ✓ `base_lrs` constants survive `optimizer.load_state_dict` deflation | 4.3 | G162 |
 | DDP-aware checkpoint save fires only on rank 0; barrier follows | 4.3, 4.5 | G199 |
 | Consolidated loop wraps with DDP after `.to(device)`, before optimizer | 4.5 | G201 |
 | `init_process_group` called once before DDP wrap; `destroy_process_group` at end | 4.5 | G201 |
@@ -4093,11 +4093,11 @@ correctness-critical decision the audit found.
 | Training loop wrapped in try/finally; `destroy_process_group` runs on exception path | 4.5 | G225 |
 | Consolidated loop builds `config` BEFORE the loader references `config.chunk_size` | 4.5 | G205 |
 | Resume sequence wraps DDP after `load_state_dict` and before optimizer build | 4.3 | G209 |
-| Checkpoint save/load round-trip: state_dict + optimizer state populated post-resume | 4.3 | G153 / G134 / G168 |
-| Resume from HF-init checkpoint (no 'optimizer' key) does not raise KeyError | 4.3 | G219 |
-| Resume sequence ends with `model.train()` (defense against prior eval-mode code) | 4.3 | G221 |
-| `torch.load(..., weights_only=False)` succeeds on saved checkpoint | 4.3 | G168 |
-| `compute_nmm_norm(None) is None`; non-None returns one float per layer | 4.3 | G172 |
+| ✓ Checkpoint save/load round-trip: state_dict + optimizer state populated post-resume | 4.3 | G153 / G134 / G168 |
+| ✓ Resume from HF-init checkpoint (no 'optimizer' key) does not raise KeyError | 4.3 | G219 |
+| ✓ Resume sequence ends with `model.train()` (defense against prior eval-mode code) | 4.3 | G221 |
+| ✓ `torch.load(..., weights_only=False)` succeeds on saved checkpoint | 4.3 | G168 |
+| ✓ `compute_nmm_norm(None) is None`; non-None returns one float per layer | 4.3 | G172 |
 | `generate` chunks prompts > block_size (full prompt seen by NMM) | 5.1 | G176 |
 | `generate` applies temperature, then top_k, THEN softmax | 5.1 | G173 |
 | `generate(model, prompt, tokenizer=tok)` reuses caller's tokenizer instance | 5.1 | G208 |

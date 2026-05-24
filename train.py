@@ -1,5 +1,8 @@
 """Consolidated training driver (fine-tune and from-scratch entry points)."""
 
+import dataclasses
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -150,3 +153,136 @@ def train_step(
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
     return loss.item(), nmm_states, grad_norm.item()
+
+
+# ---------------------------------------------------------------------------
+# 4.3 — LR schedule, NMM-norm logging, checkpoint helpers
+# ---------------------------------------------------------------------------
+
+def get_lr_multiplier(
+    step: int,
+    warmup_steps: int = 1000,
+    max_steps: int = 100_000,
+    min_ratio: float = 0.1,
+) -> float:
+    """Linear warmup then cosine decay to `min_ratio * peak`.
+
+    Returns a scalar in [min_ratio, 1.0]. Caller multiplies each
+    param_group's base LR by this.
+
+    Validates max_steps > warmup_steps (G197). max_steps == warmup_steps
+    yields a degenerate zero-length cosine; max_steps < warmup_steps lets
+    the warmup branch fire past max_steps and never decay. Both are silent
+    miscalibrations — raise loudly instead.
+    """
+    if max_steps <= warmup_steps:
+        raise ValueError(
+            f"max_steps ({max_steps}) must be > warmup_steps ({warmup_steps}). "
+            f"For a warmup-only schedule with no decay, set min_ratio=1.0 and "
+            f"max_steps just beyond your intended training duration."
+        )
+    if step < warmup_steps:
+        return step / warmup_steps
+    if step >= max_steps:
+        return min_ratio
+    progress = (step - warmup_steps) / (max_steps - warmup_steps)
+    return min_ratio + (1.0 - min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+
+
+def apply_lr(
+    optimizer: AdamW,
+    base_lrs: list,
+    step: int,
+    warmup_steps: int,
+    max_steps: int,
+    min_ratio: float = 0.1,
+) -> float:
+    """Scale every param_group's LR by the schedule multiplier. Preserves the
+    1:1:3:3 gpt2/nmm LR ratio across groups (G157) — naive single-group or
+    uniform-clobber updates would either skip groups or destroy the ratio.
+
+    `base_lrs` MUST come from code-level constants (G162), never from
+    `optimizer.param_groups[i]['lr']` after `load_state_dict` — that path
+    captures the mid-cosine deflated value and compounds the deflation
+    every resume.
+
+    `warmup_steps` and `max_steps` are required positional args (no
+    defaults) so the caller cannot silently inherit the 1k/100k schedule
+    when running a 200-step overfit (G175).
+    """
+    lr_mul = get_lr_multiplier(
+        step,
+        warmup_steps=warmup_steps,
+        max_steps=max_steps,
+        min_ratio=min_ratio,
+    )
+    for g, base_lr in zip(optimizer.param_groups, base_lrs):
+        g["lr"] = base_lr * lr_mul
+    return lr_mul
+
+
+def base_lrs_from_constants() -> list:
+    """The canonical base_lrs derivation: from code constants, matching the
+    4-group order in build_optimizer (gpt2_decay, gpt2_no_decay, nmm_decay,
+    nmm_no_decay). Resume-safe by construction (G162)."""
+    return [BASE_LR_GPT2, BASE_LR_GPT2, BASE_LR_NMM, BASE_LR_NMM]
+
+
+def compute_nmm_norm(nmm_states) -> list:
+    """Per-layer ||M||_F (treating W1/W_gate/W2 as one block), averaged across
+    batch. Returns None if states is None (first-step case, G172)."""
+    if nmm_states is None:
+        return None
+    out = []
+    for M, _S in nmm_states:
+        sq_sum = sum((v.float() ** 2).sum(dim=(-2, -1)) for v in M.values())  # [B]
+        out.append(sq_sum.sqrt().mean().detach().item())
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint save / load
+# ---------------------------------------------------------------------------
+
+def save_checkpoint(
+    path,
+    model: nn.Module,
+    optimizer: AdamW,
+    step: int,
+    config,
+) -> None:
+    """Save model state_dict + optimizer state + step + config to a single file.
+
+    config is required (not optional): finetune_mode controls block structure
+    (gamma_attn presence, out_scale init), so resume needs it to rebuild the
+    same model topology. Without saving it, the resume code can't tell which
+    structure to construct, producing state_dict mismatch errors or silently-
+    wrong inits.
+
+    NMM states are intentionally NOT saved — they're per-sequence
+    accumulators, not model state. Resume re-initializes from
+    memory_mlp.W*.weight.
+    """
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step": step,
+            "config": dataclasses.asdict(config),
+        },
+        path,
+    )
+
+
+def load_checkpoint(path, device: torch.device) -> dict:
+    """Load checkpoint dict. weights_only=False is required (G168): PyTorch
+    2.6+ flipped the default to True and would reject our nested optimizer
+    state on some version combos.
+
+    Returns the raw dict; caller rebuilds the model from `ckpt['config']`,
+    then `model.load_state_dict(ckpt['state_dict'])`, then optimizer-
+    construct + (optional) `optimizer.load_state_dict(ckpt['optimizer'])`.
+    Missing 'optimizer' key (HF-init checkpoint from load_pretrained) is
+    handled by the caller (G219).
+    """
+    return torch.load(path, map_location=device, weights_only=False)
