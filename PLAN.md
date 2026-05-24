@@ -4064,8 +4064,8 @@ correctness-critical decision the audit found.
 | ✓ `_apply_gpt2_init`: `attn.proj.weight.std()` ≈ 0.02/√(2·n_layer) | 2.5 | G155 residual scaling |
 | ✓ `_apply_gpt2_init` skips NMM-internal modules by id (renaming `self.nmm` doesn't break it) | 2.5 | G203 |
 | ✓ `_build_init_M` uses `.to(device).clone()` order (no wasted source-device copy) | 1.4 | G207 |
-| GPT-2 weight parity vs HF (NMM zeroed, N_p=0); max-logit-diff < 1e-4 | 2.6 | weight load correctness |
-| `load_pretrained` derives HF model name from `config.n_embd` (medium/large/xl work) | 2.6 | G216 |
+| ✓ GPT-2 weight parity vs HF (NMM zeroed, N_p=0); max-logit-diff < 1e-4 | 2.6 | weight load correctness |
+| ✓ `load_pretrained` derives HF model name from `config.n_embd` (medium/large/xl work) | 2.6 | G216 |
 | Tokenizer: `decode(encode(s)) == s` for ASCII; `eot_token == 50256` | 3.1 | tokenizer basics |
 | Tokenizer: literal `<|endoftext|>` in text is BPE-encoded (NOT EOT id) | 3.1 | G152 |
 | `encode_corpus(open(path))` is treated as line-per-doc (warn user); whole-file pattern recommended | 3.1 | G210 |
