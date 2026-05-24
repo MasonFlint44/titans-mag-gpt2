@@ -3514,3 +3514,27 @@ All gaps vs. the original architecture doc, tracked across research passes.
      codebase without re-indent surprises. Testing Checkpoints row
      added asserting consistent 4-space indentation as a structural
      property of the example.
+
+---
+
+## Implementation phase gaps (G228+)
+
+Gaps discovered during the code-writing phase. Format per `IMPLEMENTATION_PROMPT.md` §6:
+
+### G228 — `chunk_size` default disagrees between PLAN.md and CONFIG_REFERENCE.md
+
+**Found:** Implementation phase 0.2
+**Symptom:** PLAN.md §0.2 dataclass sketch sets `chunk_size: int = 512`; CONFIG_REFERENCE.md "NMM hyperparameters" table lists the default as `1024`. A user reading either doc in isolation forms an incorrect mental model of what `TitansConfig()` produces by default. For from-scratch training, the gap between these two values straddles the G163 warning threshold: with `block_size=1024` (default) and `chunk_size=512` (PLAN default), the from-scratch warning fires; with `chunk_size=1024` (CONFIG_REFERENCE default), it does not.
+**Root cause:** Documentation drift across separately-written design docs.
+**Fix:** Followed PLAN.md per the IMPLEMENTATION_PROMPT.md §2 tiebreaker (PLAN.md is authoritative for code-level details). Default is `chunk_size = 512`. CONFIG_REFERENCE.md should be updated by the author to match, but per the prompt's "Do not edit the docs to 'fix' the discrepancy on your own — flag and ask" rule, no doc edit was performed.
+**Test:** No direct test — the default's value is a documentation discrepancy, not a runtime invariant. `tests/unit/test_config.py::test_factory_accepts_chunk_size_override` confirms callers can override it.
+**Affects:** `config.py` (`TitansConfig.chunk_size`), `CONFIG_REFERENCE.md` (out-of-date default in the NMM hyperparameters table).
+
+### G229 — `nmm_grad_checkpoint` config field referenced by ROADMAP/CONFIG_REFERENCE but absent from PLAN.md §0.2
+
+**Found:** Implementation phase 0.2
+**Symptom:** ROADMAP.md §1.8 mentions "Optional `nmm_grad_checkpoint` flag: rematerialize each per-token update on backward". CONFIG_REFERENCE.md lists `nmm_grad_checkpoint: bool = False` in the NMM hyperparameters table. PLAN.md §0.2's `TitansConfig` sketch — the authoritative code-level reference — does not define this field. If Phase 1.8 reads `config.nmm_grad_checkpoint`, an `AttributeError` will surface at runtime; if Phase 1.8 instead exposes the flag as a method/local arg, the doc table is misleading.
+**Root cause:** Documentation drift: the field appears in the higher-level docs without ever being added to the dataclass sketch.
+**Fix:** Followed PLAN.md per the §2 tiebreaker — the field was not added to `config.py`. To be re-evaluated at Phase 1.8: if `_forward_chunk_sequential` needs a config-borne flag for grad checkpointing, the field gets added there alongside the implementation that uses it (with a same-commit test). Until then, omitting it matches the YAGNI guidance in IMPLEMENTATION_PROMPT.md §11.
+**Test:** No test — the field's absence is a deliberate consequence of following PLAN.md. Phase 1.8 will decide whether the field exists.
+**Affects:** `config.py` (`TitansConfig`), `CONFIG_REFERENCE.md` (out-of-date row), `ROADMAP.md` §1.8 (references a flag that may not be config-borne).

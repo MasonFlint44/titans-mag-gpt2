@@ -4030,10 +4030,10 @@ correctness-critical decision the audit found.
 
 | Test | After task | Defends |
 |---|---|---|
-| Config `__post_init__` rejects chunk_size > block_size (raises ValueError, NOT AssertionError) | 0.2 | wpe OOB / G206 |
-| Factory `TitansConfig.gpt2_small().n_embd == 768` | 0.2 | G143/G150 |
-| `__post_init__` warns when from-scratch + chunk_size < block_size | 0.2 | G163 |
-| `__post_init__` rejects `use_swa=True, swa_window=0` | 0.2 | G166 |
+| ✓ Config `__post_init__` rejects chunk_size > block_size (raises ValueError, NOT AssertionError) | 0.2 | wpe OOB / G206 |
+| ✓ Factory `TitansConfig.gpt2_small().n_embd == 768` | 0.2 | G143/G150 |
+| ✓ `__post_init__` warns when from-scratch + chunk_size < block_size | 0.2 | G163 |
+| ✓ `__post_init__` rejects `use_swa=True, swa_window=0` | 0.2 | G166 |
 | Conv output shape invariant; conv strictly causal | 1.1 | conv design |
 | q̂/k̂ L2 normalized, ‖v‖ unconstrained | 1.2 | activation/L2 placement |
 | W_θ/η/α outputs shape `[B, T]` (not `[B, T, 1]`) | 1.3 | broadcasting bug |
@@ -4088,7 +4088,7 @@ correctness-critical decision the audit found.
 | Gradient accumulation under DDP uses `model.no_sync()` for all but last micro-batch | 4.5 | G200 |
 | Partial DDP accumulation cycle skips optimizer.step (avoids rank divergence) | 4.5 | G214 |
 | Partial cycle detected ALSO when StopIteration fires at iter K-1 (off-by-one defended) | 4.5 | G222 |
-| `TitansConfig(n_embd=768, n_head=10)` raises `ValueError` at config time (NOT model time) | 0.2 | G223 |
+| ✓ `TitansConfig(n_embd=768, n_head=10)` raises `ValueError` at config time (NOT model time) | 0.2 | G223 |
 | `_apply_gpt2_init` uses relative import `from .nmm` (works under any top-level package name) | 2.5 | G224 |
 | Training loop wrapped in try/finally; `destroy_process_group` runs on exception path | 4.5 | G225 |
 | Consolidated loop builds `config` BEFORE the loader references `config.chunk_size` | 4.5 | G205 |

@@ -1,0 +1,188 @@
+import subprocess
+import sys
+import warnings
+
+import pytest
+
+from config import TitansConfig
+
+
+# ---------------------------------------------------------------------------
+# Factory dimensions (G143, G150)
+# ---------------------------------------------------------------------------
+
+def test_gpt2_small_factory_dims():
+    cfg = TitansConfig.gpt2_small()
+    assert cfg.n_embd == 768
+    assert cfg.n_head == 12
+    assert cfg.n_layer == 12
+
+
+def test_gpt2_medium_factory_dims():
+    cfg = TitansConfig.gpt2_medium()
+    assert cfg.n_embd == 1024
+    assert cfg.n_head == 16
+    assert cfg.n_layer == 24
+
+
+def test_gpt2_large_factory_dims():
+    cfg = TitansConfig.gpt2_large()
+    assert cfg.n_embd == 1280
+    assert cfg.n_head == 20
+    assert cfg.n_layer == 36
+
+
+def test_gpt2_xl_factory_dims():
+    cfg = TitansConfig.gpt2_xl()
+    assert cfg.n_embd == 1600
+    assert cfg.n_head == 25
+    assert cfg.n_layer == 48
+
+
+# ---------------------------------------------------------------------------
+# Factory accepts overrides (G150)
+# ---------------------------------------------------------------------------
+
+def test_factory_accepts_dropout_override():
+    cfg = TitansConfig.gpt2_small(dropout=0.1)
+    assert cfg.dropout == 0.1
+    # Other defaults intact.
+    assert cfg.n_embd == 768
+
+
+def test_factory_accepts_dim_override():
+    # The **{**defaults, **overrides} pattern must allow overriding the
+    # backbone dims the factory itself sets — earlier (fixed kwargs +
+    # **overrides) code raised TypeError: multiple values for keyword argument.
+    cfg = TitansConfig.gpt2_small(n_embd=768, n_head=12)
+    assert cfg.n_embd == 768
+
+
+def test_factory_accepts_chunk_size_override():
+    cfg = TitansConfig.gpt2_small(chunk_size=256)
+    assert cfg.chunk_size == 256
+
+
+# ---------------------------------------------------------------------------
+# chunk_size > block_size rejected (G190, G206)
+# ---------------------------------------------------------------------------
+
+def test_chunk_size_exceeds_block_size_rejected():
+    # G206: must be ValueError, NOT AssertionError. A test using
+    # pytest.raises(AssertionError) would silently pass-the-wrong-way once
+    # the assert→raise migration happened.
+    with pytest.raises(ValueError, match="chunk_size"):
+        TitansConfig(chunk_size=2048, block_size=1024)
+
+
+def test_chunk_size_equal_to_block_size_accepted():
+    cfg = TitansConfig(chunk_size=1024, block_size=1024)
+    assert cfg.chunk_size == 1024
+
+
+# ---------------------------------------------------------------------------
+# n_embd not divisible by n_head rejected at config time (G223)
+# ---------------------------------------------------------------------------
+
+def test_n_embd_not_divisible_by_n_head_rejected():
+    with pytest.raises(ValueError, match="divisible by n_head"):
+        TitansConfig.gpt2_small(n_head=10)
+
+
+def test_n_embd_divisibility_error_quotes_values():
+    # Error should be informative, not generic "invalid".
+    with pytest.raises(ValueError) as excinfo:
+        TitansConfig(n_embd=768, n_head=10)
+    msg = str(excinfo.value)
+    assert "768" in msg
+    assert "10" in msg
+
+
+# ---------------------------------------------------------------------------
+# SWA window validation (G166)
+# ---------------------------------------------------------------------------
+
+def test_swa_zero_window_rejected():
+    with pytest.raises(ValueError, match="swa_window"):
+        TitansConfig(use_swa=True, swa_window=0)
+
+
+def test_swa_negative_window_rejected():
+    with pytest.raises(ValueError, match="swa_window"):
+        TitansConfig(use_swa=True, swa_window=-1)
+
+
+def test_swa_disabled_window_value_irrelevant():
+    # When use_swa=False, swa_window value is unused; do not reject.
+    cfg = TitansConfig(use_swa=False, swa_window=0)
+    assert cfg.swa_window == 0
+
+
+# ---------------------------------------------------------------------------
+# NMM field validation
+# ---------------------------------------------------------------------------
+
+def test_nmm_n_persistent_negative_rejected():
+    with pytest.raises(ValueError, match="nmm_n_persistent"):
+        TitansConfig(nmm_n_persistent=-1)
+
+
+def test_nmm_n_persistent_zero_accepted():
+    cfg = TitansConfig(nmm_n_persistent=0)
+    assert cfg.nmm_n_persistent == 0
+
+
+def test_nmm_expansion_zero_rejected():
+    with pytest.raises(ValueError, match="nmm_expansion"):
+        TitansConfig(nmm_expansion=0)
+
+
+def test_nmm_expansion_negative_rejected():
+    with pytest.raises(ValueError, match="nmm_expansion"):
+        TitansConfig(nmm_expansion=-1)
+
+
+# ---------------------------------------------------------------------------
+# G163 — from-scratch + chunk_size < block_size warns; finetune does not
+# ---------------------------------------------------------------------------
+
+def test_from_scratch_short_chunk_warns():
+    with pytest.warns(UserWarning, match="finetune_mode=False"):
+        TitansConfig(finetune_mode=False, chunk_size=512, block_size=1024)
+
+
+def test_finetune_short_chunk_does_not_warn():
+    # finetune path overwrites wpe with HF's trained table — no risk.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any UserWarning -> test failure
+        TitansConfig(finetune_mode=True, chunk_size=512, block_size=1024)
+
+
+def test_from_scratch_equal_chunk_does_not_warn():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        TitansConfig(finetune_mode=False, chunk_size=1024, block_size=1024)
+
+
+# ---------------------------------------------------------------------------
+# Validation survives `python -O` (G190)
+# ---------------------------------------------------------------------------
+
+def test_validation_fires_under_python_O():
+    # If __post_init__ used `assert`, -O would strip it and the bad config
+    # would build silently. We use `raise ValueError`; verify under -O.
+    result = subprocess.run(
+        [
+            sys.executable, "-O", "-c",
+            "from config import TitansConfig; "
+            "TitansConfig(chunk_size=2048, block_size=1024)",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(__import__("pathlib").Path(__file__).resolve().parents[2]),
+    )
+    assert result.returncode != 0, (
+        f"Expected non-zero exit under -O; got 0.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "ValueError" in result.stderr
