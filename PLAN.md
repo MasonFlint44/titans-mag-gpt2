@@ -4044,7 +4044,7 @@ correctness-critical decision the audit found.
 | ✓ NS transpose guard: tall vs wide matrices both work | 1.6 | NS convergence |
 | ✓ NS5 forces fp32 internally; post-NS spectral norm ≈ 1 even under bf16 autocast | 1.6 | G198 |
 | ✓ NS5 explicitly disables autocast — `G @ G.mT` runs fp32 (NOT bf16) under ambient autocast scope | 1.6 | G226 |
-| Consolidated try/finally block uses CONSISTENT 4-space indentation (not mixed 2-2-4) | 4.5 | G227 |
+| ✓ Consolidated try/finally block uses CONSISTENT 4-space indentation (not mixed 2-2-4) | 4.5 | G227 |
 | ✓ `step()` T-token sequential matches reference manual loop | 1.7 | step semantics |
 | ✓ `_forward_chunk_sequential` ≠ T-many `step()` calls (conv sees full chunk) | 1.8 | G154 |
 | ✓ `_forward_chunk_sequential` precomputes per-t boundary mask on CPU (no per-token GPU sync) | 1.8 | G202 |
@@ -4090,7 +4090,7 @@ correctness-critical decision the audit found.
 | ✓ Partial cycle detected ALSO when StopIteration fires at iter K-1 (off-by-one defended) | 4.5 | G222 |
 | ✓ `TitansConfig(n_embd=768, n_head=10)` raises `ValueError` at config time (NOT model time) | 0.2 | G223 |
 | ✓ `_apply_gpt2_init` uses relative import `from .nmm` (works under any top-level package name) | 2.5 | G224 |
-| Training loop wrapped in try/finally; `destroy_process_group` runs on exception path | 4.5 | G225 (ddp-marked) |
+| ✓ Training loop wrapped in try/finally; `destroy_process_group` runs on exception path | 4.5 | G225 (structural; ddp runtime untested) |
 | ✓ Consolidated loop builds `config` BEFORE the loader references `config.chunk_size` | 4.5 | G205 |
 | Resume sequence wraps DDP after `load_state_dict` and before optimizer build | 4.3 | G209 (ddp-marked) |
 | ✓ Checkpoint save/load round-trip: state_dict + optimizer state populated post-resume | 4.3 | G153 / G134 / G168 |
