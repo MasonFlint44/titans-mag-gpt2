@@ -4050,8 +4050,8 @@ correctness-critical decision the audit found.
 | `_forward_chunk_sequential` precomputes per-t boundary mask on CPU (no per-token GPU sync) | 1.8 | G202 |
 | `_forward_chunk_sequential` lazy-builds `init_M` only when a doc boundary fires | 1.8 | G211 |
 | NMM memorizes single key→value pair (overfit) | 1.8 | end-to-end correctness |
-| reset_state on doc boundaries leaves unmasked entries byte-identical | 1.9 | G149 |
-| detach_states handles `None` (first-step case) | 1.9 | G149 |
+| ✓ reset_state on doc boundaries leaves unmasked entries byte-identical | 1.9 | G149 |
+| ✓ detach_states handles `None` (first-step case) | 1.9 | G149 |
 | CausalSelfAttention with `_aug_mask(T)` produces correct persistent/causal pattern | 2.0 | attention mask |
 | CausalSelfAttention rejects `n_head` not dividing `n_embd` via `ValueError` (NOT AssertionError, NOT silent under -O) | 2.0 | G220 |
 | GPT2MLP matches `F.gelu(c_fc(x), approximate='tanh')` elementwise | 2.0 | HF parity |

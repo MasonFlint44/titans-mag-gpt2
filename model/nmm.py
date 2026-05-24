@@ -6,6 +6,45 @@ import torch.nn.functional as F
 from torch.func import functional_call, grad, vmap
 
 
+def reset_state(state: tuple, mask: torch.Tensor, init_M: dict) -> tuple:
+    """Reset masked batch entries to init values (autograd-safe via torch.where).
+
+    In-place index assignment on tensors in the autograd graph raises
+    RuntimeError. torch.where is non-mutating and differentiable.
+
+    mask: [B] bool. Where True, the entry gets init_M / zeros_S; where False,
+    it keeps its current value bit-identically.
+    """
+    M, S = state
+    zeros_S = {k: torch.zeros_like(v) for k, v in S.items()}
+
+    def _where_dict(new_dict, old_dict):
+        out = {}
+        for k, new_v in new_dict.items():
+            old_v = old_dict[k]
+            m = mask.view(mask.shape[0], *([1] * (old_v.ndim - 1)))
+            out[k] = torch.where(m, new_v, old_v)
+        return out
+
+    return (_where_dict(init_M, M), _where_dict(zeros_S, S))
+
+
+def detach_states(states):
+    """Detach every leaf tensor in a per-layer list of (M, S) dicts.
+
+    Pass-through on None — at the very first training step nmm_states is
+    None and the model's forward initializes it; this helper must not
+    explode on that case (G149).
+    """
+    if states is None:
+        return None
+    return [
+        ({k: v.detach() for k, v in M.items()},
+         {k: v.detach() for k, v in S.items()})
+        for M, S in states
+    ]
+
+
 def _scale(scalar_B: torch.Tensor, tensor_dict: dict) -> dict:
     """Broadcast a per-sample scalar [B] across each [B, ...] tensor in the dict."""
     out = {}
