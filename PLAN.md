@@ -4035,7 +4035,7 @@ correctness-critical decision the audit found.
 | ✓ `__post_init__` warns when from-scratch + chunk_size < block_size | 0.2 | G163 |
 | ✓ `__post_init__` rejects `use_swa=True, swa_window=0` | 0.2 | G166 |
 | ✓ Conv output shape invariant; conv strictly causal | 1.1 | conv design |
-| q̂/k̂ L2 normalized, ‖v‖ unconstrained | 1.2 | activation/L2 placement |
+| ✓ q̂/k̂ L2 normalized, ‖v‖ unconstrained | 1.2 | activation/L2 placement |
 | W_θ/η/α outputs shape `[B, T]` (not `[B, T, 1]`) | 1.3 | broadcasting bug |
 | out_scale init: zeros when finetune_mode=True, ones when False | 1.4 | G123 |
 | Inner-loss gradient matches `autograd.functional.jacobian` to 1e-4 | 1.5 | torch.func correctness |

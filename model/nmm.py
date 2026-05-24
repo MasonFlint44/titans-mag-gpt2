@@ -29,3 +29,24 @@ class CausalDepthwiseConv1d(nn.Module):
         x = F.pad(x, (self.kernel_size - 1, 0))            # left-pad only
         x = self.conv(x)                                    # [B, dim, T]
         return x.transpose(1, 2)                           # [B, T, dim]
+
+
+class NMMProjection(nn.Module):
+    """Q/K/V projection: Linear -> CausalDepthwiseConv1d, no activation.
+
+    SiLU + L2-norm are applied at the call site, not inside the module —
+    putting SiLU inside would silently produce silu(silu(x)) at the call site.
+
+    Submodule names `linear` and `conv` are load-bearing for §4.1 optimizer
+    routing: param paths like `blocks.X.nmm.k_proj.linear.weight` get into
+    the NMM decay group via the `'nmm'` substring; renaming to anything
+    containing `'norm'`, `'bias'`, or `'gamma'` would misroute to no_decay.
+    """
+
+    def __init__(self, n_embd: int, kernel_size: int = 4):
+        super().__init__()
+        self.linear = nn.Linear(n_embd, n_embd, bias=False)
+        self.conv = CausalDepthwiseConv1d(n_embd, kernel_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(self.linear(x))
