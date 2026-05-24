@@ -4040,10 +4040,10 @@ correctness-critical decision the audit found.
 | ✓ out_scale init: zeros when finetune_mode=True, ones when False | 1.4 | G123 |
 | ✓ Inner-loss gradient matches `autograd.functional.jacobian` to 1e-4 | 1.5 | torch.func correctness |
 | ✓ Reduction switch: spectral_norm=False gradient ≈ 1/d × spectral_norm=True | 1.5 | G160 |
-| Newton-Schulz spectral norm bound ≈ 1 for random matrices any shape | 1.6 | NS5 correctness |
-| NS transpose guard: tall vs wide matrices both work | 1.6 | NS convergence |
-| NS5 forces fp32 internally; post-NS spectral norm ≈ 1 even under bf16 autocast | 1.6 | G198 |
-| NS5 explicitly disables autocast — `G @ G.mT` runs fp32 (NOT bf16) under ambient autocast scope | 1.6 | G226 |
+| ✓ Newton-Schulz spectral norm bound ≈ 1 for random matrices any shape | 1.6 | NS5 correctness |
+| ✓ NS transpose guard: tall vs wide matrices both work | 1.6 | NS convergence |
+| ✓ NS5 forces fp32 internally; post-NS spectral norm ≈ 1 even under bf16 autocast | 1.6 | G198 |
+| ✓ NS5 explicitly disables autocast — `G @ G.mT` runs fp32 (NOT bf16) under ambient autocast scope | 1.6 | G226 |
 | Consolidated try/finally block uses CONSISTENT 4-space indentation (not mixed 2-2-4) | 4.5 | G227 |
 | `step()` T-token sequential matches reference manual loop | 1.7 | step semantics |
 | `_forward_chunk_sequential` ≠ T-many `step()` calls (conv sees full chunk) | 1.8 | G154 |

@@ -6,6 +6,40 @@ import torch.nn.functional as F
 from torch.func import functional_call, grad, vmap
 
 
+def newton_schulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
+    """5-step Newton-Schulz iteration: drives the spectral norm of G toward 1.
+
+    Two non-obvious correctness guards:
+
+    1. The entire iteration runs under `autocast(enabled=False)`. A bare
+       `G.float()` under an ambient bf16 autocast is silently undone — matmul
+       inputs get re-cast to bf16, the iteration accumulates in bf16, and the
+       spectral-norm fixed point ends up in [0.7, 1.4] instead of ~1. The
+       disabled-autocast wrapper makes the fp32 cast persist across matmuls.
+
+    2. NS converges on wide matrices (cols >= rows). Tall gradients such as
+       W1/W_gate (shape [4d, d]) must be transposed before the iteration and
+       transposed back after; W2 ([d, 4d]) is already wide.
+
+    Coefficients (a, b, c) = (3.4445, -4.7750, 2.0315) are from Jordan et al.
+    (Muon / nanogpt), tuned to the fp32 fixed point.
+    """
+    a, b, c = 3.4445, -4.7750, 2.0315
+    orig_dtype = G.dtype
+    with torch.amp.autocast(device_type=G.device.type, enabled=False):
+        G = G.float()
+        should_transpose = G.shape[-2] > G.shape[-1]
+        if should_transpose:
+            G = G.mT
+        G = G / (G.norm(dim=(-2, -1), keepdim=True) + eps)
+        for _ in range(steps):
+            A = G @ G.mT
+            G = a * G + (b * A + c * (A @ A)) @ G
+        if should_transpose:
+            G = G.mT
+    return G.to(orig_dtype)
+
+
 def _make_grad_fn(memory_mlp: nn.Module, spectral_norm: bool):
     """Build the cached vmap(grad(inner_loss)) per-sample gradient function.
 
