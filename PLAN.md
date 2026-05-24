@@ -4070,12 +4070,12 @@ correctness-critical decision the audit found.
 | ✓ Tokenizer: literal `<|endoftext|>` in text is BPE-encoded (NOT EOT id) | 3.1 | G152 |
 | `encode_corpus(open(path))` is treated as line-per-doc (warn user); whole-file pattern recommended | 3.1 | G210 |
 | ✓ ParallelStreamLoader: position-i stream is contiguous across batches | 3.3 | G151 |
-| Optimizer has exactly 4 param groups; no param in multiple groups | 4.1 | G117 / 4-group split |
-| Optimizer betas == (0.9, 0.95); no_decay set excludes 'bias'/'ln'/'norm'/'out_scale'/'gamma'/'persistent' | 4.1 | G153 / G117 |
-| `train_step` does the `.to(device)` transfer (CPU batch → GPU works) | 4.2 | G167 |
-| Loss decreases monotonically on 100-step overfit batch | 4.2 | end-to-end |
-| Injected `loss = loss + nan` does NOT corrupt parameters | 4.2 | G158 |
-| NaN-skip resets `nmm_states` to None (caller's next call re-initializes) | 4.2 | G213 |
+| ✓ Optimizer has exactly 4 param groups; no param in multiple groups | 4.1 | G117 / 4-group split |
+| ✓ Optimizer betas == (0.9, 0.95); no_decay set excludes 'bias'/'ln'/'norm'/'out_scale'/'gamma'/'persistent' | 4.1 | G153 / G117 |
+| ✓ `train_step` does the `.to(device)` transfer (CPU batch → GPU works) | 4.2 | G167 |
+| ✓ Loss decreases monotonically on 100-step overfit batch | 4.2 | end-to-end |
+| ✓ Injected `loss = loss + nan` does NOT corrupt parameters | 4.2 | G158 |
+| ✓ NaN-skip resets `nmm_states` to None (caller's next call re-initializes) | 4.2 | G213 |
 | NaN-skip in accumulation block also resets `nmm_states` to None | 4.5 | G217 |
 | bf16 autocast: backward + clip + step run in fp32 | 4.2 | G159 |
 | `apply_lr` scales all 4 param groups; preserves 1:1:3:3 ratio | 4.3 | G157 |
