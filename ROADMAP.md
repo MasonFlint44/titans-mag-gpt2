@@ -166,7 +166,7 @@ For `_forward_chunk_sequential`:
 - Run the conv on the full chunk in one shot (not per-token) — that's the whole point vs. T-many `step()` calls (G154).
 - Precompute the per-t boundary mask on CPU; do NOT slice into a CUDA tensor inside the per-token loop (G202).
 - Lazy-build `init_M` only when a doc boundary actually fires (G211).
-- Optional `nmm_grad_checkpoint` flag: rematerialize each per-token update on backward (the GRADIENT+NS+MOMENTUM+RETRIEVAL block — not `step()`, which would recompute the conv on a 1-token slice).
+- (Deferred — G229) Optional `nmm_grad_checkpoint` rematerialization is not in `TitansConfig` today. If OOM pressure motivates it, add the field to `TitansConfig` AND wrap the per-token recurrent update (GRADIENT+NS+MOMENTUM+RETRIEVAL block — NOT `step()`, which would recompute the conv on a 1-token slice) in `torch.utils.checkpoint.checkpoint`.
 
 → PLAN.md §1.8
 

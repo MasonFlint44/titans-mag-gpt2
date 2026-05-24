@@ -59,8 +59,7 @@ HF model path is derived from `n_embd` in `load_pretrained` (G216) — passing
 | `nmm_conv_kernel` | `int` | 4 | ≥ 1 | Depthwise conv kernel size in Q/K/V projections (§4.4 of paper). `=1` disables temporal mixing |
 | `nmm_spectral_norm` | `bool` | `True` | — | Newton-Schulz 5-step on inner gradient. **Toggling this requires also changing inner-loss reduction** (G160 — see below) |
 | `nmm_n_persistent` | `int` | 4 | ≥ 0 | Number of learned persistent tokens prepended per block. `=0` disables them |
-| `chunk_size` | `int` | 1024 | 1 ≤ x ≤ `block_size` | TBPTT chunk length. `> block_size` → `ValueError` (would OOB `wpe`) |
-| `nmm_grad_checkpoint` | `bool` | `False` | — | Rematerialize per-token updates on backward (saves memory, ~2× backward cost) |
+| `chunk_size` | `int` | 512 | 1 ≤ x ≤ `block_size` | TBPTT chunk length. `> block_size` → `ValueError` (would OOB `wpe`). From-scratch users should set `chunk_size = block_size` to avoid the G163 untrained-`wpe`-rows warning. |
 
 **G160 — `nmm_spectral_norm` and inner-loss reduction are linked:**
 

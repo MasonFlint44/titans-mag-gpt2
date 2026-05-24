@@ -685,7 +685,7 @@ not in the paper at all). We prefer per-gradient NS because:
 1. Bounded gradient magnitude at every token → M weights stay well-conditioned throughout
 2. Cleaner interaction with θ_t (which then acts as a true per-token learning rate)
 
-**Done:** `‖newton_schulz5(G)‖_2 ≈ 1` for random matrices of any shape.
+**Done:** `‖newton_schulz5(G)‖_2` lies in the post-NS5 basin `~[0.85, 1.20]` for random matrices of any shape (G230 — the Muon coefficients have `a + b + c = 0.701`, so σ=1 is NOT a fixed point; "≈ 1" is engineering shorthand for "bounded near 1, tight enough for inner-loop stability", not the literal "1 ± 0.01" the diagram annotation originally suggested).
 
 ### 1.7 Sequential memory step (single-token inference ONLY)
 `NeuralMemoryModule.step(x_t, state) -> (y_t, new_state)` — used for single-token
