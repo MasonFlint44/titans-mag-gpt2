@@ -6,6 +6,23 @@ import torch.nn.functional as F
 from torch.func import functional_call, grad, vmap
 
 
+def _scale(scalar_B: torch.Tensor, tensor_dict: dict) -> dict:
+    """Broadcast a per-sample scalar [B] across each [B, ...] tensor in the dict."""
+    out = {}
+    for k, g in tensor_dict.items():
+        s = scalar_B.view(scalar_B.shape[0], *([1] * (g.ndim - 1)))
+        out[k] = s * g
+    return out
+
+
+def _dict_add(a: dict, b: dict) -> dict:
+    return {k: a[k] + b[k] for k in a}
+
+
+def _dict_sub(a: dict, b: dict) -> dict:
+    return {k: a[k] - b[k] for k in a}
+
+
 def newton_schulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
     """5-step Newton-Schulz iteration: drives the spectral norm of G toward 1.
 
@@ -234,3 +251,50 @@ class NeuralMemoryModule(nn.Module):
         M = self._build_init_M(B, device)
         S = {k: torch.zeros_like(v) for k, v in M.items()}
         return (M, S)
+
+    def step(self, x_t: torch.Tensor, state: tuple) -> tuple:
+        """Process a single token. Inference-time path.
+
+        Do NOT call in a training loop — the conv (kernel_size=4) only sees a
+        1-token window per call (3 of 4 weights are masked by left-pad). The
+        training path is `_forward_chunk_sequential` which pre-projects the
+        full chunk so the conv sees up-to-k context.
+
+        x_t: [B, d]; state: (M_prev, S_prev), each dict of [B, h, d] / [B, d, h].
+        Returns: (y_t, new_state) where y_t: [B, d].
+        """
+        if self.nmm_spectral_norm != self._spectral_norm_at_init:
+            raise RuntimeError(
+                "nmm_spectral_norm was mutated after construction "
+                f"(init={self._spectral_norm_at_init}, "
+                f"now={self.nmm_spectral_norm}). The cached "
+                "per_sample_grad_fn's reduction is locked at __init__; "
+                "rebuild the module to change spectral_norm."
+            )
+        M_prev, S_prev = state
+
+        x_seq = x_t.unsqueeze(1)
+        k_raw = self.k_proj(x_seq).squeeze(1)
+        q_raw = self.q_proj(x_seq).squeeze(1)
+        v_raw = self.v_proj(x_seq).squeeze(1)
+        k_hat = F.normalize(F.silu(k_raw), dim=-1)
+        q_hat = F.normalize(F.silu(q_raw), dim=-1)
+        v = F.silu(v_raw)
+
+        theta_t = torch.sigmoid(self.W_theta(x_t)).squeeze(-1)
+        eta_t = torch.sigmoid(self.W_eta(x_t)).squeeze(-1)
+        alpha_t = torch.sigmoid(self.W_alpha(x_t)).squeeze(-1)
+
+        g_t = self.per_sample_grad_fn(M_prev, k_hat, v)
+        if self.nmm_spectral_norm:
+            g_tilde = {key: newton_schulz5(g) for key, g in g_t.items()}
+        else:
+            g_tilde = g_t
+
+        # Momentum + memory update; theta POST-NS so the scale survives Frobenius division.
+        S_t = _dict_sub(_scale(eta_t, S_prev), _scale(theta_t, g_tilde))
+        M_t = _dict_add(_scale(1.0 - alpha_t, M_prev), S_t)
+
+        # Write-then-read: query the freshly-updated M_t.
+        y_t = self.out_scale * self._batched_retrieve(M_t, q_hat)
+        return y_t, (M_t, S_t)
