@@ -263,9 +263,13 @@ def save_checkpoint(
     accumulators, not model state. Resume re-initializes from
     memory_mlp.W*.weight.
     """
+    # G184/G186/G195 — _unwrap strips torch.compile and DDP/FSDP prefixes so
+    # the saved state_dict is portable across wrapping choices on resume.
+    from model import _unwrap
+
     torch.save(
         {
-            "state_dict": model.state_dict(),
+            "state_dict": _unwrap(model).state_dict(),
             "optimizer": optimizer.state_dict(),
             "step": step,
             "config": dataclasses.asdict(config),

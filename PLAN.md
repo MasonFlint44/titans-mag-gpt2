@@ -4103,11 +4103,11 @@ correctness-critical decision the audit found.
 | ✓ `generate(model, prompt, tokenizer=tok)` reuses caller's tokenizer instance | 5.1 | G208 |
 | ✓ `generate` / `perplexity` restore `model.training` post-exit (try/finally) | 5.1, 5.2 | G161 |
 | ✓ Perplexity baseline within 5% of HF GPT-2 (NMM zeroed, eval mode + no_grad) | 5.2 | G156 |
-| Scan path output matches sequential to <5% relative error | 6.1 | scan approximation |
-| Scan dispatcher gates on `torch.is_grad_enabled()` (NOT `self.training`) | 6.2 | G164 |
-| `_HAS_ASSOC_SCAN` resolves via documented or private import path; both succeed | 6.2 | G215 |
-| `allow_scan_training(model, True)` sets the flag on every block.nmm | 6.2 | G180 |
-| `torch.compile` checkpoint: `_unwrap(model).state_dict()` has no `_orig_mod.` keys | 6.2 | G184 |
+| ✓ Scan path matches all-grads-at-M_0 sequential exactly (implementation correctness); approximation cost vs true sequential is loose at random init (G232) | 6.1 | scan approximation |
+| ✓ Scan dispatcher gates on `torch.is_grad_enabled()` (NOT `self.training`) | 6.2 | G164 |
+| ✓ `_HAS_ASSOC_SCAN` resolves via documented or private import path; both succeed | 6.2 | G215 |
+| ✓ `allow_scan_training(model, True)` sets the flag on every block.nmm | 6.2 | G180 |
+| ✓ `torch.compile` checkpoint: `_unwrap(model).state_dict()` has no `_orig_mod.` keys | 6.2 | G184 |
 
 ---
 

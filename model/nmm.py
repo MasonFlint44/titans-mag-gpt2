@@ -6,6 +6,34 @@ import torch.nn.functional as F
 from torch.func import functional_call, grad, vmap
 
 
+# Resolve torch.associative_scan across PyTorch versions (G215). 2.8+ exposes
+# it at `torch.associative_scan`; 2.6/2.7 only at the private path. Bind to
+# a module-level name so callers don't redo the lookup.
+try:
+    from torch import associative_scan as _associative_scan
+    _HAS_ASSOC_SCAN = True
+except ImportError:
+    try:
+        from torch._higher_order_ops import associative_scan as _associative_scan
+        _HAS_ASSOC_SCAN = True
+    except ImportError:
+        _associative_scan = None
+        _HAS_ASSOC_SCAN = False
+
+
+def allow_scan_training(model, enabled: bool = True) -> None:
+    """Opt every block's NMM into the scan path during training.
+
+    Only meaningful when the model is wrapped in torch.compile — without it,
+    associative_scan lacks autograd and the scan path silently zeros NMM
+    gradients (G180). The setattr-on-top-level-model pattern is a silent
+    no-op since the dispatcher reads `self._allow_scan_training` on the NMM,
+    not on the model.
+    """
+    for block in model.blocks:
+        block.nmm._allow_scan_training = bool(enabled)
+
+
 def reset_state(state: tuple, mask: torch.Tensor, init_M: dict) -> tuple:
     """Reset masked batch entries to init values (autograd-safe via torch.where).
 
@@ -415,7 +443,123 @@ class NeuralMemoryModule(nn.Module):
         y_chunk = torch.stack(y_list, dim=1)
         return y_chunk, (M, S)
 
+    def _forward_chunk_scan(
+        self,
+        x_chunk: torch.Tensor,
+        state_in: tuple,
+        doc_boundaries,
+    ) -> tuple:
+        """Associative-scan path. Approximation: all per-token gradients are
+        computed against the chunk-start M_0 (not against M_{t-1}). This breaks
+        the recurrence's true sequential dependency in exchange for parallelism.
+
+        Caller (forward_chunk dispatcher) MUST ensure:
+          - doc_boundaries is None or has no True entries (the scan can't do
+            mid-chunk state resets).
+          - Either grad is disabled OR the model is wrapped in torch.compile
+            (associative_scan lacks autograd otherwise).
+        """
+        if not _HAS_ASSOC_SCAN:
+            raise RuntimeError("_forward_chunk_scan called but associative_scan unavailable")
+
+        if self.nmm_spectral_norm != self._spectral_norm_at_init:
+            raise RuntimeError(
+                "nmm_spectral_norm was mutated after construction — see step()."
+            )
+
+        M_state, S_state = state_in
+
+        k_hat_chunk = F.normalize(F.silu(self.k_proj(x_chunk)), dim=-1)
+        q_hat_chunk = F.normalize(F.silu(self.q_proj(x_chunk)), dim=-1)
+        v_chunk = F.silu(self.v_proj(x_chunk))
+        theta_chunk = torch.sigmoid(self.W_theta(x_chunk)).squeeze(-1)
+        eta_chunk = torch.sigmoid(self.W_eta(x_chunk)).squeeze(-1)
+        alpha_chunk = torch.sigmoid(self.W_alpha(x_chunk)).squeeze(-1)
+
+        # All gradients in parallel: outer vmap over T (dim 1 of chunks), inner
+        # vmap over B (already inside per_sample_grad_fn). M_state shared (None).
+        all_grads = vmap(self.per_sample_grad_fn, in_dims=(None, 1, 1))(
+            M_state, k_hat_chunk, v_chunk
+        )  # dict of [T, B, h, d]
+
+        th = theta_chunk.T.unsqueeze(-1).unsqueeze(-1)         # [T, B, 1, 1]
+        eta = eta_chunk.T.unsqueeze(-1).unsqueeze(-1)
+        one_minus_alpha = (1.0 - alpha_chunk.T).unsqueeze(-1).unsqueeze(-1)
+
+        # NS5 batched over the T,B leading dims; theta POST-NS as elsewhere.
+        scaled_grads = {}
+        for key, g in all_grads.items():
+            if self.nmm_spectral_norm:
+                g = newton_schulz5(g)
+            scaled_grads[key] = th * g
+
+        # Associative op for S_t = decay * S_{t-1} + delta_t:
+        #   (decay_a, delta_a) ⊗ (decay_b, delta_b) =
+        #     (decay_b * decay_a, decay_b * delta_a + delta_b)
+        def assoc_op(carry_a, carry_b):
+            decay_a, delta_a = carry_a
+            decay_b, delta_b = carry_b
+            return (decay_b * decay_a, decay_b * delta_a + delta_b)
+
+        one_B11 = eta.new_ones(1, *eta.shape[1:])
+
+        S_chunk = {}
+        M_chunk = {}
+        for key, dg in scaled_grads.items():
+            S0 = S_state[key].unsqueeze(0)              # [1, B, h, d]
+            M0 = M_state[key].unsqueeze(0)
+
+            # S scan: prepend (1, S_0) so the scan output at index t > 0
+            # is the correct S_t with S_0 incorporated. Slice [1:] to drop
+            # the synthetic prepended element.
+            eta_aug = torch.cat([one_B11, eta], dim=0)
+            neg_dg_aug = torch.cat([S0, -dg], dim=0)
+            _, S_aug = _associative_scan(
+                assoc_op, (eta_aug, neg_dg_aug), dim=0, combine_mode="generic"
+            )
+            S_chunk[key] = S_aug[1:]
+
+            # M scan: same augmented trick with M_0 + S_chunk as deltas.
+            alpha_aug = torch.cat([one_B11, one_minus_alpha], dim=0)
+            delta_aug = torch.cat([M0, S_chunk[key]], dim=0)
+            _, M_aug = _associative_scan(
+                assoc_op, (alpha_aug, delta_aug), dim=0, combine_mode="generic"
+            )
+            M_chunk[key] = M_aug[1:]
+
+        # Retrieval: outer vmap over T, inner is the cached _batched_retrieve.
+        y_raw = vmap(self._batched_retrieve, in_dims=(0, 1))(M_chunk, q_hat_chunk)
+        y_chunk = self.out_scale * y_raw.transpose(0, 1)  # [B, T, d]
+
+        state_out = (
+            {k: v[-1] for k, v in M_chunk.items()},
+            {k: v[-1] for k, v in S_chunk.items()},
+        )
+        return y_chunk, state_out
+
     def forward_chunk(self, x_chunk, state_in, doc_boundaries):
-        """Thin wrapper around _forward_chunk_sequential. Phase 6 replaces
-        this with a dispatcher that selects between scan and sequential."""
+        """Dispatch between scan and sequential paths.
+
+        Scan is taken only when:
+          - associative_scan is available, AND
+          - no doc boundaries in this chunk (scan can't reset mid-chunk), AND
+          - autograd is disabled OR _allow_scan_training is set (the latter
+            opted in only when the model is wrapped in torch.compile —
+            otherwise scan zeroes NMM gradients silently).
+
+        Gate uses torch.is_grad_enabled (G164), not self.training. The two
+        are independent: a `model.eval()`-then-forgot-to-`train()` pattern
+        leaves self.training=False during a training loop with autograd on,
+        which the old self.training gate misread as "safe to scan" — silent
+        NMM-gradient-freeze. Probing autograd directly is robust to that.
+        """
+        can_scan = _HAS_ASSOC_SCAN and (
+            doc_boundaries is None or not bool(doc_boundaries.any())
+        )
+        if torch.is_grad_enabled() and not getattr(
+            self, "_allow_scan_training", False
+        ):
+            can_scan = False
+        if can_scan:
+            return self._forward_chunk_scan(x_chunk, state_in, doc_boundaries)
         return self._forward_chunk_sequential(x_chunk, state_in, doc_boundaries)
