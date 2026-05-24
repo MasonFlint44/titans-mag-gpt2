@@ -1,0 +1,109 @@
+%% DDP gradient accumulation with model.no_sync() — 2 ranks × K=3 micro-batches.
+%% Shows the suppressed all-reduces, the final-step routing, and the G222 partial-cycle pitfall.
+
+sequenceDiagram
+    autonumber
+
+    participant R0 as Rank 0
+    participant R1 as Rank 1
+    participant L0 as Loader (rank 0)
+    participant L1 as Loader (rank 1)
+    participant NCCL as NCCL collective
+
+    rect rgb(245,245,255)
+    note over R0,R1: Setup — once
+    R0->>R0: torch.manual_seed(base + 0) AFTER model init (G204)
+    R1->>R1: torch.manual_seed(base + 1) AFTER model init (G204)
+    note over R0,R1: Per-rank seeds diverge<br/>→ dropout masks differ → real all-reduce work
+    R0->>NCCL: init_process_group(nccl)
+    R1->>NCCL: init_process_group(nccl)
+    R0->>R0: model = DDP(model, find_unused_parameters=False)
+    R1->>R1: model = DDP(model, find_unused_parameters=False)
+    end
+
+    rect rgb(245,255,245)
+    note over R0,NCCL: One optimizer-step cycle, K=3 micro-batches
+
+    R0->>R0: optimizer.zero_grad(set_to_none=True)
+    R1->>R1: optimizer.zero_grad(set_to_none=True)
+
+    rect rgb(255,250,235)
+    note over R0,R1: Micro-batch 0 (accum_i = 0)<br/>NOT final → no_sync() suppresses all-reduce
+    R0->>L0: next(loader_iter)
+    R1->>L1: next(loader_iter)
+    L0-->>R0: batch_0_r0
+    L1-->>R1: batch_0_r1
+
+    R0->>R0: with model.no_sync():<br/>  loss.backward()
+    R1->>R1: with model.no_sync():<br/>  loss.backward()
+    note over R0,R1: Gradients accumulate LOCALLY.<br/>NCCL idle.
+    end
+
+    rect rgb(255,250,235)
+    note over R0,R1: Micro-batch 1 (accum_i = 1)<br/>NOT final → no_sync() suppresses all-reduce
+    R0->>L0: next(loader_iter)
+    R1->>L1: next(loader_iter)
+    L0-->>R0: batch_1_r0
+    L1-->>R1: batch_1_r1
+
+    R0->>R0: with model.no_sync(): loss.backward()
+    R1->>R1: with model.no_sync(): loss.backward()
+    note over R0,R1: Local gradient accumulation continues.
+    end
+
+    rect rgb(255,245,245)
+    note over R0,NCCL: Micro-batch 2 (accum_i = K-1 = 2) — FINAL<br/>NO no_sync() → all-reduce fires
+    R0->>L0: next(loader_iter)
+    R1->>L1: next(loader_iter)
+    L0-->>R0: batch_2_r0
+    L1-->>R1: batch_2_r1
+
+    R0->>R0: loss.backward()
+    R1->>R1: loss.backward()
+    R0->>NCCL: all_reduce(grads)
+    R1->>NCCL: all_reduce(grads)
+    NCCL-->>R0: averaged grads
+    NCCL-->>R1: averaged grads
+    end
+
+    rect rgb(235,245,255)
+    note over R0,R1: Optimizer step — both ranks identical
+    R0->>R0: clip_grad_norm_ (fp32)
+    R0->>R0: optimizer.step()
+    R1->>R1: clip_grad_norm_ (fp32)
+    R1->>R1: optimizer.step()
+    end
+    end
+
+    rect rgb(255,235,235)
+    note over R0,L1: ⚠️ G222 — Partial cycle pitfall (StopIteration mid-cycle)
+
+    note over R0,L1: Suppose L0 is exhausted at iteration K-1 (rank 0 only).<br/>The WRONG check is:<br/>&nbsp;&nbsp;is_partial = (accum_i &lt; ACCUM_STEPS - 1)<br/>This treats "we're not on the last step" as "skip sync" — rank 0<br/>routes one path, rank 1 (which still has data) routes the OTHER →<br/>NCCL mismatch → silent hang or rank divergence.
+
+    R0->>L0: next(loader_iter)
+    L0--xR0: StopIteration → batch = None
+    R1->>L1: next(loader_iter)
+    L1-->>R1: batch_2_r1 (still has data)
+
+    alt CORRECT check: is_partial = (batch is None) and (accum_i &gt; 0)
+        R0->>R0: is_partial = True (None, accum_i=2)<br/>break → skip optimizer.step()<br/>NO all-reduce attempted
+        R1->>R1: is_partial = False (has batch)<br/>BUT rank 0 broke without all-reducing<br/>→ rank 1 must ALSO break to avoid hang
+        note over R0,R1: Both ranks need a shared signal:<br/>all_reduce a "should_continue" flag<br/>before each accum step.
+    else WRONG check: is_partial = (accum_i &lt; ACCUM_STEPS - 1)
+        R0->>R0: is_partial = False (accum_i = K-1)<br/>tries to do all-reduce<br/>but has no gradient
+        R1->>R1: is_partial = False (accum_i = K-1)<br/>tries to do all-reduce<br/>with full gradient
+        R0->>NCCL: all_reduce (zero/partial)
+        R1->>NCCL: all_reduce (full)
+        NCCL-->>R0: mismatched result
+        NCCL-->>R1: mismatched result
+        note over R0,R1: Silent corruption — training continues<br/>with wrong gradients on rank 0.
+    end
+    end
+
+    rect rgb(245,245,235)
+    note over R0,NCCL: Teardown — try/finally (G225)
+
+    note over R0,R1: Wrap the entire train loop:<br/>try:<br/>&nbsp;&nbsp;&nbsp;&nbsp;run_training()<br/>finally:<br/>&nbsp;&nbsp;&nbsp;&nbsp;dist.destroy_process_group()<br/>So NCCL is destroyed even on exception path.<br/>Use consistent 4-space indent in the try body (G227)<br/>— mixed indent can silently skip the finally.
+    R0->>NCCL: destroy_process_group()
+    R1->>NCCL: destroy_process_group()
+    end

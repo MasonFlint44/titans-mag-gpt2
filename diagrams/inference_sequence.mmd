@@ -1,0 +1,110 @@
+%% TITANS MAG + GPT-2 — Inference / generation sequence
+%% Test-time learning means NMM keeps updating during generation.
+
+sequenceDiagram
+    autonumber
+
+    participant U as Caller (generate.py CLI<br/>or programmatic)
+    participant G as Generator
+    participant CFG as Config
+    participant TK as Tokenizer (tiktoken / HF)
+    participant CK as Checkpoint
+    participant M as TitansMAGGPT2<br/>(eval mode, no DDP)
+    participant B as TitansMAGBlock i
+    participant N as NMM_i
+    participant ST as nmm_states[i]<br/>(M, S) per layer
+    participant KV as KV cache<br/>(attention)
+    participant CW as Conv context window<br/>(last k tokens, k = kernel_size)
+    participant S as Sampler<br/>(temp / top-k / top-p)
+
+    rect rgb(245,245,255)
+    note over U,S: 0. Setup
+    U->>G: generate(prompt, max_new_tokens, temp, top_k, top_p, seed)
+    G->>CFG: load config (must match training)
+    G->>M: build model architecture
+    G->>CK: load_state_dict(model, ckpt)
+    note right of CK: nmm_states NOT in checkpoint —<br/>must be re-initialized below
+    G->>M: model.eval(); torch.set_grad_enabled(False)<br/>(but inner-loop torch.func.grad still works —<br/>functional autograd is independent of grad_enabled)
+    G->>ST: init_states() from<br/>memory_mlp.W*.weight.detach().clone()<br/>broadcast to [B=1, ...]
+    G->>KV: allocate empty KV cache per layer
+    G->>CW: allocate empty conv window per layer<br/>(addresses stateless-conv train/infer drift)
+    G->>TK: encode(prompt) &rarr; idx [1, T_p]
+    end
+
+    rect rgb(245,255,245)
+    note over G,S: 1. Prompt warm-up — process prompt through model
+    alt T_p <= chunk_size
+        G->>M: forward(idx, nmm_states, doc_boundaries=None)
+        note right of M: single forward; NMM updates state<br/>token-by-token through prompt
+    else T_p > chunk_size
+        loop chunks of size chunk_size
+            G->>M: forward(idx_chunk, nmm_states, doc_b)
+            note right of M: positions reset within each chunk<br/>(GPT-2 PE table covers 0..1023);<br/>NMM state carries across chunks
+            M->>ST: write (M, S) after each token
+        end
+    end
+
+    loop layer i in 0..N-1
+        M->>B: block_i(x, state_i, doc_b=None)
+        B->>N: forward_chunk(ln_nmm(x), state_i, None)
+        note right of N: per prompt token:<br/>compute q&#770;/k&#770;/v &rarr; loss &rarr; grad &rarr; NS5<br/>&rarr; S = &eta;S - &theta;NS(g) &rarr; M = (1-&alpha;)M + S<br/>&rarr; y = out_scale &odot; MLP(q&#770;; M_t)
+        N->>ST: write (M_t, S_t)
+        N-->>B: y_mem (last token kept)
+        B-->>M: x_out
+        M->>KV: append K, V for prompt tokens
+        M->>CW: append last (k-1) projected tokens
+    end
+
+    M-->>G: logits_last [1, vocab_size]
+    end
+
+    rect rgb(255,250,235)
+    note over G,S: 2. Autoregressive generation — one token at a time
+    loop t in 0..max_new_tokens-1
+        G->>S: sample(logits_last, temp, top_k, top_p)
+        S-->>G: next_token
+
+        alt next_token == eos_token
+            G->>G: break
+        end
+
+        G->>G: generated.append(next_token)
+
+        G->>M: step(next_token, nmm_states, kv_cache, conv_window)
+        note right of M: single-token forward (T=1)
+
+        loop layer i in 0..N-1
+            M->>B: step_block_i(x_t, state_i)
+
+            note over B,KV: 2a. Attention with KV cache
+            B->>B: x&#771; = concat([P, x_t])  (or just x_t if PE allows)
+            B->>KV: read cached K, V<br/>append new k_t, v_t<br/>attend over full history
+            B-->>B: y_attn_t
+
+            note over B,CW: 2b. NMM step (with conv window mitigation)
+            B->>CW: read last (k-1) prev projected tokens<br/>concat with current &rarr; conv sees full kernel
+            B->>N: step(x_t, state_i, conv_window_i)
+            note right of N: SAME update path as training,<br/>but on a single token:<br/>1. project &rarr; conv (over k-window) &rarr; SiLU &rarr; l2_norm<br/>2. loss = ||MLP(k&#770;; M_{t-1}) - v||&sup2;<br/>3. g = func.grad; NS5 (fp32);<br/>   S = &eta;S - &theta;NS(g); M = (1-&alpha;)M + S<br/>4. y = out_scale &odot; MLP(q&#770;; M_t)<br/><br/>NaN-skip: if g or M non-finite,<br/>reset state and skip update
+            N->>ST: write (M_t, S_t)
+            N-->>B: y_mem_t
+            B->>CW: push new projected token,<br/>evict oldest (FIFO, size=k-1)
+
+            B->>B: o = y_attn_t &middot; (1 + silu(&gamma;_m &middot; y_mem_t))<br/>x = x + o + mlp(ln_2(x+o))
+            B-->>M: x_out_t
+        end
+
+        M-->>G: logits_last
+    end
+    end
+
+    rect rgb(235,245,255)
+    note over G,U: 3. Decode and return
+    G->>TK: decode(generated)
+    TK-->>G: text
+    G-->>U: text (and optionally final nmm_states for chained calls)
+    end
+
+    rect rgb(255,235,235)
+    note over G,S: Inference-specific gotchas
+    note over G: &bull; nmm_states NOT in checkpoint &rarr; always reset on load<br/>&bull; Stateless conv: at T=1 step, conv window must be kept externally<br/>&nbsp;&nbsp;or NMM sees a 1-token window vs k-token at train time<br/>&bull; Inner-loop torch.func.grad runs regardless of torch.no_grad() —<br/>&nbsp;&nbsp;NMM keeps learning at test time (the whole point of TITANS)<br/>&bull; Position embedding resets per chunk; cross-chunk context lives in NMM<br/>&bull; out_scale stays trained — do NOT zero it at inference<br/>&bull; bf16 autocast OK for forward; NS5 stays fp32 (autocast disabled inside NMM)
+    end

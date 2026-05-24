@@ -1,0 +1,202 @@
+%% TITANS MAG + GPT-2 — Component Architecture
+%% Top-down: full model -> block -> NMM internals -> update loop
+
+flowchart TB
+
+    %% ============================================================
+    %% Inputs
+    %% ============================================================
+    subgraph INPUTS["Inputs"]
+        direction LR
+        IDX["idx<br/>[B, T] token ids"]
+        DOC["doc_boundaries<br/>[B, T] bool"]
+        ST_IN["nmm_states_in<br/>(per-layer)<br/>None &rarr; init from<br/>memory_mlp.W*.weight"]
+    end
+
+    %% ============================================================
+    %% Full model: TitansMAGGPT2
+    %% ============================================================
+    subgraph MODEL["TitansMAGGPT2 (model/titans_gpt2.py)"]
+        direction TB
+        WTE["wte: Embedding<br/>[vocab_size, d_model]"]
+        WPE["wpe: Embedding<br/>[block_size=1024, d_model]<br/>positions reset per chunk"]
+        DROP["dropout"]
+        BLOCKS["blocks: N &times; TitansMAGBlock"]
+        LNF["ln_f: LayerNorm"]
+        HEAD["lm_head = wte.weight.T<br/>(tied)"]
+
+        WTE --> SUM(("&plus;"))
+        WPE --> SUM
+        SUM --> DROP --> BLOCKS --> LNF --> HEAD
+    end
+
+    IDX --> WTE
+    IDX --> WPE
+    DOC --> BLOCKS
+    ST_IN --> BLOCKS
+
+    %% ============================================================
+    %% Single block: TitansMAGBlock
+    %% ============================================================
+    subgraph BLOCK["TitansMAGBlock (model/block.py) — one of N"]
+        direction TB
+
+        PMEM["persistent_mem P<br/>[N_p, d_model] learned<br/>(no weight decay)"]
+        XIN["x: [B, T, d_model]"]
+        XTILDE["concat([P.expand(B,-1,-1), x], dim=1)<br/>&rarr; x&#771; : [B, N_p+T, d_model]"]
+        PMEM --> XTILDE
+        XIN --> XTILDE
+
+        LN1["ln_1 (LayerNorm)"]
+        ATTN["CausalSelfAttention<br/>(full causal; SWA optional)<br/>block-structured mask:<br/>P&hArr;P full, P&rarr;real masked,<br/>real&rarr;P visible, real&rarr;real causal"]
+        DROP_P["drop persistent prefix<br/>[:, N_p:, :]"]
+
+        XTILDE --> LN1 --> ATTN --> DROP_P
+        DROP_P --> YATTN["y_attn: [B, T, d_model]"]
+
+        LNNMM["ln_nmm (separate from ln_1)"]
+        XIN --> LNNMM
+        LNNMM --> NMM_CALL["nmm.forward_chunk(x_norm, state, doc_boundaries)<br/>3-arg call: doc_boundaries reset state<br/>at within-chunk document starts"]
+        DOC -.-> NMM_CALL
+
+        NMM_CALL --> YMEM["y_mem: [B, T, d_model]"]
+        NMM_CALL --> STOUT_BLK["state_t (M, S) out"]
+
+        GATE["MAG combination<br/><br/>finetune_mode=True (default):<br/>o = y_attn + silu(&gamma;_m &odot; y_mem) * y_attn<br/>= y_attn &middot; (1 + silu(&gamma;_m &middot; y_mem))<br/><br/>finetune_mode=False:<br/>o = silu(&gamma;_a &odot; y_attn) &otimes; silu(&gamma;_m &odot; y_mem)"]
+        YATTN --> GATE
+        YMEM --> GATE
+
+        RES1(("&plus;"))
+        XIN --> RES1
+        GATE --> RES1
+
+        LN2["ln_2"]
+        MLP_GPT["GPT-2 MLP (unchanged)<br/>c_fc, GELU, c_proj"]
+        RES2(("&plus;"))
+
+        RES1 --> LN2 --> MLP_GPT --> RES2
+        RES1 --> RES2
+        RES2 --> XOUT["x_out: [B, T, d_model]"]
+    end
+
+    BLOCKS -.-> BLOCK
+
+    %% ============================================================
+    %% NeuralMemoryModule internals
+    %% ============================================================
+    subgraph NMM["NeuralMemoryModule (model/nmm.py)"]
+        direction TB
+
+        subgraph PROJ["Projections + depthwise conv (kernel_size=4)"]
+            direction LR
+            QPROJ["q_proj: Linear &rarr; Conv1d_dw<br/>SiLU applied at call site"]
+            KPROJ["k_proj: Linear &rarr; Conv1d_dw<br/>SiLU applied at call site"]
+            VPROJ["v_proj: Linear &rarr; Conv1d_dw<br/>SiLU applied at call site"]
+        end
+
+        subgraph GATES["Per-token data-dep gates (Linear d_model &rarr; 1)"]
+            direction LR
+            WTHETA["W_&theta;: learning rate"]
+            WETA["W_&eta;: momentum decay"]
+            WALPHA["W_&alpha;: forgetting rate"]
+        end
+
+        subgraph MEMMLP["MemoryMLP (SiLU-GLU, L_M=2)"]
+            direction TB
+            W1["W1: Linear(d, 4d)<br/>Xavier-uniform<br/>RECURRENT STATE"]
+            WGATE["W_gate: Linear(d, 4d)<br/>Xavier-uniform<br/>RECURRENT STATE"]
+            W2["W2: Linear(4d, d)<br/>Xavier-uniform<br/>RECURRENT STATE"]
+            MNORM["norm: LayerNorm<br/>(fixed, NOT recurrent)"]
+            FORMULA["forward(x):<br/>h = silu(W1&middot;x) &odot; sigmoid(W_gate&middot;x)<br/>return norm(W2&middot;h) + x  &nbsp;(ResidualNorm)"]
+            W1 --> FORMULA
+            WGATE --> FORMULA
+            W2 --> FORMULA
+            MNORM --> FORMULA
+        end
+
+        OUTSCALE["out_scale: Parameter [d_model]<br/>init=zeros if finetune_mode=True<br/>init=ones if finetune_mode=False"]
+
+        QHAT["q&#770;_t = l2_norm(silu(conv(q_proj(x))))"]
+        KHAT["k&#770;_t = l2_norm(silu(conv(k_proj(x))))"]
+        VT["v_t  = silu(conv(v_proj(x)))  (NOT L2-normed)"]
+
+        QPROJ --> QHAT
+        KPROJ --> KHAT
+        VPROJ --> VT
+
+        RETRIEVE["Retrieve (write-then-read):<br/>y_t = out_scale &odot; MemoryMLP(q&#770;_t; M_t)"]
+        QHAT --> RETRIEVE
+        OUTSCALE --> RETRIEVE
+        RETRIEVE --> YMEM_OUT["y_mem out"]
+    end
+
+    NMM_CALL -.-> NMM
+
+    %% ============================================================
+    %% NMM update loop (per-token, surprise-driven)
+    %% ============================================================
+    subgraph UPDATE["NMM update loop (per token t)"]
+        direction TB
+
+        LOSS["&#8467;_t = ||MemoryMLP(k&#770;_t; M_{t-1}) - v_t||&sup2;<br/>(Eq. 12 — associative memory loss)"]
+
+        GRAD["g_t = &nabla;_M &#8467;_t<br/>via torch.func.grad + vmap(in_dims=(0,0,0))<br/>functional_call — NOT hand-coded backward"]
+
+        NS["NewtonSchulz5(g_t)<br/>5-step iteration, fp32 internal<br/>(autocast disabled)<br/>transpose tall matrices [4d,d] before NS,<br/>back after; W2 [d,4d] wide &rarr; no transpose"]
+
+        THETA["&theta;_t = sigmoid(W_&theta; &middot; x_t) — scalar"]
+        ETA["&eta;_t = sigmoid(W_&eta; &middot; x_t) — scalar"]
+        ALPHA["&alpha;_t = sigmoid(W_&alpha; &middot; x_t) — scalar"]
+
+        MOM["Momentum (Eq. 14):<br/>S_t = &eta;_t &middot; S_{t-1} &minus; &theta;_t &middot; NS(g_t)<br/>&theta; applied POST-NS (NS cancels pre-scaling)"]
+
+        UPD["Weight update (Eq. 13):<br/>M_t = (1 &minus; &alpha;_t) &middot; M_{t-1} + S_t<br/>doc_boundaries reset via torch.where (non-mutating)"]
+
+        LOSS --> GRAD --> NS --> MOM --> UPD
+        THETA --> MOM
+        ETA --> MOM
+        ALPHA --> UPD
+
+        KHAT -.-> LOSS
+        VT -.-> LOSS
+    end
+
+    UPD --> RETRIEVE
+
+    %% ============================================================
+    %% Recurrent state
+    %% ============================================================
+    subgraph STATE["Recurrent state per layer: (M, S)"]
+        direction LR
+        M_DICT["M = {W1: [B,4d,d],<br/>W_gate: [B,4d,d],<br/>W2: [B,d,4d]}"]
+        S_DICT["S = {same shapes,<br/>momentum buffer}"]
+        NOTE_ST["LayerNorm params NOT in state<br/>(all entries 2D for NS5)<br/>conv buffer NOT in state<br/>(stateless conv — train/infer drift)<br/>nmm_states NOT in checkpoint<br/>(reset to init on resume)"]
+    end
+
+    STOUT_BLK -.-> M_DICT
+    STOUT_BLK -.-> S_DICT
+    UPD -.-> M_DICT
+    UPD -.-> S_DICT
+    M_DICT -.-> RETRIEVE
+    M_DICT -.-> LOSS
+
+    %% ============================================================
+    %% Outputs
+    %% ============================================================
+    HEAD --> LOGITS["logits<br/>[B, T, vocab_size]"]
+    BLOCKS --> ST_OUT["nmm_states_out<br/>(per-layer)<br/>carried across chunks (TBPTT)<br/>detached between chunks"]
+
+    %% ============================================================
+    %% Styling
+    %% ============================================================
+    classDef state fill:#fff4d6,stroke:#b8860b,color:#000
+    classDef gate fill:#e6f4ff,stroke:#1f6feb,color:#000
+    classDef mlp fill:#eafbea,stroke:#2da44e,color:#000
+    classDef io fill:#f3eaff,stroke:#8250df,color:#000
+    classDef warn fill:#ffeef0,stroke:#cf222e,color:#000
+
+    class W1,WGATE,W2,M_DICT,S_DICT,STOUT_BLK,ST_IN,ST_OUT state
+    class GATE,WTHETA,WETA,WALPHA,THETA,ETA,ALPHA,OUTSCALE gate
+    class MEMMLP,FORMULA,MLP_GPT mlp
+    class IDX,DOC,LOGITS,XIN,XOUT io
+    class NS,LOSS,GRAD,MOM,UPD,NOTE_ST warn

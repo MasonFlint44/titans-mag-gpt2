@@ -1,0 +1,204 @@
+%% Phase dependency DAG — what blocks what, what can be parallelized.
+%% Nodes are PLAN.md / ROADMAP.md task IDs. An edge A → B means A must finish before B starts.
+
+flowchart LR
+
+    %% ============================================================
+    %% Phase 0 — Scaffolding (root)
+    %% ============================================================
+    subgraph P0["Phase 0 — Scaffolding"]
+        direction TB
+        T01["0.1 Repo skeleton<br/>+ requirements.txt"]
+        T02["0.2 TitansConfig<br/>+ factories<br/>+ validation"]
+        T01 --> T02
+    end
+
+    %% ============================================================
+    %% Phase 1 — NMM
+    %% ============================================================
+    subgraph P1["Phase 1 — Neural Memory Module"]
+        direction TB
+        T11["1.1 CausalDepthwiseConv1d"]
+        T12["1.2 Q/K/V projections<br/>(Linear + Conv)"]
+        T13["1.3 W_θ, W_η, W_α<br/>data-dep update params"]
+        T14["1.4 MemoryMLP<br/>+ out_scale<br/>+ _build_init_M"]
+        T15["1.5 torch.func.grad<br/>+ vmap inner gradient"]
+        T16["1.6 Newton-Schulz 5-step"]
+        T17["1.7 Sequential step<br/>(single-token inference)"]
+        T18["1.8 Chunked forward<br/>(training hot path)"]
+        T19["1.9 State mgmt<br/>(init / reset / detach)"]
+
+        T11 --> T12
+        T12 --> T17
+        T13 --> T17
+        T14 --> T15
+        T15 --> T17
+        T16 --> T17
+        T14 --> T19
+        T17 --> T18
+        T19 --> T18
+    end
+
+    %% ============================================================
+    %% Phase 2 — Block & Model
+    %% ============================================================
+    subgraph P2["Phase 2 — Block & Full Model"]
+        direction TB
+        T20["2.0 CausalSelfAttention<br/>+ GPT2MLP"]
+        T21["2.1 Persistent tokens<br/>+ augmented mask"]
+        T22["2.2 ln_nmm (separate LN)"]
+        T23["2.3 MAG combination<br/>(finetune/scratch gates)"]
+        T24["2.4 TitansMAGBlock.forward"]
+        T25["2.5 TitansMAGGPT2<br/>(full model + init)"]
+        T26["2.6 GPT-2 weight loading"]
+
+        T20 --> T24
+        T21 --> T24
+        T22 --> T24
+        T23 --> T24
+        T24 --> T25
+        T25 --> T26
+    end
+
+    %% ============================================================
+    %% Phase 3 — Data
+    %% ============================================================
+    subgraph P3["Phase 3 — Data Pipeline"]
+        direction TB
+        T31["3.1 Tokenizer adapter<br/>(tiktoken GPT-2)"]
+        T32["3.2 Chunked doc dataset<br/>(optional)"]
+        T33["3.3 ParallelStreamLoader<br/>(TBPTT-aware)"]
+
+        T31 --> T32
+        T31 --> T33
+    end
+
+    %% ============================================================
+    %% Phase 4 — Training
+    %% ============================================================
+    subgraph P4["Phase 4 — Training"]
+        direction TB
+        T41["4.1 Optimizer<br/>(4 param groups)"]
+        T42["4.2 train_step (TBPTT)<br/>+ NaN guard"]
+        T43["4.3 LR schedule + ckpt<br/>+ logging + resume"]
+        T44["4.4 Fine-tune entry"]
+        T45["4.5 From-scratch entry<br/>(DDP, no_sync, try/finally)"]
+
+        T41 --> T42
+        T42 --> T43
+        T43 --> T44
+        T43 --> T45
+        T41 --> T45
+    end
+
+    %% ============================================================
+    %% Phase 5 — Generation & Eval
+    %% ============================================================
+    subgraph P5["Phase 5 — Generation & Eval"]
+        direction TB
+        T51["5.1 generate()<br/>(chunked prompt, conv window)"]
+        T52["5.2 Perplexity eval"]
+        T53["5.3 Needle-in-haystack<br/>(synthetic long-context)"]
+
+        T51 --> T53
+    end
+
+    %% ============================================================
+    %% Phase 6 — Associative Scan (optional)
+    %% ============================================================
+    subgraph P6["Phase 6 — Associative Scan (optional)"]
+        direction TB
+        T61["6.1 Pre-compute grads<br/>+ scan operator"]
+        T62["6.2 torch.associative_scan<br/>dispatcher + compile"]
+
+        T61 --> T62
+    end
+
+    %% ============================================================
+    %% Cross-phase dependencies
+    %% ============================================================
+    T02 ==> T11
+    T02 ==> T20
+    T02 ==> T31
+    T02 ==> T41
+
+    T19 ==> T24
+    T18 ==> T42
+
+    T26 ==> T44
+    T26 ==> T51
+    T26 ==> T52
+
+    T33 ==> T42
+    T25 ==> T42
+
+    T18 ==> T61
+    T16 ==> T61
+    T45 ==> T62
+
+    %% ============================================================
+    %% Parallelizable bands — annotation
+    %% ============================================================
+    subgraph PARALLEL["Parallelizable bands (within a phase)"]
+        direction TB
+        PAR1["After 0.2:<br/>1.1, 1.3, 1.4, 1.6 can all start (independent components)"]
+        PAR2["After 0.2:<br/>2.0 can start (just GPT-2 attention/MLP, no NMM dep)"]
+        PAR3["After 0.2:<br/>3.1 can start (tokenizer, no model dep)"]
+        PAR4["Within Phase 2:<br/>2.0, 2.1, 2.2, 2.3 are all independent — only 2.4 needs all four"]
+        PAR5["Within Phase 5:<br/>5.1 and 5.2 are independent given 2.6"]
+    end
+
+    %% ============================================================
+    %% Recommended order overlay (from ROADMAP §Recommended order)
+    %% ============================================================
+    subgraph ORDER["Recommended sequential checkpoints"]
+        direction TB
+        O1["1. Phase 0 end-to-end"]
+        O2["2. Phase 1.1 – 1.4 (unit tests per module)"]
+        O3["3. Phase 1.5 – 1.6 (NS bound, autocast tests)"]
+        O4["4. Phase 1.7 – 1.9 (overfit single k→v)"]
+        O5["5. Phase 2.0 – 2.2 (mask block structure)"]
+        O6["6. Phase 2.3 – 2.5 (out_scale=0 → y_attn)"]
+        O7["7. Phase 2.6 (HF logit parity < 1e-4) ⭐ HARD GATE"]
+        O8["8. Phase 3 (sub-stream continuity)"]
+        O9["9. Phase 4.1 – 4.3 (100-step overfit)"]
+        O10["10. Phase 4.4 (short fine-tune)"]
+        O11["11. Phase 5 (perplexity within 5% of HF)"]
+        O12["12. Phase 4.5 (multi-GPU DDP, K=2 accum)"]
+        O13["13. Phase 6 (optional; scan vs seq < 5%)"]
+
+        O1 --> O2 --> O3 --> O4 --> O5 --> O6 --> O7
+        O7 --> O8 --> O9 --> O10 --> O11 --> O12 --> O13
+    end
+
+    %% ============================================================
+    %% Critical-path notes
+    %% ============================================================
+    subgraph CRITPATH["Critical path"]
+        direction TB
+        CP["The longest dependency chain:<br/>0.1 → 0.2 → 1.4 → 1.5 → 1.7 → 1.8 → 2.4 → 2.5 → 2.6 → 4.2 → 4.5<br/><br/>11 tasks, ~70% of project effort.<br/>Everything else can be parallelized around this spine."]
+        BOTTLE["Biggest validation gate: 2.6 (HF logit parity).<br/>If 2.6 fails, every later experiment is meaningless.<br/>Run the parity test obsessively until it passes."]
+    end
+
+    %% ============================================================
+    %% Styling
+    %% ============================================================
+    classDef p0 fill:#fff4d6,stroke:#b8860b,color:#000
+    classDef p1 fill:#e6f4ff,stroke:#1f6feb,color:#000
+    classDef p2 fill:#eafbea,stroke:#2da44e,color:#000
+    classDef p3 fill:#f3eaff,stroke:#8250df,color:#000
+    classDef p4 fill:#ffeef0,stroke:#cf222e,color:#000
+    classDef p5 fill:#fffaeb,stroke:#bf8700,color:#000
+    classDef p6 fill:#f5f5f5,stroke:#666,color:#000
+    classDef hard fill:#ffeef0,stroke:#cf222e,color:#000,stroke-width:3px
+
+    class T01,T02 p0
+    class T11,T12,T13,T14,T15,T16,T17,T18,T19 p1
+    class T20,T21,T22,T23,T24,T25 p2
+    class T26 hard
+    class T31,T32,T33 p3
+    class T41,T42,T43,T44,T45 p4
+    class T51,T52,T53 p5
+    class T61,T62 p6
+    class O7 hard
+    class BOTTLE,CRITPATH hard

@@ -1,0 +1,107 @@
+%% TITANS MAG + GPT-2 — Training loop sequence
+%% One gradient-update "step" = K accumulation micro-batches, each with C TBPTT chunks.
+
+sequenceDiagram
+    autonumber
+
+    participant U as User / launcher
+    participant T as Trainer (train.py)
+    participant CFG as Config
+    participant DDP as DDP backend (NCCL)
+    participant L as ParallelStreamLoader
+    participant M as TitansMAGGPT2<br/>(DDP-wrapped)
+    participant B as TitansMAGBlock i
+    participant N as NMM_i (inside Block i)
+    participant ST as nmm_states[i]<br/>(M, S) per layer
+    participant AC as autocast (bf16)
+    participant O as Optimizer<br/>(4 param groups)
+    participant SCH as LR scheduler
+    participant CK as Checkpoint mgr
+
+    rect rgb(245,245,255)
+    note over U,CK: 0. Process setup (once per rank)
+    U->>T: torchrun ... train.py
+    T->>CFG: load + validate (raise ValueError, not assert)
+    note right of CFG: chunk_size <= block_size,<br/>n_embd % n_head == 0,<br/>use_swa => swa_window > 0
+    T->>DDP: init_process_group(nccl)
+    T->>T: set per-rank seed (rank-divergent)
+    T->>M: build model, load pretrained GPT-2,<br/>init NMM (out_scale=0 if finetune)
+    T->>M: DDP(model, find_unused_parameters=False)
+    T->>O: build optimizer<br/>groups: {gpt2_decay, gpt2_no_decay,<br/>nmm_decay, nmm_no_decay}
+    T->>SCH: build scheduler<br/>base_lrs read from constants,<br/>NOT from optimizer.param_groups
+    T->>L: build loader AFTER config validated
+    T->>CK: maybe resume(model, optimizer, scheduler)
+    note right of CK: nmm_states NOT in checkpoint —<br/>reset to init on resume
+    end
+
+    rect rgb(245,255,245)
+    note over T,CK: 1. Outer loop — one iteration = one optimizer step
+    loop while step < max_steps
+        T->>O: zero_grad(set_to_none=True)
+        T->>ST: init_states() per layer from<br/>memory_mlp.W*.weight.detach().clone()<br/>broadcast to [B, ...]
+
+        rect rgb(255,250,235)
+        note over T,N: 1a. Gradient accumulation — K micro-batches
+        loop k in 0..K-1 (accumulation)
+            T->>L: next_batch() &rarr; (idx, doc_boundaries)
+            note right of L: parallel sub-streams,<br/>doc_boundaries marks restarts
+
+            alt k < K-1 (NOT the last accumulation step)
+                T->>M: model.no_sync():<br/>suppress all-reduce
+            else k == K-1 (final accumulation)
+                T->>M: normal forward — all-reduce will fire on backward
+            end
+
+            rect rgb(255,245,245)
+            note over T,N: 1b. TBPTT chunking within micro-batch
+            loop c in 0..C-1 (chunks)
+                T->>AC: enter autocast(bf16)
+                T->>M: forward(idx_c, nmm_states, doc_boundaries_c)
+
+                loop layer i in 0..N-1
+                    M->>B: block_i(x, state_i, doc_b)
+                    B->>B: x&#771; = concat([P, x])<br/>y_attn = attn(ln_1(x&#771;))[:,N_p:]
+                    B->>N: forward_chunk(ln_nmm(x), state_i, doc_b)
+                    note right of N: per token t:<br/>1. l2_norm(silu(conv(q/k/v_proj(x))))<br/>2. loss = ||MLP(k&#770;; M_{t-1}) - v||&sup2;<br/>3. g = torch.func.grad+vmap<br/>4. NS5 in fp32 (autocast disabled,<br/>explicit .float())<br/>5. S = &eta;&middot;S - &theta;&middot;NS(g)  (&theta; POST-NS)<br/>6. M = (1-&alpha;)&middot;M + S<br/>7. torch.where reset on doc_b<br/>8. NaN-skip: reset state if non-finite<br/>9. y = out_scale &odot; MLP(q&#770;; M_t)
+                    N->>ST: write updated (M_t, S_t)
+                    N-->>B: y_mem
+                    B->>B: o = y_attn &middot; (1 + silu(&gamma;_m &middot; y_mem))<br/>x = x + o + mlp(ln_2(x+o))
+                    B-->>M: x_out
+                end
+
+                M-->>T: logits, nmm_states_new
+                T->>T: loss = cross_entropy(logits, targets) / (K * C)
+                T->>AC: exit autocast (back to fp32)
+
+                T->>M: loss.backward()
+                note right of M: bf16 autocast off &rarr; backward in fp32<br/>(autocast can silently override .float() — G226)
+
+                T->>ST: detach_states(nmm_states)<br/>between chunks (TBPTT cut)
+            end
+            end
+        end
+        end
+
+        rect rgb(235,245,255)
+        note over T,O: 1c. Optimizer step (after all K micro-batches)
+        T->>M: clip_grad_norm_(model.parameters(), max_norm)<br/>fp32 clip
+        T->>O: optimizer.step()  (fp32 master weights)
+        T->>SCH: scheduler.step()  (uses base_lrs from constants)
+        end
+
+        opt every save_every steps
+            T->>CK: save(model, optimizer, scheduler, step)
+        end
+
+        opt every log_every steps
+            T-->>U: log loss / lr / throughput
+        end
+    end
+    end
+
+    rect rgb(255,235,235)
+    note over T,DDP: 2. Shutdown — try/finally guarantees teardown
+    T->>T: try { train_loop } finally { cleanup }
+    T->>DDP: destroy_process_group()<br/>even on exception path (G225)
+    T-->>U: exit
+    end

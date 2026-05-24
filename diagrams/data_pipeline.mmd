@@ -1,0 +1,124 @@
+%% Data pipeline — ParallelStreamLoader for TBPTT-aware batching.
+%% The critical property: position i of every batch in a row continues the same document stream.
+
+flowchart TB
+
+    %% ============================================================
+    %% Raw data
+    %% ============================================================
+    subgraph SOURCE["Raw corpus"]
+        direction LR
+        FILES["text shards<br/>shard_000.txt<br/>shard_001.txt<br/>...<br/>shard_N.txt"]
+    end
+
+    %% ============================================================
+    %% Tokenization
+    %% ============================================================
+    subgraph TOKENIZE["Tokenization (tiktoken GPT-2)"]
+        direction TB
+        ENC["tokenizer.encode_corpus(file)<br/>Whole-file by default;<br/>line-per-doc only on opt-in.<br/>Literal '&lt;|endoftext|&gt;' in source<br/>is BPE-encoded, NOT EOT id (G152)."]
+        STREAM["concatenated token stream:<br/>[tok_0, tok_1, ..., tok_N-1]<br/>plus parallel:<br/>doc_starts: [bool] of same length"]
+        ENC --> STREAM
+    end
+    FILES --> TOKENIZE
+
+    %% ============================================================
+    %% DDP sharding
+    %% ============================================================
+    subgraph DDP_SHARD["DDP sharding — each rank sees its own slice (G151)"]
+        direction LR
+        R0["rank 0:<br/>tokens[0 : N/W]"]
+        R1["rank 1:<br/>tokens[N/W : 2N/W]"]
+        RDOTS["..."]
+        RW["rank W-1:<br/>tokens[(W-1)N/W : N]"]
+    end
+    STREAM --> DDP_SHARD
+
+    %% ============================================================
+    %% ParallelStreamLoader (one per rank)
+    %% ============================================================
+    subgraph LOADER["ParallelStreamLoader (this rank)"]
+        direction TB
+
+        SPLIT["Split rank's tokens into<br/>B = batch_size sub-streams<br/>of equal length"]
+
+        SUBSTREAMS["sub-stream 0:  [a_0, a_1, a_2, ...]<br/>sub-stream 1:  [b_0, b_1, b_2, ...]<br/>...<br/>sub-stream B-1: [z_0, z_1, z_2, ...]"]
+
+        CURSOR["per-substream cursor[b]<br/>tracks position into sub-stream b<br/>(carries across __iter__ calls)"]
+
+        SPLIT --> SUBSTREAMS
+        SUBSTREAMS --> CURSOR
+    end
+    DDP_SHARD --> LOADER
+
+    %% ============================================================
+    %% Batch assembly
+    %% ============================================================
+    subgraph BATCH["Per-iteration batch assembly"]
+        direction TB
+
+        ASSEMBLE["__iter__ yields one batch:<br/><br/>idx[b, :] = sub_stream_b[cursor[b] : cursor[b] + chunk_size]<br/>doc_b[b, :] = doc_starts at those positions<br/>cursor[b] += chunk_size  (NO overlap)<br/><br/>Shape: idx ∈ ℤ^{B × chunk_size}<br/>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;doc_boundaries ∈ 𝔹^{B × chunk_size}"]
+
+        CONTINUITY["⚠ Continuity invariant:<br/>batch_(k+1)[b, 0] = batch_k[b, chunk_size]<br/>i.e., row b continues row b's history.<br/>NMM state[b] carries forward."]
+
+        ASSEMBLE --> CONTINUITY
+    end
+    LOADER --> BATCH
+
+    %% ============================================================
+    %% Output to training loop
+    %% ============================================================
+    subgraph OUT["Output to train_step"]
+        direction LR
+        IDX["idx [B, chunk_size]<br/>token ids<br/>(stay on CPU here — G167)"]
+        DOC["doc_boundaries [B, chunk_size]<br/>True at within-chunk doc starts<br/>→ NMM state[b, t] resets there"]
+    end
+    BATCH --> IDX
+    BATCH --> DOC
+
+    %% ============================================================
+    %% Training consumer
+    %% ============================================================
+    subgraph CONSUMER["train_step (per chunk)"]
+        direction TB
+        TODEV["batch.to(device)<br/>(NOT pre-moved in loader — G167)"]
+        FWD["model.forward(idx, nmm_states, doc_boundaries)"]
+        DETACH["detach_states(nmm_states)<br/>between chunks (TBPTT cut)"]
+        TODEV --> FWD --> DETACH --> NEXT["next chunk (cursor advanced)"]
+    end
+    IDX --> CONSUMER
+    DOC --> CONSUMER
+    NEXT -.-> ASSEMBLE
+
+    %% ============================================================
+    %% Visualization of stream layout
+    %% ============================================================
+    subgraph LAYOUT["Layout visualization (B=3, chunk_size=4)"]
+        direction TB
+        VIZ["Rank 0 tokens (after DDP shard, after split into 3 sub-streams):<br/><br/>row 0:  [a0 a1 a2 a3] [a4 a5 a6 a7] [a8 a9 a10 a11] ...<br/>row 1:  [b0 b1 b2 b3] [b4 b5 b6 b7] [b8 b9 b10 b11] ...<br/>row 2:  [c0 c1 c2 c3] [c4 c5 c6 c7] [c8 c9 c10 c11] ...<br/>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└───batch 0───┘ └───batch 1───┘ └───batch 2───┘<br/><br/>Sub-stream b is contiguous across batches.<br/>NMM state[b] carries from batch 0 → batch 1 → ... ."]
+    end
+    BATCH -.-> LAYOUT
+
+    %% ============================================================
+    %% Common failure modes
+    %% ============================================================
+    subgraph FAIL["⚠ Failure modes"]
+        direction TB
+        F1["DataLoader(shuffle=False) does NOT give continuity.<br/>Default PyTorch loader treats each chunk as independent;<br/>NMM state has nothing to carry."]
+        F2["All ranks see the same data (G151).<br/>Forget to pass rank/world_size → identical batches across ranks<br/>→ effective batch size = per-rank batch, not B × W."]
+        F3["Pre-moving to GPU in the loader (G167).<br/>Makes the worker process touch CUDA → fork crash<br/>or wastes device memory on prefetched batches."]
+        F4["Treating literal '&lt;|endoftext|&gt;' as EOT id (G152).<br/>If a source file legitimately contains the text<br/>'&lt;|endoftext|&gt;', it must BPE-encode, not become eot_id."]
+        F5["Passing raw file handle to encode_corpus without flag (G210).<br/>Whole-file vs line-per-doc is a real semantic difference.<br/>Default whole-file; emit warning if a handle is passed without intent."]
+    end
+    LOADER -.-> FAIL
+
+    %% ============================================================
+    %% Styling
+    %% ============================================================
+    classDef warn fill:#ffeef0,stroke:#cf222e,color:#000
+    classDef good fill:#eafbea,stroke:#2da44e,color:#000
+    classDef state fill:#fff4d6,stroke:#b8860b,color:#000
+
+    class FAIL,F1,F2,F3,F4,F5,CONTINUITY warn
+    class LAYOUT,VIZ good
+    class CURSOR,SUBSTREAMS state

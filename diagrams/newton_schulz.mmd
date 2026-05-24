@@ -1,0 +1,105 @@
+%% Newton-Schulz 5-step spectral normalization — fp32 boundary, transpose-tall guard.
+%% The single most failure-prone subroutine in the inner loop.
+
+flowchart TB
+
+    %% ============================================================
+    %% Entry
+    %% ============================================================
+    IN["Input: per-token gradient G<br/>shape ∈ { [B, 4d, d] (W1, W_gate)<br/>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[B, d, 4d] (W2) }<br/>dtype: whatever ambient autocast says<br/>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;(typically bf16 during training)"]
+
+    %% ============================================================
+    %% Autocast disable region — the critical fp32 boundary
+    %% ============================================================
+    subgraph AUTOCAST_OFF["torch.amp.autocast(device_type=device.type, enabled=False)"]
+        direction TB
+        ENTER_AC["⚠ G226: This is the WHOLE FIX.<br/>Bare .float() is silently undone by ambient bf16 autocast<br/>— matmul inputs get re-cast to bf16 even after .float().<br/>The autocast region MUST wrap the entire iteration."]
+
+        CAST["G_fp32 = G.float()<br/>(record original dtype for return)"]
+
+        %% --------------------------------------------------------
+        %% Transpose guard
+        %% --------------------------------------------------------
+        SHAPE_CHECK{"shape[-2] &gt; shape[-1]<br/>(rows &gt; cols, tall matrix)?"}
+        TRANSPOSE["G_fp32 = G_fp32.transpose(-2, -1)<br/>transposed = True<br/><br/>⚠ G198: NS converges on WIDE matrices.<br/>W1/W_gate are [4d, d] (tall) → must transpose.<br/>W2 is [d, 4d] (wide) → no transpose."]
+        NO_TRANSPOSE["transposed = False"]
+
+        SHAPE_CHECK -- "yes (W1, W_gate)" --> TRANSPOSE
+        SHAPE_CHECK -- "no (W2)" --> NO_TRANSPOSE
+
+        %% --------------------------------------------------------
+        %% Normalize by Frobenius
+        %% --------------------------------------------------------
+        FROB["G_norm = G_fp32 / (‖G_fp32‖_F + eps)<br/>(eps = 1e-7)<br/><br/>Drives matrix into the unit-Frobenius ball<br/>so the polynomial iteration converges."]
+        TRANSPOSE --> FROB
+        NO_TRANSPOSE --> FROB
+
+        %% --------------------------------------------------------
+        %% The 5-step iteration
+        %% --------------------------------------------------------
+        subgraph ITER["5-step polynomial iteration"]
+            direction TB
+            INIT["X = G_norm<br/>coefficients: a, b, c<br/>(typically 3.4445, -4.7750, 2.0315)"]
+            STEP["Repeat 5 times:<br/>&nbsp;&nbsp;A = X · X.transpose(-2, -1)<br/>&nbsp;&nbsp;X = a·X + (b·A + c·A·A) · X<br/><br/>Polynomial drives singular values toward 1.<br/>After 5 steps: σ_i(X) ≈ 1 ± 0.01 for all i."]
+            INIT --> STEP
+        end
+        FROB --> ITER
+
+        %% --------------------------------------------------------
+        %% Restore shape
+        %% --------------------------------------------------------
+        UNTRANSPOSE{"transposed?"}
+        UNT_YES["X = X.transpose(-2, -1)<br/>back to original [4d, d]"]
+        UNT_NO["X unchanged"]
+        ITER --> UNTRANSPOSE
+        UNTRANSPOSE -- "yes" --> UNT_YES
+        UNTRANSPOSE -- "no" --> UNT_NO
+
+        %% --------------------------------------------------------
+        %% Cast back
+        %% --------------------------------------------------------
+        CAST_BACK["X = X.to(original_dtype)<br/>(typically bf16 for training)"]
+        UNT_YES --> CAST_BACK
+        UNT_NO --> CAST_BACK
+
+        ENTER_AC -.-> CAST
+        CAST --> SHAPE_CHECK
+    end
+    IN --> AUTOCAST_OFF
+
+    %% ============================================================
+    %% Output
+    %% ============================================================
+    OUT["g̃ = NS(g)<br/>spectral norm ≈ 1<br/>same shape and dtype as input"]
+    CAST_BACK --> OUT
+
+    %% ============================================================
+    %% Downstream use — θ POST-NS
+    %% ============================================================
+    THETA_POST["Used in NMM step:<br/>S_t = η_t · S_{t-1} - θ_t · NS(g_t)<br/><br/>⚠ θ_t scales POST-NS, NOT pre-NS.<br/>NS divides by ‖G‖_F → any pre-scaling cancels.<br/>NS(θ·g) = NS(g) exactly, so pre-NS θ has zero effect."]
+    OUT --> THETA_POST
+
+    %% ============================================================
+    %% Why each guard matters
+    %% ============================================================
+    subgraph GUARDS["Why each guard exists"]
+        direction TB
+        G1["1. autocast(enabled=False) wrapper (G226):<br/>Without it, matmul ops inside the iteration<br/>re-cast inputs to bf16 silently. The iteration<br/>then operates in bf16, accumulates error each<br/>step, and the spectral-norm guarantee dies.<br/>Symptom: training NaN within ~1K steps."]
+        G2["2. Transpose-tall guard (G198):<br/>Without it, NS on [4d, d] tall matrices<br/>doesn't fully converge. Spectral norm drifts,<br/>S_t accumulates larger-than-1 updates,<br/>training drifts. Symptom: slow divergence."]
+        G3["3. θ POST-NS, not pre-NS:<br/>Without it, θ has NO effect — NS cancels<br/>any uniform pre-scaling. The data-dependent<br/>learning rate is silently disabled.<br/>Symptom: training works but ablation studies<br/>show no θ effect."]
+        G4["4. fp32 cast preserved through iteration:<br/>Bare .float() at entry is undone by autocast.<br/>The fix in #1 is what makes the cast actually<br/>persist through every matmul."]
+        G5["5. Built once in __init__, called per step:<br/>NS is stateless except for coefficients;<br/>no point reconstructing per call.<br/>NMM module captures (a, b, c) on init."]
+    end
+
+    AUTOCAST_OFF -.-> GUARDS
+
+    %% ============================================================
+    %% Styling
+    %% ============================================================
+    classDef warn fill:#ffeef0,stroke:#cf222e,color:#000
+    classDef ok fill:#eafbea,stroke:#2da44e,color:#000
+    classDef io fill:#f3eaff,stroke:#8250df,color:#000
+
+    class ENTER_AC,TRANSPOSE,THETA_POST,G1,G2,G3,GUARDS warn
+    class FROB,ITER,STEP,CAST_BACK,OUT ok
+    class IN,OUT io

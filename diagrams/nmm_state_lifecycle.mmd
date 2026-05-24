@@ -1,0 +1,110 @@
+%% NMM (M, S) state lifecycle — when state is created, mutated, detached, reset, or discarded.
+%% State refers to the per-layer recurrent (M, S) tuple maintained outside the model graph.
+
+stateDiagram-v2
+    direction TB
+
+    [*] --> Uninitialized: process start
+
+    Uninitialized --> InitFromW: forward(idx, nmm_states=None)
+    note right of InitFromW
+        init_state(B, device):
+        M = {W*: memory_mlp.W*.weight
+                  .detach().clone()
+                  .unsqueeze(0).expand(B,...)
+                  .contiguous()}
+        S = zeros_like(M)
+        — G207: .to(device).clone() order
+                avoids wasted source-device copy
+    end note
+
+    InitFromW --> Live: state ready
+
+    Live --> Updating: per-token in forward_chunk
+    note right of Updating
+        Per token t (write-then-read):
+          ℓ = ‖MLP(k̂; M_{t-1}) - v‖²
+          g = vmap(grad(...))(M, k̂, v)
+          g̃ = NS5(g)               (fp32, autocast off)
+          S = η·S - θ·g̃            (θ POST-NS)
+          M = (1-α)·M + S
+          y = out_scale ⊙ MLP(q̂; M_t)
+    end note
+    Updating --> Live: chunk forward complete
+
+    Live --> ResetOnDoc: doc_boundaries[b,t] == True
+    note left of ResetOnDoc
+        torch.where(mask[..., None, None],
+                    init_M, M)
+        — NOT in-place assignment
+        (autograd tensor → RuntimeError)
+        Lazy-build init_M only when a
+        boundary actually fires (G211)
+    end note
+    ResetOnDoc --> Live
+
+    Live --> NaNDetected: loss / state non-finite
+    note right of NaNDetected
+        Caught in train_step:
+          if not torch.isfinite(loss):
+              optimizer.zero_grad(set_to_none=True)
+              return (loss, None, None)
+        Caller MUST reset nmm_states=None.
+        DDP accumulation path ALSO resets
+        (G213, G217) — otherwise corrupt
+        state persists across micro-batches.
+    end note
+    NaNDetected --> Uninitialized: nmm_states := None
+    Uninitialized --> InitFromW: next forward rebuilds
+
+    Live --> Detached: between TBPTT chunks
+    note left of Detached
+        detach_states(states):
+          for each leaf in nested (M, S):
+              t.detach()
+          handles state=None (G149)
+        Cuts the autograd graph so the
+        next chunk's backward doesn't
+        reach into the previous chunk.
+        Values are preserved; only the
+        graph link is severed.
+    end note
+    Detached --> Live: next chunk begins<br/>(same (M, S) values, fresh graph)
+
+    Live --> DiscardedOnRankBoundary: end of micro-batch in DDP
+    note right of DiscardedOnRankBoundary
+        nmm_states do NOT cross ranks.
+        Each rank maintains its own.
+        At optimizer.step() the values
+        are retained for the next batch,
+        but the graph is fully detached.
+    end note
+    DiscardedOnRankBoundary --> Live
+
+    Live --> NotSavedToCheckpoint: ckpt_save fires
+    note left of NotSavedToCheckpoint
+        nmm_states are NOT in the
+        checkpoint dict. Per-sequence
+        recurrent state, not model state.
+        save({'model': ..., 'optimizer': ...,
+              'scheduler': ..., 'step': ...})
+    end note
+    NotSavedToCheckpoint --> Live
+
+    Live --> Uninitialized: process resume from checkpoint
+    note right of Uninitialized
+        On resume:
+          1. Build model
+          2. load_state_dict
+          3. wrap DDP
+          4. build optimizer
+          5. load_optimizer (if present)
+          6. model.train()
+        → nmm_states starts as None;
+          first forward triggers InitFromW
+          from the (possibly trained)
+          memory_mlp.W*.weight values.
+    end note
+
+    Live --> [*]: process exit
+    NaNDetected --> [*]: unrecoverable<br/>(params went NaN, not just state)

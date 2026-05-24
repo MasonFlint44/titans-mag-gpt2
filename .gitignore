@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# Testing / type-checking caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Model artifacts (large; not for git)
+ckpts/
+checkpoints/
+*.pt
+*.ckpt
+*.pth
+*.bin
+*.safetensors
+
+# Training / experiment logging
+wandb/
+runs/
+lightning_logs/
+tb_logs/
+
+# Local data / tokenized corpora
+# (the data/ module IS tracked — only ignore downloaded datasets)
+datasets/
+corpus/
+*.tokens
+*.bin.idx
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
