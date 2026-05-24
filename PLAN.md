@@ -4066,8 +4066,8 @@ correctness-critical decision the audit found.
 | ✓ `_build_init_M` uses `.to(device).clone()` order (no wasted source-device copy) | 1.4 | G207 |
 | ✓ GPT-2 weight parity vs HF (NMM zeroed, N_p=0); max-logit-diff < 1e-4 | 2.6 | weight load correctness |
 | ✓ `load_pretrained` derives HF model name from `config.n_embd` (medium/large/xl work) | 2.6 | G216 |
-| Tokenizer: `decode(encode(s)) == s` for ASCII; `eot_token == 50256` | 3.1 | tokenizer basics |
-| Tokenizer: literal `<|endoftext|>` in text is BPE-encoded (NOT EOT id) | 3.1 | G152 |
+| ✓ Tokenizer: `decode(encode(s)) == s` for ASCII; `eot_token == 50256` | 3.1 | tokenizer basics |
+| ✓ Tokenizer: literal `<|endoftext|>` in text is BPE-encoded (NOT EOT id) | 3.1 | G152 |
 | `encode_corpus(open(path))` is treated as line-per-doc (warn user); whole-file pattern recommended | 3.1 | G210 |
 | ParallelStreamLoader: position-i stream is contiguous across batches | 3.3 | G151 |
 | Optimizer has exactly 4 param groups; no param in multiple groups | 4.1 | G117 / 4-group split |
