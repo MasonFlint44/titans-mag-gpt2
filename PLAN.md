@@ -4053,8 +4053,8 @@ correctness-critical decision the audit found.
 | ✓ reset_state on doc boundaries leaves unmasked entries byte-identical | 1.9 | G149 |
 | ✓ detach_states handles `None` (first-step case) | 1.9 | G149 |
 | CausalSelfAttention with `_aug_mask(T)` produces correct persistent/causal pattern | 2.0 | attention mask |
-| CausalSelfAttention rejects `n_head` not dividing `n_embd` via `ValueError` (NOT AssertionError, NOT silent under -O) | 2.0 | G220 |
-| GPT2MLP matches `F.gelu(c_fc(x), approximate='tanh')` elementwise | 2.0 | HF parity |
+| ✓ CausalSelfAttention rejects `n_head` not dividing `n_embd` via `ValueError` (NOT AssertionError, NOT silent under -O) | 2.0 | G220 |
+| ✓ GPT2MLP matches `F.gelu(c_fc(x), approximate='tanh')` elementwise | 2.0 | HF parity |
 | Persistent token mask: top-right block is -inf (persistent ⊥ real) | 2.1 | mask block structure |
 | ln_nmm appears in state_dict, independent of ln_1 | 2.2 | separate norms |
 | MAG additive gate at out_scale=0 equals y_attn exactly | 2.3 | finetune init |
