@@ -4055,11 +4055,11 @@ correctness-critical decision the audit found.
 | CausalSelfAttention with `_aug_mask(T)` produces correct persistent/causal pattern | 2.0 | attention mask |
 | ✓ CausalSelfAttention rejects `n_head` not dividing `n_embd` via `ValueError` (NOT AssertionError, NOT silent under -O) | 2.0 | G220 |
 | ✓ GPT2MLP matches `F.gelu(c_fc(x), approximate='tanh')` elementwise | 2.0 | HF parity |
-| Persistent token mask: top-right block is -inf (persistent ⊥ real) | 2.1 | mask block structure |
-| ln_nmm appears in state_dict, independent of ln_1 | 2.2 | separate norms |
-| MAG additive gate at out_scale=0 equals y_attn exactly | 2.3 | finetune init |
-| SWA banded mask: row i attends to j ∈ (i-swa_window, i] | 2.4 | G136 |
-| Block forward shape-invariant; jit-traceable | 2.4 | block correctness |
+| ✓ Persistent token mask: top-right block is -inf (persistent ⊥ real) | 2.1 | mask block structure |
+| ✓ ln_nmm appears in state_dict, independent of ln_1 | 2.2 | separate norms |
+| ✓ MAG additive gate at out_scale=0 equals y_attn exactly | 2.3 | finetune init |
+| ✓ SWA banded mask: row i attends to j ∈ (i-swa_window, i] | 2.4 | G136 |
+| ✓ Block forward shape-invariant; jit-traceable | 2.4 | block correctness |
 | `_apply_gpt2_init`: `wte.weight.std() ≈ 0.02` (NOT ≈ 1) post-init | 2.5 | G155 |
 | `_apply_gpt2_init`: `attn.proj.weight.std()` ≈ 0.02/√(2·n_layer) | 2.5 | G155 residual scaling |
 | `_apply_gpt2_init` skips NMM-internal modules by id (renaming `self.nmm` doesn't break it) | 2.5 | G203 |
