@@ -4060,9 +4060,9 @@ correctness-critical decision the audit found.
 | ✓ MAG additive gate at out_scale=0 equals y_attn exactly | 2.3 | finetune init |
 | ✓ SWA banded mask: row i attends to j ∈ (i-swa_window, i] | 2.4 | G136 |
 | ✓ Block forward shape-invariant; jit-traceable | 2.4 | block correctness |
-| `_apply_gpt2_init`: `wte.weight.std() ≈ 0.02` (NOT ≈ 1) post-init | 2.5 | G155 |
-| `_apply_gpt2_init`: `attn.proj.weight.std()` ≈ 0.02/√(2·n_layer) | 2.5 | G155 residual scaling |
-| `_apply_gpt2_init` skips NMM-internal modules by id (renaming `self.nmm` doesn't break it) | 2.5 | G203 |
+| ✓ `_apply_gpt2_init`: `wte.weight.std() ≈ 0.02` (NOT ≈ 1) post-init | 2.5 | G155 |
+| ✓ `_apply_gpt2_init`: `attn.proj.weight.std()` ≈ 0.02/√(2·n_layer) | 2.5 | G155 residual scaling |
+| ✓ `_apply_gpt2_init` skips NMM-internal modules by id (renaming `self.nmm` doesn't break it) | 2.5 | G203 |
 | ✓ `_build_init_M` uses `.to(device).clone()` order (no wasted source-device copy) | 1.4 | G207 |
 | GPT-2 weight parity vs HF (NMM zeroed, N_p=0); max-logit-diff < 1e-4 | 2.6 | weight load correctness |
 | `load_pretrained` derives HF model name from `config.n_embd` (medium/large/xl work) | 2.6 | G216 |
@@ -4089,7 +4089,7 @@ correctness-critical decision the audit found.
 | Partial DDP accumulation cycle skips optimizer.step (avoids rank divergence) | 4.5 | G214 |
 | Partial cycle detected ALSO when StopIteration fires at iter K-1 (off-by-one defended) | 4.5 | G222 |
 | ✓ `TitansConfig(n_embd=768, n_head=10)` raises `ValueError` at config time (NOT model time) | 0.2 | G223 |
-| `_apply_gpt2_init` uses relative import `from .nmm` (works under any top-level package name) | 2.5 | G224 |
+| ✓ `_apply_gpt2_init` uses relative import `from .nmm` (works under any top-level package name) | 2.5 | G224 |
 | Training loop wrapped in try/finally; `destroy_process_group` runs on exception path | 4.5 | G225 |
 | Consolidated loop builds `config` BEFORE the loader references `config.chunk_size` | 4.5 | G205 |
 | Resume sequence wraps DDP after `load_state_dict` and before optimizer build | 4.3 | G209 |
