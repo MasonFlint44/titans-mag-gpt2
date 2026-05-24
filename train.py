@@ -286,3 +286,302 @@ def load_checkpoint(path, device: torch.device) -> dict:
     handled by the caller (G219).
     """
     return torch.load(path, map_location=device, weights_only=False)
+
+
+# ---------------------------------------------------------------------------
+# 4.5 — Training loop helpers
+# ---------------------------------------------------------------------------
+
+def is_partial_cycle(batch, accum_i: int) -> bool:
+    """G222: the correct partial-cycle skip condition.
+
+    A partial cycle is when the loader's StopIteration fires mid-accumulation
+    (i.e., before the final micro-batch of an accumulation cycle that would
+    have triggered the all-reduce). The trip wire is `batch is None` (loader
+    exhausted) AND `accum_i > 0` (we already ran at least one micro-batch in
+    this cycle, so accumulator grads are non-zero — we'd be tempted to
+    optimizer.step() on them, but that would diverge across ranks because
+    different ranks may have different numbers of partial micro-batches
+    depending on stream length).
+
+    The naive `accum_i < ACCUM_STEPS - 1` check is silently off-by-one: at
+    iter K-1, StopIteration fires after running micro-batch K-1 (the last
+    one in the cycle), so accum_i == K-1 == ACCUM_STEPS - 1 -> check is
+    False -> the cycle is treated as complete -> step fires (correct). But
+    when StopIteration fires at iter K (cycle finished, fetching the NEXT
+    cycle's first batch), accum_i == 0 -> naive check is True
+    (0 < K-1) -> we erroneously skip what was actually a complete cycle. The
+    `(batch is None) and (accum_i > 0)` form has no off-by-one.
+    """
+    return (batch is None) and (accum_i > 0)
+
+
+def run_training(
+    model: nn.Module,
+    optimizer: AdamW,
+    loader,
+    device: torch.device,
+    max_steps: int,
+    warmup_steps: int,
+    accum_steps: int = 1,
+    log_every: int = 50,
+    save_every: int = None,
+    save_path: str = None,
+    config=None,
+    autocast_dtype: torch.dtype = None,
+    rank: int = 0,
+    is_distributed: bool = False,
+) -> None:
+    """Top-level training loop covering both Phase 4.4 (fine-tune) and 4.5
+    (from-scratch). One optimizer.step per accumulation cycle of `accum_steps`
+    micro-batches.
+
+    DDP: caller wraps `model` with DDP and passes `is_distributed=True`. All
+    micro-batches except the last in a cycle run inside `model.no_sync()` to
+    suppress per-microbatch all-reduce (G200). Partial cycle at corpus end
+    is detected via G222's `(batch is None) and (accum_i > 0)` check and
+    skipped to avoid rank divergence — the per-rank `.grad` buffers were
+    never AllReduce'd. On single GPU, partial cycles step normally.
+
+    NaN-skip: if accumulated grad_norm is non-finite, zero grads AND reset
+    nmm_states to None (G217) so the next cycle's first micro-batch hits
+    model.forward's None branch and re-inits — otherwise NaN-tainted M
+    livelocks until the next document boundary.
+
+    NCCL teardown (try/finally with destroy_process_group, G225/G227) lives
+    in the entry-point script that wraps this call, not here — keeps this
+    function single-purpose and reusable from notebooks / tests.
+    """
+    import contextlib
+
+    base_lrs = base_lrs_from_constants()
+    model.train()
+    nmm_states = None
+
+    step = 0
+    micro_batches = iter(loader)
+    while step < max_steps:
+        cycle_ran_any_microbatch = False
+        cycle_completed = True
+
+        for accum_i in range(accum_steps):
+            try:
+                batch = next(micro_batches)
+            except StopIteration:
+                batch = None
+
+            if batch is None and accum_i == 0:
+                # Loader exhausted exactly at cycle boundary; clean stop.
+                return
+
+            if is_partial_cycle(batch, accum_i):
+                # G214/G222: under DDP, this cycle's micro-batches ran with
+                # no_sync; per-rank .grad never AllReduce'd. Stepping would
+                # diverge ranks permanently. Discard + stop.
+                if is_distributed:
+                    optimizer.zero_grad(set_to_none=True)
+                    nmm_states = None  # G217 — match NaN-skip semantics
+                    return
+                # Single-GPU: partial is safe (no AllReduce). Treat as complete.
+                cycle_completed = False
+                break
+
+            input_ids, doc_boundaries = batch
+            input_ids = input_ids.to(device, non_blocking=True)
+            doc_boundaries = doc_boundaries.to(device, non_blocking=True)
+            nmm_states = _detach_states(nmm_states)
+
+            is_last_accum = (accum_i == accum_steps - 1)
+            sync_ctx = (
+                model.no_sync()
+                if (is_distributed and not is_last_accum
+                    and hasattr(model, "no_sync"))
+                else contextlib.nullcontext()
+            )
+
+            with sync_ctx:
+                if autocast_dtype is not None:
+                    with torch.autocast(
+                        device_type=device.type, dtype=autocast_dtype
+                    ):
+                        logits, nmm_states = model(
+                            input_ids, nmm_states, doc_boundaries
+                        )
+                        loss = F.cross_entropy(
+                            logits[:, :-1].reshape(-1, logits.size(-1)),
+                            input_ids[:, 1:].reshape(-1),
+                        ) / accum_steps
+                else:
+                    logits, nmm_states = model(
+                        input_ids, nmm_states, doc_boundaries
+                    )
+                    loss = F.cross_entropy(
+                        logits[:, :-1].reshape(-1, logits.size(-1)),
+                        input_ids[:, 1:].reshape(-1),
+                    ) / accum_steps
+                loss.backward()
+            cycle_ran_any_microbatch = True
+
+        if not cycle_ran_any_microbatch:
+            break
+
+        # One optimizer.step per completed accumulation cycle.
+        apply_lr(
+            optimizer, base_lrs, step,
+            warmup_steps=warmup_steps, max_steps=max_steps,
+        )
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        if torch.isfinite(grad_norm):
+            optimizer.step()
+        else:
+            # G217 — match the train_step NaN-skip pattern.
+            nmm_states = None
+        optimizer.zero_grad(set_to_none=True)
+
+        if rank == 0 and step % log_every == 0:
+            nmm_norms = compute_nmm_norm(nmm_states)
+            print(
+                f"step={step} loss={loss.item() * accum_steps:.4f} "
+                f"grad_norm={grad_norm.item():.4f} nmm_norms={nmm_norms}"
+            )
+
+        if (
+            rank == 0
+            and save_every is not None
+            and save_path is not None
+            and step > 0
+            and step % save_every == 0
+        ):
+            save_checkpoint(save_path, model, optimizer, step, config)
+
+        step += 1
+        if not cycle_completed:
+            # Single-GPU partial cycle exhausted the loader; stop.
+            break
+
+
+def _detach_states(states):
+    """Local alias for detach_states to avoid the top-level circular import."""
+    from model.nmm import detach_states
+    return detach_states(states)
+
+
+# ---------------------------------------------------------------------------
+# 4.5 — From-scratch entry point (CLI)
+# ---------------------------------------------------------------------------
+
+def main():
+    """From-scratch training entry. Distributed via torchrun (sets LOCAL_RANK)."""
+    import argparse
+    import os
+
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
+
+    from config import TitansConfig
+    from data.dataloader import ParallelStreamLoader
+    from data.tokenizer import Tokenizer
+    from model.titans_gpt2 import TitansMAGGPT2
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", required=True)
+    parser.add_argument("--size", default="small",
+                        choices=["small", "medium", "large", "xl"])
+    parser.add_argument("--chunk-size", type=int, default=1024)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--grad-accum", type=int, default=1)
+    parser.add_argument("--max-steps", type=int, default=100_000)
+    parser.add_argument("--warmup-steps", type=int, default=1000)
+    parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--save-every", type=int, default=1000)
+    parser.add_argument("--save-path", default="ckpts/from_scratch.pt")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    # Device selection — LOCAL_RANK aware under torchrun.
+    is_distributed = "LOCAL_RANK" in os.environ and torch.cuda.is_available()
+    if is_distributed:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        dist.init_process_group(backend="nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    elif torch.cuda.is_available():
+        device = torch.device("cuda:0")
+        rank, world_size = 0, 1
+    else:
+        device = torch.device("cpu")
+        rank, world_size = 0, 1
+
+    try:
+        # Config BEFORE loader (loader reads chunk_size) — G205.
+        factory = {
+            "small": TitansConfig.gpt2_small,
+            "medium": TitansConfig.gpt2_medium,
+            "large": TitansConfig.gpt2_large,
+            "xl": TitansConfig.gpt2_xl,
+        }[args.size]
+        config = factory(
+            finetune_mode=False,
+            chunk_size=args.chunk_size,
+            block_size=args.chunk_size,  # match so all wpe positions train (G163)
+        )
+
+        # Seed BEFORE model so all ranks build identical params, then re-seed
+        # PER RANK so dropout masks diverge (G204).
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+
+        model = TitansMAGGPT2(config).to(device)
+
+        # Per-rank seed AFTER model construction.
+        torch.manual_seed(args.seed + rank)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed + rank)
+
+        if is_distributed:
+            model = DDP(model, device_ids=[local_rank])
+
+        optimizer = build_optimizer(model)
+
+        tok = Tokenizer()
+        with open(args.data, "r", encoding="utf-8") as f:
+            token_stream = tok.encode_corpus([f.read()])
+
+        loader = ParallelStreamLoader(
+            token_stream,
+            batch_size=args.batch_size,
+            chunk_size=args.chunk_size,
+            eot_id=tok.eot_token,
+            rank=rank,
+            world_size=world_size,
+        )
+
+        autocast_dtype = torch.bfloat16 if device.type == "cuda" else None
+
+        run_training(
+            model=model,
+            optimizer=optimizer,
+            loader=loader,
+            device=device,
+            max_steps=args.max_steps,
+            warmup_steps=args.warmup_steps,
+            accum_steps=args.grad_accum,
+            log_every=args.log_every,
+            save_every=args.save_every,
+            save_path=args.save_path,
+            config=config,
+            autocast_dtype=autocast_dtype,
+            rank=rank,
+            is_distributed=is_distributed,
+        )
+    finally:
+        # G225/G227 — NCCL cleanup on exception path. Consistent 4-space indent.
+        if is_distributed and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()

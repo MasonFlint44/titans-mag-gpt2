@@ -4076,23 +4076,23 @@ correctness-critical decision the audit found.
 | ✓ Loss decreases monotonically on 100-step overfit batch | 4.2 | end-to-end |
 | ✓ Injected `loss = loss + nan` does NOT corrupt parameters | 4.2 | G158 |
 | ✓ NaN-skip resets `nmm_states` to None (caller's next call re-initializes) | 4.2 | G213 |
-| NaN-skip in accumulation block also resets `nmm_states` to None | 4.5 | G217 |
+| ✓ NaN-skip in accumulation block also resets `nmm_states` to None | 4.5 | G217 |
 | ✓ bf16 autocast: backward + clip + step run in fp32 | 4.2 | G159 |
 | ✓ `apply_lr` scales all 4 param groups; preserves 1:1:3:3 ratio | 4.3 | G157 |
 | ✓ `apply_lr` respects user-supplied `max_steps`/`warmup_steps` (NOT defaults) | 4.3 | G175 |
 | ✓ `base_lrs` constants survive `optimizer.load_state_dict` deflation | 4.3 | G162 |
-| DDP-aware checkpoint save fires only on rank 0; barrier follows | 4.3, 4.5 | G199 |
-| Consolidated loop wraps with DDP after `.to(device)`, before optimizer | 4.5 | G201 |
-| `init_process_group` called once before DDP wrap; `destroy_process_group` at end | 4.5 | G201 |
-| Per-rank seed differs after model construction (dropout masks diverge) | 4.5 | G204 |
-| Gradient accumulation under DDP uses `model.no_sync()` for all but last micro-batch | 4.5 | G200 |
-| Partial DDP accumulation cycle skips optimizer.step (avoids rank divergence) | 4.5 | G214 |
-| Partial cycle detected ALSO when StopIteration fires at iter K-1 (off-by-one defended) | 4.5 | G222 |
+| DDP-aware checkpoint save fires only on rank 0; barrier follows | 4.3, 4.5 | G199 (ddp-marked) |
+| Consolidated loop wraps with DDP after `.to(device)`, before optimizer | 4.5 | G201 (ddp-marked) |
+| `init_process_group` called once before DDP wrap; `destroy_process_group` at end | 4.5 | G201 (ddp-marked) |
+| Per-rank seed differs after model construction (dropout masks diverge) | 4.5 | G204 (ddp-marked) |
+| Gradient accumulation under DDP uses `model.no_sync()` for all but last micro-batch | 4.5 | G200 (ddp-marked) |
+| Partial DDP accumulation cycle skips optimizer.step (avoids rank divergence) | 4.5 | G214 (ddp-marked) |
+| ✓ Partial cycle detected ALSO when StopIteration fires at iter K-1 (off-by-one defended) | 4.5 | G222 |
 | ✓ `TitansConfig(n_embd=768, n_head=10)` raises `ValueError` at config time (NOT model time) | 0.2 | G223 |
 | ✓ `_apply_gpt2_init` uses relative import `from .nmm` (works under any top-level package name) | 2.5 | G224 |
-| Training loop wrapped in try/finally; `destroy_process_group` runs on exception path | 4.5 | G225 |
-| Consolidated loop builds `config` BEFORE the loader references `config.chunk_size` | 4.5 | G205 |
-| Resume sequence wraps DDP after `load_state_dict` and before optimizer build | 4.3 | G209 |
+| Training loop wrapped in try/finally; `destroy_process_group` runs on exception path | 4.5 | G225 (ddp-marked) |
+| ✓ Consolidated loop builds `config` BEFORE the loader references `config.chunk_size` | 4.5 | G205 |
+| Resume sequence wraps DDP after `load_state_dict` and before optimizer build | 4.3 | G209 (ddp-marked) |
 | ✓ Checkpoint save/load round-trip: state_dict + optimizer state populated post-resume | 4.3 | G153 / G134 / G168 |
 | ✓ Resume from HF-init checkpoint (no 'optimizer' key) does not raise KeyError | 4.3 | G219 |
 | ✓ Resume sequence ends with `model.train()` (defense against prior eval-mode code) | 4.3 | G221 |
