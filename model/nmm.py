@@ -3,6 +3,35 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.func import functional_call, grad, vmap
+
+
+def _make_grad_fn(memory_mlp: nn.Module, spectral_norm: bool):
+    """Build the cached vmap(grad(inner_loss)) per-sample gradient function.
+
+    The reduction is derived from `spectral_norm`, NOT hardcoded:
+      - True: 'sum' — Newton-Schulz normalises the gradient's spectral norm
+        to 1, so the d_model factor cancels and sum vs mean is invisible
+        downstream. Matches paper Eq. 12 (squared L2 norm).
+      - False: 'mean' — without NS, 'sum' would let the gradient grow with
+        d_model, scaling W_theta's effective LR by ~d. 'mean' keeps the
+        gradient magnitude independent of d.
+
+    Mismatch between this flag and the downstream NS branch is silent and
+    catastrophic: a user toggling nmm_spectral_norm=False after construction
+    keeps the cached 'sum' reduction (no NS to cancel the d factor),
+    inflating per-token LR ~768x at gpt2_small dims. Treat
+    nmm_spectral_norm as construction-time-only; rebuild the NMM to change it.
+    """
+    reduction = "sum" if spectral_norm else "mean"
+
+    def inner_loss(params, k_hat, v):
+        # params: dict of per-sample weights ([h,d] / [d,h]); k_hat, v: [d]
+        pred = functional_call(memory_mlp, params, k_hat)
+        return F.mse_loss(pred, v, reduction=reduction)
+
+    # argnums=0 (default) -> grad w.r.t. params (must stay first arg).
+    return vmap(grad(inner_loss), in_dims=(0, 0, 0))
 
 
 class CausalDepthwiseConv1d(nn.Module):
@@ -94,10 +123,12 @@ class NeuralMemoryModule(nn.Module):
         n_embd: int,
         expansion: int = 4,
         kernel_size: int = 4,
+        spectral_norm: bool = True,
         finetune_mode: bool = True,
     ):
         super().__init__()
         self.n_embd = n_embd
+        self.nmm_spectral_norm = spectral_norm
         self.finetune_mode = finetune_mode
 
         # Q/K/V projections — SiLU/L2 applied at call site, not inside.
@@ -125,6 +156,26 @@ class NeuralMemoryModule(nn.Module):
             self.out_scale = nn.Parameter(torch.zeros(n_embd))
         else:
             self.out_scale = nn.Parameter(torch.ones(n_embd))
+
+        # Per-sample inner gradient — built ONCE; recreating vmap(grad(...)) in
+        # forward/step is measurably slower at T=512. Reduction is baked in via
+        # spectral_norm at construction time; mutating self.nmm_spectral_norm
+        # later does NOT change the cached reduction. Lock the construction
+        # value so downstream sanity checks can detect drift.
+        self.per_sample_grad_fn = _make_grad_fn(
+            self.memory_mlp, spectral_norm=self.nmm_spectral_norm
+        )
+        self._spectral_norm_at_init = self.nmm_spectral_norm
+
+        # Per-sample retrieval — same caching rationale. functional_call reads
+        # self.memory_mlp at call time, so device moves of NMM after __init__
+        # are still respected.
+        def _retrieve_one_sample(m_dict, q):
+            return functional_call(
+                self.memory_mlp, m_dict, q.unsqueeze(0)
+            ).squeeze(0)
+
+        self._batched_retrieve = vmap(_retrieve_one_sample, in_dims=(0, 0))
 
     def _build_init_M(self, B: int, device) -> dict:
         """Per-sample-batched initial M dict from memory_mlp.W*.weight.

@@ -4038,8 +4038,8 @@ correctness-critical decision the audit found.
 | ✓ q̂/k̂ L2 normalized, ‖v‖ unconstrained | 1.2 | activation/L2 placement |
 | ✓ W_θ/η/α outputs shape `[B, T]` (not `[B, T, 1]`) | 1.3 | broadcasting bug |
 | ✓ out_scale init: zeros when finetune_mode=True, ones when False | 1.4 | G123 |
-| Inner-loss gradient matches `autograd.functional.jacobian` to 1e-4 | 1.5 | torch.func correctness |
-| Reduction switch: spectral_norm=False gradient ≈ 1/d × spectral_norm=True | 1.5 | G160 |
+| ✓ Inner-loss gradient matches `autograd.functional.jacobian` to 1e-4 | 1.5 | torch.func correctness |
+| ✓ Reduction switch: spectral_norm=False gradient ≈ 1/d × spectral_norm=True | 1.5 | G160 |
 | Newton-Schulz spectral norm bound ≈ 1 for random matrices any shape | 1.6 | NS5 correctness |
 | NS transpose guard: tall vs wide matrices both work | 1.6 | NS convergence |
 | NS5 forces fp32 internally; post-NS spectral norm ≈ 1 even under bf16 autocast | 1.6 | G198 |
