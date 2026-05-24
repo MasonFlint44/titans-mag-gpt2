@@ -1,0 +1,11 @@
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+    "slow: CPU test taking >5s but <60s",
+    "gpu: requires CUDA",
+    "slow_gpu: GPU test taking >60s",
+    "ddp: requires >=2 GPUs and torchrun",
+    "compile: requires torch.compile",
+    "perf: performance gate with deterministic threshold",
+]

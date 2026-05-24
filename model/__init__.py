@@ -1,0 +1,1 @@
+"""TITANS MAG model components."""
