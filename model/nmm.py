@@ -50,3 +50,22 @@ class NMMProjection(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(self.linear(x))
+
+
+class NeuralMemoryModule(nn.Module):
+    """Online memory module with surprise-driven weight updates.
+
+    Holds the data-dependent update params W_theta, W_eta, W_alpha:
+    three Linear(d, 1, bias=False) modules whose sigmoid outputs are
+    per-token scalars (learning rate, momentum decay, forgetting rate).
+    Call site is `sigmoid(self.W_theta(x)).squeeze(-1)` — squeezing to
+    [B, T] (not [B, T, 1]) is required for downstream broadcasting and
+    for grad() to receive a scalar inner loss.
+    """
+
+    def __init__(self, n_embd: int):
+        super().__init__()
+        self.n_embd = n_embd
+        self.W_theta = nn.Linear(n_embd, 1, bias=False)
+        self.W_eta = nn.Linear(n_embd, 1, bias=False)
+        self.W_alpha = nn.Linear(n_embd, 1, bias=False)
