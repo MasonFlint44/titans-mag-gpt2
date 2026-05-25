@@ -165,13 +165,15 @@ base_lrs = [g['lr'] for g in optimizer.param_groups]  # BUG
 
 ### Most likely causes (in order)
 
-1. **NMM state too big.** State is `~54 MB · n_layer · (B/4) · (d_model/768)²` in fp32. For `gpt2_medium` (`d_model=1024`) at `B=8`: ~3.8 GB on top of model weights and activations. Try `nmm_expansion=1`, smaller `B`, or bf16 states (measure NS precision impact).
+1. **`_forward_chunk_sequential`'s per-token autograd graph.** This is the dominant OOM mode at `chunk_size >= 64` on consumer GPUs. The per-token NMM loop retains `(M_t, S_t, g_t)` snapshots for every t, growing linearly with `chunk_size`. **Fix:** set `nmm_grad_checkpoint=True` (and tune `nmm_grad_checkpoint_segment_len` — start at 64, drop to 32 or 16 if it still OOMs). Backward recomputes intermediates instead of storing them. See `docs/CONFIG_REFERENCE.md` "Memory-saving knobs".
 
-2. **No grad checkpointing.** Set `nmm_grad_checkpoint=True` to rematerialize per-token updates on backward. ~2× backward time, much less memory.
+2. **fp32 NMM state.** With checkpoint on, the fp32 `(M, S)` snapshots at segment boundaries plus inner-loop intermediates dominate. **Fix:** set `nmm_state_dtype="bf16"` to halve them. Combines with the checkpoint flag multiplicatively. NS5 still runs in fp32 internally (G226 invariant preserved).
 
-3. **`chunk_size` too large.** Per-token autograd graph through the chunk scales linearly in chunk_size. Halve it.
+3. **NMM state base size too big.** State per layer is `~24·B·d²·dtype_bytes`. For `gpt2_medium` (`d_model=1024`) at `B=8` fp32: ~6 GB across 24 layers on top of model weights, AdamW moments, and activations. Try `nmm_expansion=1` (halves hidden dim) or smaller `B`.
 
-4. **Stuck reference to old `nmm_states`.** Detaching between chunks releases the graph; not detaching means the graph keeps every chunk's intermediates pinned. Verify `detach_states` is actually called between TBPTT chunks.
+4. **`chunk_size` too large.** Even with both knobs above on, very long chunks blow up activations. Halve `chunk_size`. On a 16 GiB consumer card with `gpt2_small`, expect to fit `T` up to ~256 with bf16 + ckpt seg=16; `T=1024` realistically needs ≥ 24 GiB.
+
+5. **Stuck reference to old `nmm_states`.** Detaching between chunks releases the graph; not detaching means the graph keeps every chunk's intermediates pinned. Verify `detach_states` is actually called between TBPTT chunks.
 
 ### Diagnose
 ```python
@@ -179,6 +181,34 @@ print(torch.cuda.memory_summary(device=0, abbreviated=True))
 ```
 
 Look for "Active memory" — if it's much larger than "Allocated memory" expectation, you have an autograd graph leak (probably detach missing).
+
+### Recovery checklist (in fix-cost order)
+
+```python
+# 1. Enable checkpointing first — biggest win, no accuracy risk.
+cfg = TitansConfig.gpt2_small(
+    chunk_size=T,
+    block_size=T,
+    nmm_grad_checkpoint=True,
+    nmm_grad_checkpoint_segment_len=32,
+)
+
+# 2. Add bf16 state if still OOM. Accuracy risk is minor but measure
+#    loss curves vs fp32 baseline before committing to it.
+cfg = TitansConfig.gpt2_small(
+    chunk_size=T, block_size=T,
+    nmm_grad_checkpoint=True, nmm_grad_checkpoint_segment_len=16,
+    nmm_state_dtype="bf16",
+)
+
+# 3. Reduce capacity if still OOM.
+cfg = TitansConfig.gpt2_small(
+    chunk_size=T // 2, block_size=T // 2,
+    nmm_grad_checkpoint=True, nmm_grad_checkpoint_segment_len=16,
+    nmm_state_dtype="bf16",
+    nmm_expansion=1,
+)
+```
 
 ---
 

@@ -62,6 +62,51 @@ HF model path is derived from `n_embd` in `load_pretrained` (G216) — passing
 | `chunk_size` | `int` | 512 | 1 ≤ x ≤ `block_size` | TBPTT chunk length. `> block_size` → `ValueError` (would OOB `wpe`). From-scratch users should set `chunk_size = block_size` to avoid the G163 untrained-`wpe`-rows warning. |
 | `nmm_n_heads` | `int` | 1 | ≥ 1, must divide `n_embd` | NUMBER of parallel NMM heads. Default `1` = single-head (current behavior). `>1` instantiates `MultiHeadNMM` wrapping N parallel `NeuralMemoryModule`s on `head_dim = n_embd // n_heads`. NOT in the paper proper — this is a lucidrains enhancement exposed for ablation (G254). When `>1`, the per-layer NMM state becomes a list of per-head `(M, S)` tuples; `detach_states` / `compute_nmm_norm` handle this recursively. |
 
+## Memory-saving knobs (G256 / G257)
+
+Reach for these when training OOMs on the per-token NMM graph (the
+typical failure mode at `chunk_size >= 64` on consumer GPUs).
+**Disabled by default** so the original numerical and performance
+properties are preserved.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `nmm_state_dtype` | `str` | `"fp32"` | Storage dtype for the recurrent `(M, S)` and per-step update buffers. `"bf16"` roughly halves per-step state retention. NS5 still casts to fp32 internally (G226), so the spectral-norm fixed point is preserved. The drift risk is the per-step `M_t = (1-α)·M_{t-1} + S_t` rounding in bf16 — measure loss curves before relying on it. Valid: `"fp32"`, `"bf16"`. `fp16` is rejected (would need loss scaling). |
+| `nmm_grad_checkpoint` | `bool` | `False` | When `True`, `_forward_chunk_sequential` runs the per-token inner loop in `nmm_grad_checkpoint_segment_len`-token segments, each wrapped in `torch.utils.checkpoint.checkpoint(use_reentrant=True)`. Backward recomputes inner-loop intermediates instead of storing them. **The unlock for `T ≥ 64` on a 16 GiB consumer card.** Composes with `nmm_state_dtype="bf16"` multiplicatively. The scan path (`_forward_chunk_scan`) ignores this flag. |
+| `nmm_grad_checkpoint_segment_len` | `int` | 64 | Segment size when grad-checkpointing is on (no effect otherwise). Smaller = less peak memory + more recompute; larger = more peak memory + less recompute. Tuning guidance: start at `64`; drop to `32` or `16` if OOM persists. |
+
+**Why `use_reentrant=True`** is *required* (not just convenient):
+`use_reentrant=False` calls `disable_saved_tensors_hooks`, and
+`torch.func.grad` (used inside `per_sample_grad_fn`) rejects that
+at runtime. The reentrant path uses `torch.autograd.function.Function`
+which composes with `torch.func`.
+
+**Measured impact** (RTX 5070 Ti, 16 GiB, `gpt2_small` with `bf16` autocast):
+
+| Configuration | Peak VRAM | Status |
+|---|---|---|
+| `B=1, T=64`, fp32, no ckpt (baseline) | 12.6 GiB | OOM |
+| `B=1, T=64`, bf16, no ckpt | 12.6 GiB | OOM (bf16 alone ~no help — activations are already bf16) |
+| `B=1, T=64`, fp32, ckpt seg=16 | 10.9 GiB | OK |
+| `B=1, T=64`, bf16 + ckpt seg=16 | 7.7 GiB | OK |
+| `B=1, T=128`, bf16 + ckpt seg=16 | 9.0 GiB | OK |
+| `B=1, T=256`, bf16 + ckpt seg=16 | 11.7 GiB | OK ← **practical limit on this card** |
+| `B=2, T=128`, bf16 + ckpt seg=16 | 13.9 GiB | OOM |
+| `B=1, T=512`, bf16 + ckpt seg=16 | 12.8 GiB | OOM |
+| `B=1, T=1024`, bf16 + ckpt seg ∈ {8, 16, 32, 64} | ~13 GiB | OOM at every seg |
+
+Checkpointing is the dominant unlock — it converts the per-token graph
+from "all T steps retained" to "boundary states retained, recompute
+within segment." The remaining cost scales as
+`n_blocks × (T / seg_len) × per_segment_state_bytes`. For `gpt2_small`
+that's `12 × (T/seg) × ~28·B MiB` per layer of M/S boundaries; T=1024
+needs >40 GiB of boundary storage at any reasonable seg_len.
+
+**To fit T=1024 on consumer hardware** you'd need: a smaller backbone
+(`gpt2_small(n_layer=6)`), `nmm_expansion=1` (halves state), or a
+GPU with ≥40 GiB. The implemented optimizations get a 16 GiB card to
+T=256, not T=1024.
+
 **G160 — `nmm_spectral_norm` and inner-loss reduction are linked:**
 
 | `nmm_spectral_norm` | Inner-loss reduction | Why |

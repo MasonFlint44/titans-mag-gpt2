@@ -55,6 +55,39 @@ class TitansConfig:
     feed_persistent_to_nmm: bool = True
     nmm_n_heads: int = 1
 
+    # Memory-saving knobs (G256, G257). Defaults preserve the original
+    # fp32 / no-checkpoint behavior; flip when you hit OOM training the
+    # NMM with realistic chunk sizes.
+    #
+    # nmm_state_dtype: storage dtype for the recurrent (M, S) tensors and
+    #   the per-step update buffers in `_forward_chunk_sequential`. Use
+    #   "bf16" to roughly halve per-step state retention (~2x larger
+    #   feasible chunk_size on a fixed VRAM budget). NS5 still casts in/out
+    #   of fp32 internally (G226 — bf16 NS5 drifts to spectral norm 0.7-1.4
+    #   instead of ~1), so this is safe-by-construction; the only drift
+    #   risk is the per-step M_t = (1-a)*M_{t-1} + S_t update rounding in
+    #   bf16. Measure loss curves before relying on it for full training.
+    #   Valid values: "fp32", "bf16".
+    #
+    # nmm_grad_checkpoint: when True, `_forward_chunk_sequential` runs the
+    #   per-token inner loop in segments of `nmm_grad_checkpoint_segment_len`
+    #   tokens; each segment is wrapped in `torch.utils.checkpoint.checkpoint`
+    #   so backward recomputes the inner-loop intermediates instead of
+    #   storing them. ~5-10x larger feasible chunk_size at the cost of an
+    #   extra forward pass through each segment during backward. Composes
+    #   with nmm_state_dtype="bf16" multiplicatively. The scan path
+    #   (`_forward_chunk_scan`) ignores this flag — it has a different
+    #   memory-vs-compute trade and doesn't share the per-token graph.
+    #
+    # nmm_grad_checkpoint_segment_len: segment size when grad-checkpointing
+    #   is on. Smaller = less peak memory + more recompute; larger = more
+    #   peak memory + less recompute. 64 is a reasonable default that
+    #   roughly matches "checkpoint every 64 tokens" guidance from other
+    #   sequence-model checkpoint implementations.
+    nmm_state_dtype: str = "fp32"
+    nmm_grad_checkpoint: bool = False
+    nmm_grad_checkpoint_segment_len: int = 64
+
     def __post_init__(self):
         # raise ValueError (never assert): `python -O` strips asserts, which
         # would let invalid configs ship silently in production.
@@ -108,6 +141,20 @@ class TitansConfig:
                 f"({self.nmm_n_heads}); head_dim would be {head_dim} but "
                 f"{self.nmm_n_heads} * {head_dim} = "
                 f"{self.nmm_n_heads * head_dim}, not {self.n_embd}."
+            )
+
+        # Memory-saving knob validation (G256 / G257).
+        if self.nmm_state_dtype not in ("fp32", "bf16"):
+            raise ValueError(
+                f"nmm_state_dtype must be 'fp32' or 'bf16' (got "
+                f"{self.nmm_state_dtype!r}). fp16 is NOT supported — it "
+                f"needs loss scaling that this codebase doesn't wire; "
+                f"bf16 is the safe choice for halved NMM state memory."
+            )
+        if self.nmm_grad_checkpoint_segment_len < 1:
+            raise ValueError(
+                f"nmm_grad_checkpoint_segment_len must be >= 1 (got "
+                f"{self.nmm_grad_checkpoint_segment_len})."
             )
 
         # From-scratch with chunk_size < block_size leaves wpe rows above

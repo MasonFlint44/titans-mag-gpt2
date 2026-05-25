@@ -3,7 +3,19 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as _checkpoint
 from torch.func import functional_call, grad, vmap
+
+
+# Map config strings -> torch dtypes for the recurrent (M, S) state and
+# per-step update buffers. fp16 is intentionally excluded — it would need
+# GradScaler wiring and the NMM's surprise gradient can overshoot fp16 range
+# in early training. bf16 has fp32-equivalent range and "Just Works" with
+# our bf16-autocast forward pipeline.
+_STATE_DTYPE_MAP = {
+    "fp32": torch.float32,
+    "bf16": torch.bfloat16,
+}
 
 
 # Resolve torch.associative_scan across PyTorch versions (G215). 2.8+ exposes
@@ -221,6 +233,15 @@ class MemoryMLP(nn.Module):
     norm is a fixed stabilizer trained by the outer optimizer only — it is
     NOT recurrent state. Only the three 2D weights {W1, W_gate, W2} live in
     the recurrent (M, S); Newton-Schulz operates on 2D matrices.
+
+    Dtype handling: when `functional_call` overrides W1/W_gate/W2 with bf16
+    state, `x` flows through this MLP in bf16, but `self.norm.weight` /
+    `self.norm.bias` remain fp32 (they are outer-trained params that
+    AdamW expects in fp32). LayerNorm under autocast.bf16 already runs in
+    fp32 internally, but `torch.func.grad` (used in the NMM inner loop)
+    disables autocast. So we explicitly cast through fp32 around the norm
+    — matches the autocast policy and lets bf16-state NMM forward without
+    a dtype mismatch (G256).
     """
 
     def __init__(self, d: int, expansion: int = 4):
@@ -234,7 +255,12 @@ class MemoryMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = F.silu(self.W1(x)) * torch.sigmoid(self.W_gate(x))
         y = self.W2(h)
-        return self.norm(y) + x
+        # Run LayerNorm in fp32 regardless of (x, W*) dtype; cast back to
+        # match the input. Identity-cast is free in fp32, ~negligible in
+        # bf16, and unblocks `state_dtype="bf16"` mode (G256).
+        orig_dtype = y.dtype
+        y = self.norm(y.float()).to(orig_dtype)
+        return y + x.to(orig_dtype)
 
 
 class NeuralMemoryModule(nn.Module):
@@ -258,6 +284,9 @@ class NeuralMemoryModule(nn.Module):
         spectral_norm: bool = True,
         finetune_mode: bool = True,
         retrieval_from_M_prev: bool = False,
+        state_dtype: str = "fp32",
+        grad_checkpoint: bool = False,
+        grad_checkpoint_segment_len: int = 64,
     ):
         super().__init__()
         self.n_embd = n_embd
@@ -266,6 +295,21 @@ class NeuralMemoryModule(nn.Module):
         # Paper Eq. 15: y_t = M(q_t) where M is M_{t-1} (read-then-write).
         # Default False = lucidrains "write-then-read" (retrieve from M_t).
         self.retrieval_from_M_prev = retrieval_from_M_prev
+
+        if state_dtype not in _STATE_DTYPE_MAP:
+            raise ValueError(
+                f"state_dtype must be one of {sorted(_STATE_DTYPE_MAP)} "
+                f"(got {state_dtype!r})."
+            )
+        self.state_dtype_name = state_dtype
+        self.state_dtype = _STATE_DTYPE_MAP[state_dtype]
+        self.grad_checkpoint = grad_checkpoint
+        if grad_checkpoint_segment_len < 1:
+            raise ValueError(
+                f"grad_checkpoint_segment_len must be >= 1 "
+                f"(got {grad_checkpoint_segment_len})."
+            )
+        self.grad_checkpoint_segment_len = grad_checkpoint_segment_len
 
         # Q/K/V projections — SiLU/L2 applied at call site, not inside.
         self.k_proj = NMMProjection(n_embd, kernel_size)
@@ -314,22 +358,24 @@ class NeuralMemoryModule(nn.Module):
         self._batched_retrieve = vmap(_retrieve_one_sample, in_dims=(0, 0))
 
     def _build_init_M(self, B: int, device) -> dict:
-        """Per-sample-batched initial M dict from memory_mlp.W*.weight.
+        """Per-sample-batched initial M dict from memory_mlp.W*.weight,
+        cast to `self.state_dtype` (fp32 by default, bf16 when configured).
 
         `.expand(B, -1, -1)` is a stride-0 view; vmap with in_dims=0 over
         such views is undefined in the batched autograd interpreter, so
         we `.clone()` to materialize normal strides. Order is
-        `.to(device).clone()` (not `.clone().to(device)`): on the same
-        device the two are equivalent, but cross-device the former avoids
-        a wasted source-device allocation.
+        `.to(device, dtype).clone()`: on the same device the dtype cast
+        happens before the materialization, avoiding a fp32 staging copy
+        when state_dtype is bf16.
         """
         W1 = self.memory_mlp.W1.weight
         W_gate = self.memory_mlp.W_gate.weight
         W2 = self.memory_mlp.W2.weight
+        dt = self.state_dtype
         return {
-            "W1.weight":     W1.unsqueeze(0).expand(B, -1, -1).to(device).clone(),
-            "W_gate.weight": W_gate.unsqueeze(0).expand(B, -1, -1).to(device).clone(),
-            "W2.weight":     W2.unsqueeze(0).expand(B, -1, -1).to(device).clone(),
+            "W1.weight":     W1.unsqueeze(0).expand(B, -1, -1).to(device, dtype=dt).clone(),
+            "W_gate.weight": W_gate.unsqueeze(0).expand(B, -1, -1).to(device, dtype=dt).clone(),
+            "W2.weight":     W2.unsqueeze(0).expand(B, -1, -1).to(device, dtype=dt).clone(),
         }
 
     def init_state(self, B: int, device) -> tuple:
@@ -369,6 +415,16 @@ class NeuralMemoryModule(nn.Module):
         theta_t = torch.sigmoid(self.W_theta(x_t)).squeeze(-1)
         eta_t = torch.sigmoid(self.W_eta(x_t)).squeeze(-1)
         alpha_t = torch.sigmoid(self.W_alpha(x_t)).squeeze(-1)
+
+        # Cast inputs to state_dtype so per_sample_grad_fn's overridden
+        # weights (state_dtype) match input dtype — see forward_chunk note.
+        if self.state_dtype != k_hat.dtype:
+            k_hat = k_hat.to(self.state_dtype)
+            q_hat = q_hat.to(self.state_dtype)
+            v = v.to(self.state_dtype)
+            theta_t = theta_t.to(self.state_dtype)
+            eta_t = eta_t.to(self.state_dtype)
+            alpha_t = alpha_t.to(self.state_dtype)
 
         g_t = self.per_sample_grad_fn(M_prev, k_hat, v)
         if self.nmm_spectral_norm:
@@ -465,6 +521,17 @@ class NeuralMemoryModule(nn.Module):
         eta_t = torch.sigmoid(self.W_eta(x_t)).squeeze(-1)
         alpha_t = torch.sigmoid(self.W_alpha(x_t)).squeeze(-1)
 
+        # Cast to state_dtype — see forward_chunk note. Decode path runs
+        # without autocast (the `prepare_decode` eval-mode contract), so
+        # without this cast inputs would be fp32 vs. bf16 M weights.
+        if self.state_dtype != k_hat.dtype:
+            k_hat = k_hat.to(self.state_dtype)
+            q_hat = q_hat.to(self.state_dtype)
+            v = v.to(self.state_dtype)
+            theta_t = theta_t.to(self.state_dtype)
+            eta_t = eta_t.to(self.state_dtype)
+            alpha_t = alpha_t.to(self.state_dtype)
+
         g_t = self.per_sample_grad_fn(M_prev, k_hat, v)
         if self.nmm_spectral_norm:
             g_tilde = {key: newton_schulz5(g) for key, g in g_t.items()}
@@ -484,6 +551,79 @@ class NeuralMemoryModule(nn.Module):
         }
         return y_t, (M_t, S_t), new_buffer
 
+    def _run_inner_loop(
+        self,
+        k_hat_seg: torch.Tensor,
+        q_hat_seg: torch.Tensor,
+        v_seg: torch.Tensor,
+        theta_seg: torch.Tensor,
+        eta_seg: torch.Tensor,
+        alpha_seg: torch.Tensor,
+        M_W1, M_Wg, M_W2,
+        S_W1, S_Wg, S_W2,
+        db_seg,
+        init_M_W1, init_M_Wg, init_M_W2,
+    ) -> tuple:
+        """Run the per-token NMM update loop over a (sub)chunk and return:
+          (y_seg [B, T_seg, d], M_W1, M_Wg, M_W2, S_W1, S_Wg, S_W2).
+
+        All state inputs/outputs are flat tensors (not dicts) so this is
+        directly wrappable in `torch.utils.checkpoint.checkpoint`, which
+        requires tensor-only signatures with `use_reentrant=False`.
+
+        `db_seg` is the [B, T_seg] bool mask of document boundaries for
+        this segment (or None). When a boundary fires, the corresponding
+        rows of M/S get reset from `init_M_*` (zeros for S). `init_M_*`
+        is precomputed once at the chunk level (so it doesn't have to be
+        re-built per segment) and passed in as flat tensors too — None
+        sentinels are not allowed through checkpoint, but the boundary-
+        free common case still avoids the reset altogether via the mask
+        being all-False.
+        """
+        T_seg = k_hat_seg.shape[1]
+        M = {"W1.weight": M_W1, "W_gate.weight": M_Wg, "W2.weight": M_W2}
+        S = {"W1.weight": S_W1, "W_gate.weight": S_Wg, "W2.weight": S_W2}
+        init_M = (
+            {"W1.weight": init_M_W1, "W_gate.weight": init_M_Wg,
+             "W2.weight": init_M_W2}
+            if init_M_W1 is not None else None
+        )
+        y_list = []
+        for t in range(T_seg):
+            if db_seg is not None and bool(db_seg[:, t].any()):
+                # `init_M` is guaranteed non-None at this branch by the caller —
+                # if any boundary in the WHOLE chunk fires, the caller builds it.
+                M, S = reset_state((M, S), db_seg[:, t], init_M)
+
+            k_hat_t = k_hat_seg[:, t, :]
+            q_hat_t = q_hat_seg[:, t, :]
+            v_t = v_seg[:, t, :]
+            theta_t = theta_seg[:, t]
+            eta_t = eta_seg[:, t]
+            alpha_t = alpha_seg[:, t]
+
+            M_prev = M
+
+            g_t = self.per_sample_grad_fn(M, k_hat_t, v_t)
+            if self.nmm_spectral_norm:
+                g_tilde = {key: newton_schulz5(g) for key, g in g_t.items()}
+            else:
+                g_tilde = g_t
+
+            S = _dict_sub(_scale(eta_t, S), _scale(theta_t, g_tilde))
+            M = _dict_add(_scale(1.0 - alpha_t, M), S)
+
+            M_for_retrieval = M_prev if self.retrieval_from_M_prev else M
+            y_t = self.out_scale * self._batched_retrieve(M_for_retrieval, q_hat_t)
+            y_list.append(y_t)
+
+        y_seg = torch.stack(y_list, dim=1)
+        return (
+            y_seg,
+            M["W1.weight"], M["W_gate.weight"], M["W2.weight"],
+            S["W1.weight"], S["W_gate.weight"], S["W2.weight"],
+        )
+
     def _forward_chunk_sequential(
         self,
         x_chunk: torch.Tensor,
@@ -498,11 +638,19 @@ class NeuralMemoryModule(nn.Module):
         the conv see up-to-k tokens of causal context for every output.
 
         Two performance/memory guards:
-        - init_M is lazy-built only when a doc boundary actually fires
-          (zero-cost on the common no-boundary chunk).
+        - init_M is lazy-built only when a boundary actually fires in the
+          whole chunk (zero-cost on the common no-boundary chunk).
         - The per-position "any boundary?" mask is computed once on CPU
           to avoid T implicit GPU->CPU syncs from `tensor.any()` inside
           a Python `if`.
+
+        When `self.grad_checkpoint` is True, the per-token inner loop is
+        broken into `grad_checkpoint_segment_len`-token segments, each
+        wrapped in `torch.utils.checkpoint.checkpoint(use_reentrant=False)`
+        so backward recomputes the segment's intermediates instead of
+        storing them. This trades one extra forward per segment during
+        backward for ~5-10x peak-memory headroom — the difference between
+        T=32 and T=1024 fitting on a 16 GiB consumer card (G257).
         """
         if self.nmm_spectral_norm != self._spectral_norm_at_init:
             raise RuntimeError(
@@ -522,49 +670,106 @@ class NeuralMemoryModule(nn.Module):
         eta_chunk = torch.sigmoid(self.W_eta(x_chunk)).squeeze(-1)
         alpha_chunk = torch.sigmoid(self.W_alpha(x_chunk)).squeeze(-1)
 
-        # Lazy: don't allocate init_M unless a boundary fires.
-        init_M = None
-        M, S = state_in
-        y_list = []
+        # When state_dtype is bf16 the per-step buffers (M, S, g_t, etc.)
+        # are bf16, but the Q/K/V projections still produce whatever
+        # dtype x_chunk is (fp32 if no autocast, bf16 under autocast).
+        # Inside `per_sample_grad_fn` the params dict overrides
+        # memory_mlp's bf16 weights, so the inner forward expects bf16
+        # inputs — without these casts, F.linear errors with "expected
+        # Float but found BFloat16". Casting once at the chunk boundary
+        # is cheaper than per-step casts.
+        if self.state_dtype != x_chunk.dtype:
+            k_hat_chunk = k_hat_chunk.to(self.state_dtype)
+            q_hat_chunk = q_hat_chunk.to(self.state_dtype)
+            v_chunk = v_chunk.to(self.state_dtype)
+            theta_chunk = theta_chunk.to(self.state_dtype)
+            eta_chunk = eta_chunk.to(self.state_dtype)
+            alpha_chunk = alpha_chunk.to(self.state_dtype)
 
-        # CPU-side per-position boundary mask — avoids T GPU<->CPU syncs.
-        if doc_boundaries is not None:
-            any_boundary_per_t = doc_boundaries.any(dim=0).cpu().tolist()
+        M_dict, S_dict = state_in
+
+        # Eagerly build init_M iff any boundary fires anywhere in the chunk.
+        # The grad-checkpointed segment loop can't lazily build init_M from
+        # inside the checkpointed callable (calling _build_init_M during
+        # backward-recompute would silently re-read potentially-grad-tracked
+        # MemoryMLP weights and reshape the autograd graph), so we hoist the
+        # decision here and pass init_M_* down as tensors (or Nones).
+        any_boundary = (
+            doc_boundaries is not None and bool(doc_boundaries.any())
+        )
+        if any_boundary:
+            init_M = self._build_init_M(B, x_chunk.device)
+            init_M_W1 = init_M["W1.weight"]
+            init_M_Wg = init_M["W_gate.weight"]
+            init_M_W2 = init_M["W2.weight"]
         else:
-            any_boundary_per_t = [False] * T
+            init_M_W1 = init_M_Wg = init_M_W2 = None
 
-        for t in range(T):
-            if any_boundary_per_t[t]:
-                if init_M is None:
-                    init_M = self._build_init_M(B, x_chunk.device)
-                M, S = reset_state((M, S), doc_boundaries[:, t], init_M)
+        seg_len = (
+            self.grad_checkpoint_segment_len
+            if (self.grad_checkpoint and torch.is_grad_enabled())
+            else T
+        )
 
-            k_hat_t = k_hat_chunk[:, t, :]
-            q_hat_t = q_hat_chunk[:, t, :]
-            v_t = v_chunk[:, t, :]
-            theta_t = theta_chunk[:, t]
-            eta_t = eta_chunk[:, t]
-            alpha_t = alpha_chunk[:, t]
+        M_W1 = M_dict["W1.weight"]
+        M_Wg = M_dict["W_gate.weight"]
+        M_W2 = M_dict["W2.weight"]
+        S_W1 = S_dict["W1.weight"]
+        S_Wg = S_dict["W_gate.weight"]
+        S_W2 = S_dict["W2.weight"]
 
-            # Capture M_prev BEFORE the update — needed for retrieval if
-            # retrieval_from_M_prev is set (paper Eq. 15).
-            M_prev = M
+        y_segments = []
+        for start in range(0, T, seg_len):
+            end = min(start + seg_len, T)
+            k_seg = k_hat_chunk[:, start:end]
+            q_seg = q_hat_chunk[:, start:end]
+            v_seg = v_chunk[:, start:end]
+            theta_seg = theta_chunk[:, start:end]
+            eta_seg = eta_chunk[:, start:end]
+            alpha_seg = alpha_chunk[:, start:end]
+            db_seg = (
+                doc_boundaries[:, start:end] if doc_boundaries is not None else None
+            )
 
-            g_t = self.per_sample_grad_fn(M, k_hat_t, v_t)
-            if self.nmm_spectral_norm:
-                g_tilde = {key: newton_schulz5(g) for key, g in g_t.items()}
+            args = (
+                k_seg, q_seg, v_seg, theta_seg, eta_seg, alpha_seg,
+                M_W1, M_Wg, M_W2, S_W1, S_Wg, S_W2,
+                db_seg,
+                init_M_W1, init_M_Wg, init_M_W2,
+            )
+            if self.grad_checkpoint and torch.is_grad_enabled() and seg_len < T:
+                # use_reentrant=True is REQUIRED here even though the modern
+                # default is False: `use_reentrant=False` enables
+                # `disable_saved_tensors_hooks`, which `torch.func.grad`
+                # (used inside `per_sample_grad_fn`) rejects at runtime.
+                # The legacy reentrant path goes through
+                # `torch.autograd.function.Function` and does NOT touch
+                # saved-tensor hooks, so it composes with torch.func.
+                #
+                # Reentrant-path quirks we already handle:
+                # - All tensor inputs (state, init_M_*, segment slices)
+                #   must be properly tracked: the chunk-level state
+                #   tensors flow through `memory_mlp.W*.weight` which has
+                #   requires_grad=True, so autograd is connected.
+                # - boundary masks are bool / non-grad — fine, checkpoint
+                #   silently passes non-floats through.
+                # - autocast: reentrant captures + restores the autocast
+                #   state on recompute by default in modern torch.
+                y_seg, M_W1, M_Wg, M_W2, S_W1, S_Wg, S_W2 = _checkpoint.checkpoint(
+                    self._run_inner_loop, *args,
+                    use_reentrant=True,
+                )
             else:
-                g_tilde = g_t
+                y_seg, M_W1, M_Wg, M_W2, S_W1, S_Wg, S_W2 = self._run_inner_loop(*args)
 
-            S = _dict_sub(_scale(eta_t, S), _scale(theta_t, g_tilde))
-            M = _dict_add(_scale(1.0 - alpha_t, M), S)
+            y_segments.append(y_seg)
 
-            M_for_retrieval = M_prev if self.retrieval_from_M_prev else M
-            y_t = self.out_scale * self._batched_retrieve(M_for_retrieval, q_hat_t)
-            y_list.append(y_t)
-
-        y_chunk = torch.stack(y_list, dim=1)
-        return y_chunk, (M, S)
+        y_chunk = torch.cat(y_segments, dim=1)
+        new_state = (
+            {"W1.weight": M_W1, "W_gate.weight": M_Wg, "W2.weight": M_W2},
+            {"W1.weight": S_W1, "W_gate.weight": S_Wg, "W2.weight": S_W2},
+        )
+        return y_chunk, new_state
 
     def _forward_chunk_scan(
         self,
@@ -598,6 +803,18 @@ class NeuralMemoryModule(nn.Module):
         theta_chunk = torch.sigmoid(self.W_theta(x_chunk)).squeeze(-1)
         eta_chunk = torch.sigmoid(self.W_eta(x_chunk)).squeeze(-1)
         alpha_chunk = torch.sigmoid(self.W_alpha(x_chunk)).squeeze(-1)
+
+        # Mirror the chunk-level cast from `_forward_chunk_sequential` —
+        # state_dtype=bf16 requires inputs to per_sample_grad_fn match the
+        # bf16 (M, S) tensors or F.linear fails inside the nested
+        # vmap(grad(...)) (G256).
+        if self.state_dtype != x_chunk.dtype:
+            k_hat_chunk = k_hat_chunk.to(self.state_dtype)
+            q_hat_chunk = q_hat_chunk.to(self.state_dtype)
+            v_chunk = v_chunk.to(self.state_dtype)
+            theta_chunk = theta_chunk.to(self.state_dtype)
+            eta_chunk = eta_chunk.to(self.state_dtype)
+            alpha_chunk = alpha_chunk.to(self.state_dtype)
 
         # All gradients in parallel: outer vmap over T (dim 1 of chunks), inner
         # vmap over B (already inside per_sample_grad_fn). M_state shared (None).
@@ -725,6 +942,9 @@ class MultiHeadNMM(nn.Module):
         spectral_norm: bool = True,
         finetune_mode: bool = True,
         retrieval_from_M_prev: bool = False,
+        state_dtype: str = "fp32",
+        grad_checkpoint: bool = False,
+        grad_checkpoint_segment_len: int = 64,
     ):
         super().__init__()
         if n_heads < 1:
@@ -744,6 +964,9 @@ class MultiHeadNMM(nn.Module):
 
         # The conv-kernel `step_with_conv` semantic carries through — each
         # head's NMM has its own conv buffer of last (k-1) head-dim tokens.
+        # state_dtype / grad_checkpoint propagate per-head (one bf16 per-head
+        # state plus per-head checkpointing). Per-head segment_len is the same
+        # since heads share the chunk-time dimension.
         self.heads = nn.ModuleList([
             NeuralMemoryModule(
                 n_embd=self.head_dim,
@@ -752,6 +975,9 @@ class MultiHeadNMM(nn.Module):
                 spectral_norm=spectral_norm,
                 finetune_mode=finetune_mode,
                 retrieval_from_M_prev=retrieval_from_M_prev,
+                state_dtype=state_dtype,
+                grad_checkpoint=grad_checkpoint,
+                grad_checkpoint_segment_len=grad_checkpoint_segment_len,
             )
             for _ in range(n_heads)
         ])

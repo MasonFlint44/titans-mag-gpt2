@@ -195,6 +195,9 @@ class TitansMAGBlock(nn.Module):
             spectral_norm=config.nmm_spectral_norm,
             finetune_mode=config.finetune_mode,
             retrieval_from_M_prev=config.retrieval_from_M_prev,
+            state_dtype=config.nmm_state_dtype,
+            grad_checkpoint=config.nmm_grad_checkpoint,
+            grad_checkpoint_segment_len=config.nmm_grad_checkpoint_segment_len,
         )
         if config.nmm_n_heads > 1:
             self.nmm = MultiHeadNMM(n_heads=config.nmm_n_heads, **nmm_kwargs)

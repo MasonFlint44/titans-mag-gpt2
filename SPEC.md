@@ -233,21 +233,60 @@ buffer is a separate per-block decode cache (§6).
    the whole `[B, T, d]` chunk so the conv sees up to k tokens for every
    output position. Compute SiLU + L2 (q, k) and SiLU (v).
 2. Compute `θ_chunk`, `η_chunk`, `α_chunk` for the whole chunk in one shot.
-3. Build a CPU-side per-position "any boundary?" mask once with
-   `doc_boundaries.any(dim=0).cpu().tolist()` to avoid T implicit
-   GPU↔CPU syncs from `tensor.any()` inside a Python `if`.
-4. Loop `t = 0..T−1`:
-   - If `any_boundary_per_t[t]`: call `reset_state((M, S), doc_boundaries[:, t], init_M)`.
-     `init_M` is **lazy-built** the first time a boundary fires (zero-cost
-     on the common no-boundary chunk).
+3. **Dtype reconciliation.** When `state_dtype != x_chunk.dtype` (i.e.,
+   bf16 state with fp32 input, or vice versa), cast all chunk-level
+   buffers (k_hat, q_hat, v, θ, η, α) to `state_dtype`. Required so
+   `per_sample_grad_fn`'s `functional_call` doesn't fail at the inner
+   `F.linear` with "expected Float but found BFloat16" when state is
+   bf16 (G256).
+4. Build the per-position "any boundary?" mask once on CPU (avoids T
+   GPU↔CPU syncs). If any boundary fires anywhere in the chunk, build
+   `init_M` **eagerly** (not lazily) so it can be passed to the
+   checkpointed inner loop as a flat tensor list — checkpoint can't
+   tolerate building it during recompute.
+5. Inner loop, broken into segments of length `seg_len`:
+   - `seg_len = grad_checkpoint_segment_len` if `grad_checkpoint=True`
+     and `torch.is_grad_enabled()`; otherwise `seg_len = T` (one segment).
+   - Each segment runs `_run_inner_loop(...)`. When `seg_len < T` the
+     segment call is wrapped in
+     `torch.utils.checkpoint.checkpoint(..., use_reentrant=True)` so
+     backward recomputes the segment instead of storing it.
+6. Inside each `_run_inner_loop` call, for each `t` in the segment:
+   - If `db_seg[:, t].any()`: reset state via
+     `reset_state((M, S), db_seg[:, t], init_M)`.
    - Capture `M_prev = M` (needed if `retrieval_from_M_prev`).
-   - Compute `g_t`, NS, update `S` and `M` per §2.3.
+   - Compute `g_t`, NS5, update `S` and `M` per §2.3.
    - Retrieve from `M_prev` or `M` per `retrieval_from_M_prev`.
-5. Stack `y_list` into `[B, T, d]` and return `(y_chunk, (M, S))`.
+7. Concatenate segment outputs into `[B, T, d]` and return `(y_chunk, (M, S))`.
+
+**`use_reentrant=True` is required**, not just convenient.
+`use_reentrant=False` calls `disable_saved_tensors_hooks`, and
+`torch.func.grad` (used inside `per_sample_grad_fn`) rejects that
+at runtime. The reentrant path uses `torch.autograd.function.Function`
+which composes with `torch.func`.
 
 `reset_state(state, mask, init_M)` uses `torch.where` (NOT in-place
 assignment): in-place index assignment on tensors in the autograd graph
 raises `RuntimeError`. `where` is non-mutating and differentiable.
+
+**Memory characterization** (gpt2_small, RTX 5070 Ti, 16 GiB, bf16 autocast):
+
+| Config | Peak VRAM | Notes |
+|---|---|---|
+| `B=1, T=64`, defaults (fp32, no ckpt) | OOM @ 12.6 GiB | baseline |
+| `B=1, T=64`, bf16 only | OOM @ 12.6 GiB | bf16 alone ~no win |
+| `B=1, T=64`, fp32 + ckpt seg=16 | 10.9 GiB | OK |
+| `B=1, T=64`, bf16 + ckpt seg=16 | 7.7 GiB | OK |
+| `B=1, T=128`, bf16 + ckpt seg=16 | 9.0 GiB | OK |
+| `B=1, T=256`, bf16 + ckpt seg=16 | 11.7 GiB | **practical limit on this card** |
+| `B=1, T=512`, bf16 + ckpt seg=16 | OOM @ 12.8 GiB | |
+| `B=1, T=1024`, bf16 + ckpt seg ∈ {8..64} | OOM @ ~13 GiB | total boundary state > 40 GiB |
+
+Gradient checkpointing is the dominant unlock. The remaining cost
+scales as `n_blocks × (T / seg_len) × per_segment_state_bytes` for the
+boundary M/S tensors retained between segments — at gpt2_small with
+12 blocks, that's ~28·B MiB per layer per segment. T=1024 exceeds
+a 16 GiB card's budget at any seg_len.
 
 ### 2.9 Chunked forward — associative-scan path
 
@@ -507,6 +546,29 @@ config. **Defaults prefer the paper** (G255 default flip).
 
 At `finetune_mode=True` with `out_scale=0`, the NMM contributes 0 at init
 regardless of these flags, so HF parity at init is unaffected.
+
+### 5.5 Memory-saving flags (G256 / G257)
+
+Optional knobs that trade compute / minor numerical drift for VRAM.
+**Disabled by default**; the original numerical and performance
+properties are preserved unless you opt in.
+
+| Field | Default | What it does | Cost |
+|---|---|---|---|
+| `nmm_state_dtype` | `"fp32"` | Storage dtype of `(M, S)` and per-step buffers. `"bf16"` halves their footprint. NS5 still casts to fp32 internally (G226 invariant preserved). | Minor accumulated rounding in the per-step `M_t = (1−α)M_{t-1} + S_t` update — measure loss curves before relying on it. |
+| `nmm_grad_checkpoint` | `False` | When `True`, segments `_forward_chunk_sequential`'s inner loop into `nmm_grad_checkpoint_segment_len` slices; each segment wrapped in `torch.utils.checkpoint.checkpoint(use_reentrant=True)`. | One extra forward per segment during backward (typical: 30-50% slower step). |
+| `nmm_grad_checkpoint_segment_len` | `64` | Segment length used when checkpointing is on. Smaller = less peak memory + more recompute. | None directly — but small `seg_len` ⇒ more checkpoint boundaries ⇒ more backward recompute. |
+
+**`use_reentrant=True` is required**, not just convenient.
+`use_reentrant=False` calls `disable_saved_tensors_hooks`, and
+`torch.func.grad` (used inside `per_sample_grad_fn`) rejects that
+at runtime. The reentrant path uses `torch.autograd.function.Function`
+which composes with `torch.func`.
+
+Validation:
+- `nmm_state_dtype` must be `"fp32"` or `"bf16"`. `fp16` is explicitly
+  rejected (would require GradScaler wiring that doesn't exist).
+- `nmm_grad_checkpoint_segment_len >= 1`.
 
 ### 5.5 Attention / mode flags
 
