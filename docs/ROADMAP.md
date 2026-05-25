@@ -46,17 +46,19 @@ Throughout this file:
 Establish the package layout and the canonical config that every later phase reads from.
 
 ### 0.1 Repo skeleton
-Create the empty file tree from `ARCHITECTURE.md` (model/, data/, train.py, etc.) plus a `requirements.txt` with **lower-bound-pinned** deps:
+Create the empty file tree from `ARCHITECTURE.md` (model/, data/, train.py, etc.) plus a `pyproject.toml` with **lower-bound-pinned** deps under `[project].dependencies`:
 
-```
-torch>=2.3,<3      # >=2.8 also needed for Phase 6 scan
-tiktoken>=0.5
-transformers>=4.30
-datasets>=2.14
-numpy>=1.24
+```toml
+dependencies = [
+    "torch>=2.3,<3",      # >=2.8 also needed for Phase 6 scan
+    "tiktoken>=0.5",
+    "transformers>=4.30",
+    "datasets>=2.14",
+    "numpy>=1.24",
+]
 ```
 
-**⚠** Unpinned deps are a silent-failure source — a `transformers` minor bump can change the Conv1D weight layout that Phase 2.6 unpacks.
+Run `uv lock` to generate `uv.lock` (commit both). **⚠** Unpinned deps are a silent-failure source — a `transformers` minor bump can change the Conv1D weight layout that Phase 2.6 unpacks; `uv.lock` freezes the exact resolved versions so CI / fresh clones reproduce bit-for-bit.
 
 → PLAN.md §0.1
 
@@ -452,7 +454,8 @@ titans-mag-gpt2/
 ├── scripts/
 │   ├── load_pretrained.py
 │   └── finetune.py
-└── requirements.txt
+├── pyproject.toml
+└── uv.lock
 ```
 
 ## References

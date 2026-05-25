@@ -1,3 +1,33 @@
+[project]
+name = "titans-mag-gpt2"
+version = "0.1.0"
+description = "From-scratch PyTorch implementation of the TITANS MAG variant on GPT-2."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [
+    { name = "Mason Flint" },
+]
+dependencies = [
+    "torch>=2.3,<3",
+    "tiktoken>=0.5",
+    "transformers>=4.30",
+    "datasets>=2.14",
+    "numpy>=1.24",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["model", "data", "scripts"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]

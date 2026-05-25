@@ -331,7 +331,8 @@ titans-mag-gpt2/
 ├── scripts/
 │   ├── load_pretrained.py
 │   └── finetune.py
-└── requirements.txt
+├── pyproject.toml
+└── uv.lock
 ```
 
 ---

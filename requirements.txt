@@ -1,5 +1,0 @@
-torch>=2.3,<3
-tiktoken>=0.5
-transformers>=4.30
-datasets>=2.14
-numpy>=1.24

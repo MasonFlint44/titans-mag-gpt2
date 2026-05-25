@@ -56,20 +56,28 @@ test time — that's the whole point.
 
 ## Install
 
+Dependencies are managed with [`uv`](https://docs.astral.sh/uv/). Install
+uv first ([instructions](https://docs.astral.sh/uv/getting-started/installation/)),
+then:
+
 ```bash
-git clone <repo-url> titans-mag-gpt2
+git clone https://github.com/MasonFlint44/titans-mag-gpt2.git
 cd titans-mag-gpt2
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+uv sync                     # creates .venv, installs locked deps + dev tools
 ```
 
-PyTorch ≥ 2.3 required for `torch.func.grad` + `vmap` (used in the inner
-gradient). PyTorch ≥ 2.8 required for the optional Phase 6 associative scan.
+`uv sync` materializes `.venv` from `uv.lock` (PyTorch, transformers,
+tiktoken, datasets, numpy, pytest). Run commands inside the env with
+`uv run …` (no manual `source .venv/bin/activate` needed).
+
+Requirements pinned by `uv.lock`: Python ≥ 3.12, PyTorch ≥ 2.3 (for
+`torch.func.grad` + `vmap` in the inner gradient; ≥ 2.8 enables the
+optional Phase 6 associative scan).
 
 ## Fine-tune GPT-2 with the NMM
 
 ```bash
-python scripts/finetune.py \
+uv run python scripts/finetune.py \
     --size small \
     --data /path/to/corpus.txt \
     --chunk-size 512 \
@@ -86,7 +94,7 @@ memory contribution ramps up.
 ## Train from scratch (multi-GPU)
 
 ```bash
-torchrun --nproc_per_node=4 train.py \
+uv run torchrun --nproc_per_node=4 train.py \
     --size small \
     --data /path/to/corpus.txt \
     --chunk-size 1024 \
@@ -103,7 +111,7 @@ sees training (G163).
 ## Generate
 
 ```bash
-python generate.py \
+uv run python generate.py \
     --checkpoint ckpts/step_5000.pt \
     --prompt "The capital of France is" \
     --max-new-tokens 100 \
@@ -121,11 +129,11 @@ memory adapts to whatever you're feeding it right now.
 ## Test
 
 ```bash
-pytest tests/                              # all
-pytest tests/unit/                         # fast, every commit
-pytest -m "not slow and not gpu"           # local dev loop
-pytest tests/parity/                       # HF GPT-2 logit/perplexity parity
-pytest tests/ddp/ -m ddp                   # spawns 2-rank ranges
+uv run pytest tests/                              # all
+uv run pytest tests/unit/                         # fast, every commit
+uv run pytest -m "not slow and not gpu"           # local dev loop
+uv run pytest tests/parity/                       # HF GPT-2 logit/perplexity parity
+uv run pytest tests/ddp/ -m ddp                   # spawns 2-rank ranges
 ```
 
 CI tiers in [`docs/TEST_PLAN.md`](docs/TEST_PLAN.md) §15.

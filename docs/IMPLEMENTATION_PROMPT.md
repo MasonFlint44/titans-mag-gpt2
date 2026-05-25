@@ -406,7 +406,8 @@ Begin with:
 3. Read `diagrams/architecture.mmd` and `diagrams/phase_dag.mmd`.
 4. Skim `GLOSSARY.md` and `CONFIG_REFERENCE.md`.
 5. Then begin Phase 0.1: create the repo skeleton (empty files per the file
-   structure in ARCHITECTURE.md) and `requirements.txt` with the pinned deps.
+   structure in ARCHITECTURE.md) and `pyproject.toml` with the pinned deps
+   under `[project].dependencies`; run `uv lock` to generate `uv.lock`.
 6. Move to Phase 0.2: implement `TitansConfig`. Run the matching unit tests in
    TEST_PLAN.md §4 to confirm validation fires correctly (including under
    `python -O`).
