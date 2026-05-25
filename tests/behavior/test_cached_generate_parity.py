@@ -106,20 +106,14 @@ def test_cached_decode_long_prompt_uses_full_context():
     assert len(a_ids) > cfg.block_size
     assert len(b_ids) > cfg.block_size
 
-    # Run the same chunked-warm-up + prepare_decode path that generate uses,
-    # and compare last_logits directly.
+    # Use the shared helper (G249) instead of inlining the chunked-warm-up
+    # pipeline. This way the test verifies the SAME code path generate /
+    # needle use in production — if they diverge, this test catches it.
     def _last_logits_for(ids_list):
         torch.manual_seed(0)  # model is deterministic; only random source
         ids = torch.tensor(ids_list, dtype=torch.long).unsqueeze(0)
-        prompt_len = ids.size(1)
-        tail_start = prompt_len - cfg.block_size
-        nmm_states = None
         with torch.no_grad():
-            for start in range(0, tail_start, cfg.block_size):
-                end = min(start + cfg.block_size, tail_start)
-                _, nmm_states = model(ids[:, start:end], nmm_states, None)
-            tail = ids[:, tail_start:]
-            cache = model.prepare_decode(tail, initial_nmm_states=nmm_states)
+            cache = model.prepare_decode_chunked(ids)
         return cache["last_logits"].squeeze()  # [V]
 
     logits_a = _last_logits_for(a_ids)

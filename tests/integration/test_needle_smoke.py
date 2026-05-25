@@ -5,6 +5,9 @@ Also locks in that the harness uses Option B (cached decode), NOT the
 old broken sliding-window NMM-reprocess pattern. The call-counting test
 below would fail loudly if anyone reintroduced the old pattern, since
 it would call `model.forward()` repeatedly inside the decode loop.
+
+needle_in_haystack_sweep (G251) tests at the bottom — the batched sweep
+harness that aggregates per-position and per-secret recall stats.
 """
 
 import pytest
@@ -12,7 +15,7 @@ import torch
 
 from config import TitansConfig
 from data.tokenizer import Tokenizer
-from eval import needle_in_haystack
+from eval import needle_in_haystack, needle_in_haystack_sweep
 from model.titans_gpt2 import TitansMAGGPT2
 
 
@@ -203,3 +206,144 @@ def test_needle_in_haystack_long_prompt_uses_cached_decode_path():
         f"last_logits, no forward_step needed); got {step_calls['n']} "
         f"forward_step calls — likely the boundary cap was lifted."
     )
+
+
+# ---------------------------------------------------------------------------
+# G251 — needle_in_haystack_sweep
+# ---------------------------------------------------------------------------
+
+def _sweep_model():
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=8, vocab_size=50257,
+        block_size=128, chunk_size=32, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=2,
+    )
+    return cfg, TitansMAGGPT2(cfg)
+
+
+def test_sweep_default_grid_returns_expected_structure():
+    """G251 — default sweep with n_positions=9, n_secrets=5 should run 45
+    pairs and return a result dict with the documented keys."""
+    cfg, model = _sweep_model()
+    tok = Tokenizer()
+    result = needle_in_haystack_sweep(
+        model=model,
+        tokenizer=tok,
+        device=torch.device("cpu"),
+        haystack="the quick brown fox jumps over the lazy dog. " * 3,
+        block_size=64,
+    )
+    # Documented keys.
+    expected_keys = {
+        "recall", "n_pairs", "n_matched", "per_position",
+        "per_secret", "details", "insert_fractions", "secrets",
+    }
+    assert set(result.keys()) == expected_keys
+    # Default grid: 9 positions x 5 secrets = 45 pairs.
+    assert result["n_pairs"] == 45
+    assert len(result["insert_fractions"]) == 9
+    assert len(result["secrets"]) == 5
+    assert len(result["details"]) == 45
+    # Recall is a float in [0, 1].
+    assert isinstance(result["recall"], float)
+    assert 0.0 <= result["recall"] <= 1.0
+    # n_matched and recall are consistent.
+    assert result["n_matched"] == sum(1 for _, _, m in result["details"] if m)
+    assert abs(result["recall"] - result["n_matched"] / result["n_pairs"]) < 1e-9
+
+
+def test_sweep_per_position_per_secret_aggregation_correct():
+    """Per-position recall must equal mean of details with that position;
+    per-secret recall must equal mean of details with that secret."""
+    cfg, model = _sweep_model()
+    tok = Tokenizer()
+    result = needle_in_haystack_sweep(
+        model=model,
+        tokenizer=tok,
+        device=torch.device("cpu"),
+        haystack="hello world. " * 5,
+        n_positions=3,
+        n_secrets=2,
+        block_size=64,
+    )
+    assert result["n_pairs"] == 6
+
+    # Per-position aggregation
+    for f in result["insert_fractions"]:
+        matches = [m for ff, _, m in result["details"] if ff == f]
+        expected = sum(matches) / len(matches)
+        assert abs(result["per_position"][f] - expected) < 1e-9
+
+    # Per-secret aggregation
+    for s in result["secrets"]:
+        matches = [m for _, ss, m in result["details"] if ss == s]
+        expected = sum(matches) / len(matches)
+        assert abs(result["per_secret"][s] - expected) < 1e-9
+
+
+def test_sweep_explicit_secrets_and_positions_override_defaults():
+    """When the caller supplies `secrets` and `insert_fractions`, those are
+    used directly — `n_secrets` / `n_positions` are ignored."""
+    cfg, model = _sweep_model()
+    tok = Tokenizer()
+    result = needle_in_haystack_sweep(
+        model=model,
+        tokenizer=tok,
+        device=torch.device("cpu"),
+        haystack="hello world. " * 5,
+        insert_fractions=[0.25, 0.75],
+        secrets=["FOO1", "BAR2", "BAZ3"],
+        n_positions=99,  # ignored
+        n_secrets=99,    # ignored
+        block_size=64,
+    )
+    assert result["insert_fractions"] == [0.25, 0.75]
+    assert result["secrets"] == ["FOO1", "BAR2", "BAZ3"]
+    assert result["n_pairs"] == 6
+
+
+def test_sweep_seed_determinism():
+    """Same seed -> same default secrets across calls."""
+    cfg, model = _sweep_model()
+    tok = Tokenizer()
+    r1 = needle_in_haystack_sweep(
+        model=model, tokenizer=tok, device=torch.device("cpu"),
+        haystack="hello. " * 5, n_positions=2, n_secrets=3,
+        seed=42, block_size=64,
+    )
+    r2 = needle_in_haystack_sweep(
+        model=model, tokenizer=tok, device=torch.device("cpu"),
+        haystack="hello. " * 5, n_positions=2, n_secrets=3,
+        seed=42, block_size=64,
+    )
+    assert r1["secrets"] == r2["secrets"]
+
+
+def test_sweep_different_seed_produces_different_secrets():
+    cfg, model = _sweep_model()
+    tok = Tokenizer()
+    r1 = needle_in_haystack_sweep(
+        model=model, tokenizer=tok, device=torch.device("cpu"),
+        haystack="hello. " * 5, n_positions=2, n_secrets=3,
+        seed=0, block_size=64,
+    )
+    r2 = needle_in_haystack_sweep(
+        model=model, tokenizer=tok, device=torch.device("cpu"),
+        haystack="hello. " * 5, n_positions=2, n_secrets=3,
+        seed=1, block_size=64,
+    )
+    assert r1["secrets"] != r2["secrets"]
+
+
+def test_sweep_one_secret_one_position_runs_one_pair():
+    """Degenerate grid — n_positions=1, n_secrets=1 — should run exactly 1
+    pair; recall is either 0.0 or 1.0."""
+    cfg, model = _sweep_model()
+    tok = Tokenizer()
+    result = needle_in_haystack_sweep(
+        model=model, tokenizer=tok, device=torch.device("cpu"),
+        haystack="hello. " * 5, n_positions=1, n_secrets=1,
+        block_size=64,
+    )
+    assert result["n_pairs"] == 1
+    assert result["recall"] in (0.0, 1.0)

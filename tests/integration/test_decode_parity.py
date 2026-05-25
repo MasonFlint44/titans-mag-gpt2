@@ -281,6 +281,69 @@ def test_prepare_decode_rejects_train_mode():
         model.prepare_decode(prompt)
 
 
+def test_prepare_decode_chunked_short_prompt_matches_prepare_decode():
+    """G249 — for short prompts (P <= block_size) the chunked helper must
+    behave identically to a plain prepare_decode."""
+    torch.manual_seed(0)
+    cfg, model = _tiny_model()
+    prompt = torch.randint(0, cfg.vocab_size, (1, 8))
+    with torch.no_grad():
+        cache_plain = model.prepare_decode(prompt)
+        cache_chunked = model.prepare_decode_chunked(prompt)
+    # Same logits, same position, same cache structure shapes.
+    assert torch.equal(cache_plain["last_logits"], cache_chunked["last_logits"])
+    assert cache_plain["position"] == cache_chunked["position"]
+    for (k1, v1), (k2, v2) in zip(cache_plain["kv_caches"], cache_chunked["kv_caches"]):
+        assert torch.equal(k1, k2)
+        assert torch.equal(v1, v2)
+
+
+def test_prepare_decode_chunked_long_prompt_threads_nmm_state_across_prefix():
+    """G249 — long-prompt path runs the prefix through forward() so the NMM
+    sees every token, then prepare_decode on the tail. Two prompts that
+    differ only in their prefix must produce different last_logits."""
+    torch.manual_seed(0)
+    cfg, model = _tiny_model()
+    # Need prompt > block_size; build two with same tail, different prefix.
+    # Tiny model uses vocab_size=64 — keep prefix_a and prefix_b in disjoint
+    # token ranges so they're guaranteed to differ.
+    P = cfg.block_size + 8  # 8 tokens of prefix beyond what fits in a single block
+    half = cfg.vocab_size // 2
+    prefix_a = torch.randint(0, half, (1, 8))
+    prefix_b = torch.randint(half, cfg.vocab_size, (1, 8))
+    assert not torch.equal(prefix_a, prefix_b)
+    tail = torch.randint(0, cfg.vocab_size, (1, cfg.block_size))
+    prompt_a = torch.cat([prefix_a, tail], dim=1)
+    prompt_b = torch.cat([prefix_b, tail], dim=1)
+    assert prompt_a.size(1) == P
+
+    with torch.no_grad():
+        cache_a = model.prepare_decode_chunked(prompt_a)
+        cache_b = model.prepare_decode_chunked(prompt_b)
+    # Position lands at block_size in both (one-shot decode boundary).
+    assert cache_a["position"] == cfg.block_size
+    assert cache_b["position"] == cfg.block_size
+    # Logits MUST differ — the prefix went through the NMM in both cases
+    # and the two prefixes were different.
+    diff = (cache_a["last_logits"] - cache_b["last_logits"]).abs().max().item()
+    assert diff > 1e-4, (
+        f"long-prompt chunked warm-up did not thread prefix through NMM: "
+        f"max logit diff = {diff:.3e}"
+    )
+
+
+def test_prepare_decode_chunked_rejects_train_mode():
+    """G249 — same eval-mode contract as prepare_decode (G243). Asserting
+    here means the chunked-warm-up loop doesn't run its dropout-different
+    forward path before the inner prepare_decode would have rejected the
+    whole thing."""
+    cfg, model = _tiny_model()
+    model.train()
+    long_prompt = torch.randint(0, cfg.vocab_size, (1, cfg.block_size + 4))
+    with pytest.raises(RuntimeError, match="prepare_decode_chunked requires model.eval"):
+        model.prepare_decode_chunked(long_prompt)
+
+
 def test_forward_step_rejects_train_mode():
     """G243 — symmetric guard on forward_step. A caller could call
     prepare_decode in eval, then flip the model to train and forward_step;

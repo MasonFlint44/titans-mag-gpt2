@@ -73,9 +73,10 @@ class TitansMAGGPT2(nn.Module):
         for name, module in self.named_modules():
             if id(module) in nmm_internal_ids:
                 continue
-            if "ln_nmm" in name:
-                # LayerNorm default (weight=1, bias=0) is already what we want.
-                continue
+            # NOTE: no explicit ln_nmm skip needed — LayerNorm matches neither
+            # nn.Linear nor nn.Embedding below, so it's left at the default
+            # (weight=1, bias=0) by virtue of the isinstance filter. Same is
+            # true for ln_1, ln_2, ln_f — all correctly skipped implicitly.
             if isinstance(module, nn.Linear):
                 # Output projections (attn.proj, mlp.c_proj) get residual scaling.
                 # Note: NMMProjection's k/q/v_proj end with "_proj" but are skipped
@@ -219,6 +220,53 @@ class TitansMAGGPT2(nn.Module):
             "nmm_conv_buffers": nmm_conv_buffers,
             "position": P,
         }
+
+    def prepare_decode_chunked(self, prompt_idx: torch.Tensor) -> dict:
+        """Prepare a decode cache for ANY prompt length (short or long).
+
+        Encapsulates the chunked-warm-up + tail-prepare_decode pipeline that
+        previously lived inline in `generate.py`, `eval.needle_in_haystack`,
+        and `tests/behavior/test_cached_generate_parity.py` (G249 — three-way
+        DRY violation, future-divergence risk).
+
+        Behavior:
+          - prompt_len <= block_size: equivalent to `prepare_decode(prompt_idx)`.
+          - prompt_len > block_size: chunks the prefix through `forward()` so
+            the NMM accumulates state across the full prompt, then calls
+            `prepare_decode(tail, initial_nmm_states=...)` on the last
+            block_size tokens. In this case the returned cache's `position` is
+            at `block_size`; callers can sample AT MOST ONE token from
+            `cache["last_logits"]` (any `forward_step` call would wpe-OOB).
+
+        Caller still owns the `max_new` cap, since the appropriate value
+        depends on what they want to do with the cache.
+
+        Same eval-mode contract as prepare_decode (G243): asserted up front
+        so the long-prompt prefix chunks don't run their dropout-different
+        forward path before the final prepare_decode would have rejected the
+        whole thing.
+        """
+        if self.training:
+            raise RuntimeError(
+                "prepare_decode_chunked requires model.eval() mode (G243). "
+                "Call model.eval() first, or use generate() / "
+                "needle_in_haystack() which manage the mode for you."
+            )
+        block_size = self.config.block_size
+        prompt_len = prompt_idx.size(1)
+        if prompt_len <= block_size:
+            return self.prepare_decode(prompt_idx)
+
+        # Long-prompt path: chunk prefix through forward() so the NMM sees
+        # every token; then prepare_decode on the trailing block_size tokens.
+        tail_start = prompt_len - block_size
+        nmm_states = None
+        for start in range(0, tail_start, block_size):
+            end = min(start + block_size, tail_start)
+            chunk = prompt_idx[:, start:end]
+            _, nmm_states = self(chunk, nmm_states, None)
+        tail = prompt_idx[:, tail_start:]
+        return self.prepare_decode(tail, initial_nmm_states=nmm_states)
 
     def forward_step(self, token_id: torch.Tensor, cache: dict) -> tuple:
         """Single-token decode forward.

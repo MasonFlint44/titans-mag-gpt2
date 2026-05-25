@@ -2,6 +2,7 @@
 
 import math
 import random
+import string
 
 import torch
 import torch.nn.functional as F
@@ -89,27 +90,16 @@ def needle_in_haystack(
         prompt_len = ids.size(1)
         n_decode = len(tokenizer.encode(secret)) + 4
 
-        # Warm-up + cached decode (mirrors generate.py).
+        # Single call handles both short and long prompts (G249). Long
+        # prompts get a chunked-warm-up + tail prepare_decode internally;
+        # the resulting cache's `position` lands at block_size, so we cap
+        # decode at 1 token in that branch (anything further would need
+        # RoPE). Probe is short by construction; for long haystacks this
+        # caps recall verification rather than enabling it.
+        cache = model.prepare_decode_chunked(ids)
         if prompt_len > block_size:
-            # Long prompt: chunk the prefix through forward() to thread
-            # NMM state across all prompt tokens, then prepare_decode on
-            # the trailing block_size tokens. As in generate.py, the
-            # cache's `last_logits` is valid for sampling ONE token; we
-            # can't run forward_step at the boundary without wpe OOB.
-            tail_start = prompt_len - block_size
-            nmm_states = None
-            for start in range(0, tail_start, block_size):
-                end = min(start + block_size, tail_start)
-                _, nmm_states = model(ids[:, start:end], nmm_states, None)
-            tail = ids[:, tail_start:]
-            cache = model.prepare_decode(tail, initial_nmm_states=nmm_states)
-            # At the boundary we can only sample 1 token; subsequent ones
-            # would need RoPE. Probe is short by construction so this
-            # caps recall verification rather than enabling it for long
-            # haystacks — caller should choose haystack so prompt fits.
             max_new = 1
         else:
-            cache = model.prepare_decode(ids)
             max_new = min(n_decode, block_size - prompt_len + 1)
 
         out_ids = []
@@ -128,3 +118,119 @@ def needle_in_haystack(
     finally:
         if was_training:
             model.train()
+
+
+def _random_secret(rng: random.Random, n_chars: int = 5) -> str:
+    """Generate a random alphanumeric secret. Restricted to uppercase letters
+    and digits so the BPE tokenization is dense and deterministic — no
+    leading-space-vs-no-space drift, no rare-byte fallbacks."""
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(rng.choices(alphabet, k=n_chars))
+
+
+@torch.no_grad()
+def needle_in_haystack_sweep(
+    model,
+    tokenizer,
+    device: torch.device,
+    haystack: str,
+    insert_fractions: list = None,
+    secrets: list = None,
+    n_positions: int = 9,
+    n_secrets: int = 5,
+    needle_template: str = "The secret password is {}.",
+    probe: str = "The secret password is",
+    block_size: int = None,
+    seed: int = 0,
+) -> dict:
+    """Sweep N (insert_fraction, secret) pairs and aggregate recall.
+
+    For each pair: build the full prompt with the needle injected at
+    `insert_fraction`, decode the probe completion, check whether the
+    secret appears. Aggregate per-position and per-secret recall.
+
+    The TEST_PLAN.md §10 specification ("Top-1 token includes the secret
+    for ≥80% of positions") is implemented here as `result["recall"]`.
+
+    Args:
+      insert_fractions: positions in [0, 1] to inject the needle. Default:
+        `n_positions` evenly spaced points in (0, 1).
+      secrets: secret strings to test. Default: `n_secrets` random
+        5-character alphanumeric strings generated from `seed`.
+      n_positions, n_secrets: only consulted when the corresponding
+        explicit list is None.
+      seed: RNG seed for default secret generation. Has no effect when
+        `secrets` is supplied explicitly.
+
+    Returns:
+      dict with:
+        recall: float — overall fraction of pairs matched
+        n_pairs: int — total pairs evaluated (= len(insert_fractions) * len(secrets))
+        n_matched: int — pairs whose decoded completion contained the secret
+        per_position: dict[float, float] — recall at each insert_fraction
+        per_secret: dict[str, float] — recall for each secret across positions
+        details: list[tuple[float, str, bool]] — per-pair (fraction, secret, matched)
+        insert_fractions: list[float] — the actual positions evaluated
+        secrets: list[str] — the actual secrets evaluated
+
+    Untrained models will produce near-zero recall (the secret is unlikely
+    to be the argmax of an untrained vocab distribution); this harness is
+    intended for trained-checkpoint evaluation. See TEST_PLAN §10.
+
+    Mode is captured-and-restored by the per-pair `needle_in_haystack`
+    call (G161); this function adds no additional mode mutation.
+    """
+    rng = random.Random(seed)
+
+    if insert_fractions is None:
+        # Evenly spaced in (0, 1), avoiding the exact endpoints where the
+        # needle would land outside the haystack character bounds.
+        step = 1.0 / (n_positions + 1)
+        insert_fractions = [round(step * (i + 1), 3) for i in range(n_positions)]
+    if secrets is None:
+        secrets = [_random_secret(rng) for _ in range(n_secrets)]
+
+    details = []
+    for f in insert_fractions:
+        for s in secrets:
+            matched = needle_in_haystack(
+                model=model,
+                tokenizer=tokenizer,
+                device=device,
+                haystack=haystack,
+                needle_template=needle_template,
+                secret=s,
+                probe=probe,
+                insert_fraction=f,
+                block_size=block_size,
+            )
+            details.append((f, s, matched))
+
+    n_pairs = len(details)
+    n_matched = sum(1 for _, _, m in details if m)
+    recall = n_matched / n_pairs if n_pairs > 0 else 0.0
+
+    per_position = {}
+    for f in insert_fractions:
+        pos_results = [m for ff, _, m in details if ff == f]
+        per_position[f] = (
+            sum(pos_results) / len(pos_results) if pos_results else 0.0
+        )
+
+    per_secret = {}
+    for s in secrets:
+        sec_results = [m for _, ss, m in details if ss == s]
+        per_secret[s] = (
+            sum(sec_results) / len(sec_results) if sec_results else 0.0
+        )
+
+    return {
+        "recall": recall,
+        "n_pairs": n_pairs,
+        "n_matched": n_matched,
+        "per_position": per_position,
+        "per_secret": per_secret,
+        "details": details,
+        "insert_fractions": insert_fractions,
+        "secrets": secrets,
+    }

@@ -453,6 +453,7 @@ Verify that the architecture's *intended* behavior emerges. Slow but essential.
 - Inject `"The magic number is 42."` at random position in 2048 tokens of random Wikipedia.
 - Generate completion of `"Question: what is the magic number? Answer:"`.
 - **Top-1 token includes "42"** for ≥80% of positions. Tests cross-chunk memory.
+- **Harness API:** `eval.needle_in_haystack_sweep(model, tokenizer, device, haystack, ...)` runs the (position × secret) grid and returns `{"recall": float, "per_position": dict, "per_secret": dict, ...}` — the headline `recall ≥ 0.8` invariant maps to `result["recall"]`. Six structural / aggregation tests in `tests/integration/test_needle_smoke.py` lock in the harness contract; the recall behavior test waits on a trained checkpoint (G251).
 
 ### `test_long_context_loss.py` (`slow_gpu`)
 - Compare per-position loss at positions [0, 256, 512, 768] of a 1024-length sequence.
@@ -610,6 +611,9 @@ Every gap in `GAP_HISTORY.md` that introduced a silent-failure mode (or near-mis
 | G243 | `test_decode_parity::test_prepare_decode_rejects_train_mode`, `::test_forward_step_rejects_train_mode` | §8 |
 | G244 | `test_decode_parity::test_prepare_decode_rejects_wrong_batch_dim_initial_nmm_states` | §8 |
 | G245 / G246 / G247 / G248 | (documentation patches — no defending tests) | — |
+| G249 | `test_decode_parity::test_prepare_decode_chunked_short_prompt_matches_prepare_decode`, `::test_prepare_decode_chunked_long_prompt_threads_nmm_state_across_prefix`, `::test_prepare_decode_chunked_rejects_train_mode` | §8 |
+| G250 | (dead branch removed — existing `test_full_model::test_apply_gpt2_init_*` defend the init invariants) | §4 |
+| G251 | `test_needle_smoke::test_sweep_default_grid_returns_expected_structure`, `::test_sweep_per_position_per_secret_aggregation_correct`, `::test_sweep_explicit_secrets_and_positions_override_defaults`, `::test_sweep_seed_determinism`, `::test_sweep_different_seed_produces_different_secrets`, `::test_sweep_one_secret_one_position_runs_one_pair` | §10 |
 
 Gaps in `GAP_HISTORY.md` not appearing here are structural (documentation reorganization, comment additions, file renames) and are not separately testable. See `GAP_HISTORY.md` for full per-gap context.
 

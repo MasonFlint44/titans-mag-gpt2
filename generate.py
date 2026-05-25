@@ -62,37 +62,25 @@ def generate(
         block_size = model.config.block_size
         prompt_len = context_ids.size(1)
 
+        # Single call handles both short prompts (one-shot prepare_decode) and
+        # long prompts (chunked-warm-up + tail prepare_decode). G249.
+        cache = model.prepare_decode_chunked(context_ids)
         if prompt_len > block_size:
-            # Long-prompt path (G176): NMM sees the full prompt; KV cache
-            # holds only the last block_size tokens (wpe table is bounded).
-            # Chunk the prefix through forward() so the NMM accumulates
-            # state, then prepare_decode on the tail with that state.
-            tail_start = prompt_len - block_size
-            nmm_states = None
-            for start in range(0, tail_start, block_size):
-                end = min(start + block_size, tail_start)
-                chunk = context_ids[:, start:end]
-                _, nmm_states = model(chunk, nmm_states, None)
-            tail = context_ids[:, tail_start:]
-            cache = model.prepare_decode(tail, initial_nmm_states=nmm_states)
-            # Position in cache is block_size; KV cache holds block_size
-            # real positions + N_p persistent. forward_step would go OOB on
-            # wpe immediately. The user can sample at most ONE new token
-            # from the cache's last_logits (which IS valid for the position
-            # immediately AFTER block_size - 1, the last prompt token); any
-            # further generation requires shortening the prompt.
+            # Long-prompt path: cache position is at block_size; forward_step
+            # would wpe-OOB immediately. The user can sample at most ONE new
+            # token from cache["last_logits"] (valid for the position right
+            # after the last prompt token); further generation requires
+            # shortening the prompt.
             max_new = 1 if max_new_tokens >= 1 else 0
         else:
-            # Single-shot warm-up.
-            cache = model.prepare_decode(context_ids)
             # +1 because the FIRST sampled token comes from cache["last_logits"]
-            # — it doesn't require a forward_step (and thus no wpe lookup at a
-            # new position). Only the remaining (max_new - 1) tokens hit
+            # — it doesn't require a forward_step (no wpe lookup at a new
+            # position). Only the remaining (max_new - 1) tokens hit
             # forward_step, which needs `cache["position"] + k < block_size`
             # for k = 0..max_new-2. The highest position used is therefore
             # prompt_len + max_new - 2, giving max_new <= block_size - prompt_len + 1.
-            # At prompt_len == block_size, this yields max_new == 1 — the user can
-            # still sample one token from the last_logits without going OOB.
+            # At prompt_len == block_size, this yields max_new == 1 — the user
+            # can still sample one token from last_logits without going OOB.
             max_new = min(max_new_tokens, block_size - prompt_len + 1)
         next_logits = cache["last_logits"].squeeze(1)  # [B, vocab]
 
