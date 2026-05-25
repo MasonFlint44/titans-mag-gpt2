@@ -228,16 +228,28 @@ def base_lrs_from_constants() -> list:
     return [BASE_LR_GPT2, BASE_LR_GPT2, BASE_LR_NMM, BASE_LR_NMM]
 
 
+def _layer_norm_M(layer_state) -> float:
+    """Compute ||M||_F (batch-mean) for a single per-layer state. Handles
+    both shapes (G254): single-head `(M, S)` tuple OR multi-head
+    `[(M_h, S_h), ...]` list. For multi-head, returns the per-head average."""
+    if isinstance(layer_state, list):
+        return sum(_layer_norm_M(s) for s in layer_state) / len(layer_state)
+    M, _S = layer_state
+    sq_sum = sum((v.float() ** 2).sum(dim=(-2, -1)) for v in M.values())  # [B]
+    return sq_sum.sqrt().mean().detach().item()
+
+
 def compute_nmm_norm(nmm_states) -> list:
     """Per-layer ||M||_F (treating W1/W_gate/W2 as one block), averaged across
-    batch. Returns None if states is None (first-step case, G172)."""
+    batch. Returns None if states is None (first-step case, G172).
+
+    Multi-head safe (G254): when `nmm_n_heads > 1`, the per-layer state is a
+    list of per-head `(M, S)` tuples; we report the mean of per-head norms
+    per layer (so the returned list has length n_layer regardless of head
+    count — convenient for log parsers)."""
     if nmm_states is None:
         return None
-    out = []
-    for M, _S in nmm_states:
-        sq_sum = sum((v.float() ** 2).sum(dim=(-2, -1)) for v in M.values())  # [B]
-        out.append(sq_sum.sqrt().mean().detach().item())
-    return out
+    return [_layer_norm_M(s) for s in nmm_states]
 
 
 # ---------------------------------------------------------------------------

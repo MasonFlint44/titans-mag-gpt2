@@ -60,6 +60,7 @@ HF model path is derived from `n_embd` in `load_pretrained` (G216) — passing
 | `nmm_spectral_norm` | `bool` | `True` | — | Newton-Schulz 5-step on inner gradient. **Toggling this requires also changing inner-loss reduction** (G160 — see below) |
 | `nmm_n_persistent` | `int` | 4 | ≥ 0 | Number of learned persistent tokens prepended per block. `=0` disables them |
 | `chunk_size` | `int` | 512 | 1 ≤ x ≤ `block_size` | TBPTT chunk length. `> block_size` → `ValueError` (would OOB `wpe`). From-scratch users should set `chunk_size = block_size` to avoid the G163 untrained-`wpe`-rows warning. |
+| `nmm_n_heads` | `int` | 1 | ≥ 1, must divide `n_embd` | NUMBER of parallel NMM heads. Default `1` = single-head (current behavior). `>1` instantiates `MultiHeadNMM` wrapping N parallel `NeuralMemoryModule`s on `head_dim = n_embd // n_heads`. NOT in the paper proper — this is a lucidrains enhancement exposed for ablation (G254). When `>1`, the per-layer NMM state becomes a list of per-head `(M, S)` tuples; `detach_states` / `compute_nmm_norm` handle this recursively. |
 
 **G160 — `nmm_spectral_norm` and inner-loss reduction are linked:**
 
@@ -88,6 +89,17 @@ Note: field is `swa_window`, **not** `window_size` (G126).
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `finetune_mode` | `bool` | `True` | Selects the MAG gate formula and `out_scale` init (see below) |
+
+## Paper-strict ablation flags (G254)
+
+These flags expose two deliberate paper/lucidrains divergences as runtime
+config so paper-faithful experiments can be run side-by-side with the
+default lucidrains-flavored behavior. Defaults preserve current behavior.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `retrieval_from_M_prev` | `bool` | `False` | Paper Eq. 15: `y_t = M(q_t)` where M is M_{t-1} (read-then-write). Default `False` = lucidrains write-then-read (retrieve from freshly-updated M_t). Flip to `True` for paper-strict ordering. Applies to all NMM forward paths (`step`, `step_with_conv`, `_forward_chunk_sequential`, `_forward_chunk_scan`). |
+| `feed_persistent_to_nmm` | `bool` | `False` | Paper Eq. 28: `M(x̃)` where x̃ = `concat(persistent, x)`. Default `False` = NMM sees only real tokens (lucidrains-flavored). `True` = the block feeds `ln_nmm(x_aug)` to NMM, augments `doc_boundaries` with a False prefix (persistent positions never trigger resets), and slices the prefix off `y_mem` before the residual. |
 
 ### `finetune_mode=True` (default, recommended for pretrained init)
 

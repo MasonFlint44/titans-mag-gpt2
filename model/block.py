@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import cat
 
-from model.nmm import NeuralMemoryModule
+from model.nmm import MultiHeadNMM, NeuralMemoryModule
 
 
 class CausalSelfAttention(nn.Module):
@@ -170,6 +170,10 @@ class TitansMAGBlock(nn.Module):
         self.finetune_mode = config.finetune_mode
         self.use_swa = config.use_swa
         self.swa_window = config.swa_window
+        # Paper Eq. 28 says M(x̃) — feed persistent-augmented input to NMM.
+        # Default False (our lucidrains-flavored choice): NMM sees only real
+        # tokens. True = paper-strict.
+        self.feed_persistent_to_nmm = config.feed_persistent_to_nmm
 
         # Small init like GPT-2 wte; learned, no weight decay (routed in §4.1).
         self.persistent_mem = nn.Parameter(
@@ -183,13 +187,19 @@ class TitansMAGBlock(nn.Module):
 
         # Separate from ln_1; NMM has its own pre-norm.
         self.ln_nmm = nn.LayerNorm(config.n_embd)
-        self.nmm = NeuralMemoryModule(
+        # Build NMM — single-head (default) or multi-head wrapper.
+        nmm_kwargs = dict(
             n_embd=config.n_embd,
             expansion=config.nmm_expansion,
             kernel_size=config.nmm_conv_kernel,
             spectral_norm=config.nmm_spectral_norm,
             finetune_mode=config.finetune_mode,
+            retrieval_from_M_prev=config.retrieval_from_M_prev,
         )
+        if config.nmm_n_heads > 1:
+            self.nmm = MultiHeadNMM(n_heads=config.nmm_n_heads, **nmm_kwargs)
+        else:
+            self.nmm = NeuralMemoryModule(**nmm_kwargs)
 
         # MAG gates: gamma_mem always; gamma_attn only when training from scratch.
         # Creating gamma_attn unconditionally would leak unused params into the
@@ -234,9 +244,29 @@ class TitansMAGBlock(nn.Module):
             self.ln_1(x_aug), mask=self._aug_mask(T, dtype=x.dtype)
         )[:, self.N_p :, :]
 
-        y_mem, nmm_state = self.nmm.forward_chunk(
-            self.ln_nmm(x), nmm_state, doc_boundaries
-        )
+        if self.feed_persistent_to_nmm:
+            # Paper Eq. 28 strict: M(x̃). Feed the persistent-augmented input
+            # through ln_nmm + NMM; slice the persistent prefix off the OUTPUT
+            # so the residual stream only sees y_mem for real tokens.
+            # doc_boundaries must also gain a False prefix (persistent
+            # positions never trigger doc resets — they're input-independent
+            # and identical across documents).
+            if doc_boundaries is not None:
+                db_aug = cat(
+                    [torch.zeros(B, self.N_p, dtype=torch.bool, device=x.device),
+                     doc_boundaries], dim=1,
+                )
+            else:
+                db_aug = None
+            y_mem_full, nmm_state = self.nmm.forward_chunk(
+                self.ln_nmm(x_aug), nmm_state, db_aug,
+            )
+            y_mem = y_mem_full[:, self.N_p :, :]
+        else:
+            # Default: NMM sees only real tokens (lucidrains-flavored).
+            y_mem, nmm_state = self.nmm.forward_chunk(
+                self.ln_nmm(x), nmm_state, doc_boundaries,
+            )
 
         if self.finetune_mode:
             # Additive gate: at out_scale=0 -> y_mem=0 -> o = y_attn exactly.
@@ -272,8 +302,16 @@ class TitansMAGBlock(nn.Module):
         x_aug_norm = self.ln_1(x_aug)
         k_cache, v_cache = self.attn.project_kv(x_aug_norm)
 
-        # NMM conv buffer: last (k-1) Linear projections of ln_nmm(prompt).
-        x_nmm_norm = self.ln_nmm(x_prompt)
+        # NMM conv buffer: last (k-1) Linear projections of ln_nmm input.
+        # Under feed_persistent_to_nmm, the conv must have seen the persistent
+        # prefix during warm-up — so we seed the buffer from ln_nmm(x_aug)
+        # (matching what _forward_chunk_sequential saw). Without this branch
+        # the decode-time conv would diverge from warm-up at exactly the
+        # boundary between persistent prefix and the new decoded token.
+        if self.feed_persistent_to_nmm:
+            x_nmm_norm = self.ln_nmm(x_aug)
+        else:
+            x_nmm_norm = self.ln_nmm(x_prompt)
         nmm_conv_buffer = self.nmm.init_conv_buffer_from_prompt(x_nmm_norm)
         return k_cache, v_cache, nmm_conv_buffer
 

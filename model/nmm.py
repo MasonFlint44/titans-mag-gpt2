@@ -57,20 +57,34 @@ def reset_state(state: tuple, mask: torch.Tensor, init_M: dict) -> tuple:
     return (_where_dict(init_M, M), _where_dict(zeros_S, S))
 
 
+def _detach_per_layer(layer_state):
+    """Detach a single per-layer NMM state. Handles both shapes:
+      - single-head: `(M, S)` tuple of dicts
+      - multi-head: `[(M_h, S_h), ...]` list of per-head tuples (G254)
+    """
+    if isinstance(layer_state, list):
+        return [_detach_per_layer(s) for s in layer_state]
+    M, S = layer_state
+    return (
+        {k: v.detach() for k, v in M.items()},
+        {k: v.detach() for k, v in S.items()},
+    )
+
+
 def detach_states(states):
-    """Detach every leaf tensor in a per-layer list of (M, S) dicts.
+    """Detach every leaf tensor in a per-layer list of NMM states.
 
     Pass-through on None — at the very first training step nmm_states is
     None and the model's forward initializes it; this helper must not
     explode on that case (G149).
+
+    Now recursive (G254): per-layer state can be either a `(M, S)` tuple
+    (single-head NMM) or a list-of-tuples (multi-head NMM via `MultiHeadNMM`).
+    The recursion in `_detach_per_layer` handles both transparently.
     """
     if states is None:
         return None
-    return [
-        ({k: v.detach() for k, v in M.items()},
-         {k: v.detach() for k, v in S.items()})
-        for M, S in states
-    ]
+    return [_detach_per_layer(s) for s in states]
 
 
 def _scale(scalar_B: torch.Tensor, tensor_dict: dict) -> dict:
@@ -243,11 +257,15 @@ class NeuralMemoryModule(nn.Module):
         kernel_size: int = 4,
         spectral_norm: bool = True,
         finetune_mode: bool = True,
+        retrieval_from_M_prev: bool = False,
     ):
         super().__init__()
         self.n_embd = n_embd
         self.nmm_spectral_norm = spectral_norm
         self.finetune_mode = finetune_mode
+        # Paper Eq. 15: y_t = M(q_t) where M is M_{t-1} (read-then-write).
+        # Default False = lucidrains "write-then-read" (retrieve from M_t).
+        self.retrieval_from_M_prev = retrieval_from_M_prev
 
         # Q/K/V projections — SiLU/L2 applied at call site, not inside.
         self.k_proj = NMMProjection(n_embd, kernel_size)
@@ -362,8 +380,10 @@ class NeuralMemoryModule(nn.Module):
         S_t = _dict_sub(_scale(eta_t, S_prev), _scale(theta_t, g_tilde))
         M_t = _dict_add(_scale(1.0 - alpha_t, M_prev), S_t)
 
-        # Write-then-read: query the freshly-updated M_t.
-        y_t = self.out_scale * self._batched_retrieve(M_t, q_hat)
+        # Retrieval source per config: M_prev (paper Eq. 15, read-then-write)
+        # or M_t (lucidrains default, write-then-read).
+        M_for_retrieval = M_prev if self.retrieval_from_M_prev else M_t
+        y_t = self.out_scale * self._batched_retrieve(M_for_retrieval, q_hat)
         return y_t, (M_t, S_t)
 
     def init_conv_buffer_from_prompt(self, x_chunk: torch.Tensor) -> dict:
@@ -453,7 +473,8 @@ class NeuralMemoryModule(nn.Module):
 
         S_t = _dict_sub(_scale(eta_t, S_prev), _scale(theta_t, g_tilde))
         M_t = _dict_add(_scale(1.0 - alpha_t, M_prev), S_t)
-        y_t = self.out_scale * self._batched_retrieve(M_t, q_hat)
+        M_for_retrieval = M_prev if self.retrieval_from_M_prev else M_t
+        y_t = self.out_scale * self._batched_retrieve(M_for_retrieval, q_hat)
 
         # Update conv buffer: drop oldest, append the new linear projection.
         new_buffer = {
@@ -525,6 +546,10 @@ class NeuralMemoryModule(nn.Module):
             eta_t = eta_chunk[:, t]
             alpha_t = alpha_chunk[:, t]
 
+            # Capture M_prev BEFORE the update — needed for retrieval if
+            # retrieval_from_M_prev is set (paper Eq. 15).
+            M_prev = M
+
             g_t = self.per_sample_grad_fn(M, k_hat_t, v_t)
             if self.nmm_spectral_norm:
                 g_tilde = {key: newton_schulz5(g) for key, g in g_t.items()}
@@ -534,7 +559,8 @@ class NeuralMemoryModule(nn.Module):
             S = _dict_sub(_scale(eta_t, S), _scale(theta_t, g_tilde))
             M = _dict_add(_scale(1.0 - alpha_t, M), S)
 
-            y_t = self.out_scale * self._batched_retrieve(M, q_hat_t)
+            M_for_retrieval = M_prev if self.retrieval_from_M_prev else M
+            y_t = self.out_scale * self._batched_retrieve(M_for_retrieval, q_hat_t)
             y_list.append(y_t)
 
         y_chunk = torch.stack(y_list, dim=1)
@@ -624,8 +650,21 @@ class NeuralMemoryModule(nn.Module):
             )
             M_chunk[key] = M_aug[1:]
 
+        # Retrieval source: M_chunk[t] is M_t (post-update). For paper-Eq.-15
+        # ordering we instead want M_{t-1} at position t — prepend M_state
+        # (= M_0) and drop the last entry so position t reads from M_{t-1}.
+        if self.retrieval_from_M_prev:
+            M_for_retrieval = {}
+            for k, v in M_chunk.items():
+                # [T, B, h, d]; prepend M_state[k] shape [B, h, d] -> [1, B, h, d]
+                M_for_retrieval[k] = torch.cat(
+                    [M_state[k].unsqueeze(0), v[:-1]], dim=0,
+                )
+        else:
+            M_for_retrieval = M_chunk
+
         # Retrieval: outer vmap over T, inner is the cached _batched_retrieve.
-        y_raw = vmap(self._batched_retrieve, in_dims=(0, 1))(M_chunk, q_hat_chunk)
+        y_raw = vmap(self._batched_retrieve, in_dims=(0, 1))(M_for_retrieval, q_hat_chunk)
         y_chunk = self.out_scale * y_raw.transpose(0, 1)  # [B, T, d]
 
         state_out = (
@@ -660,3 +699,135 @@ class NeuralMemoryModule(nn.Module):
         if can_scan:
             return self._forward_chunk_scan(x_chunk, state_in, doc_boundaries)
         return self._forward_chunk_sequential(x_chunk, state_in, doc_boundaries)
+
+
+class MultiHeadNMM(nn.Module):
+    """N parallel NeuralMemoryModules, each on `head_dim = n_embd // n_heads`.
+
+    Lucidrains enhancement (NOT in the paper proper) — gated by config field
+    `nmm_n_heads`. Default `nmm_n_heads=1` uses the single-head
+    `NeuralMemoryModule` directly (no wrapper); `nmm_n_heads > 1` instantiates
+    this wrapper. Exposes the same API as `NeuralMemoryModule` so the block
+    treats it as a drop-in replacement.
+
+    State structure: a list of per-head `(M, S)` tuples. `detach_states` and
+    `compute_nmm_norm` are now recursive to handle the nested structure
+    (the per-layer entry in `nmm_states` becomes a list-of-states instead
+    of a single `(M, S)` tuple).
+    """
+
+    def __init__(
+        self,
+        n_embd: int,
+        n_heads: int,
+        expansion: int = 4,
+        kernel_size: int = 4,
+        spectral_norm: bool = True,
+        finetune_mode: bool = True,
+        retrieval_from_M_prev: bool = False,
+    ):
+        super().__init__()
+        if n_heads < 1:
+            raise ValueError(f"n_heads must be >= 1 (got {n_heads})")
+        if n_embd % n_heads != 0:
+            raise ValueError(
+                f"n_embd ({n_embd}) must be divisible by n_heads ({n_heads}); "
+                f"head_dim would be {n_embd // n_heads}, which gives "
+                f"{n_heads * (n_embd // n_heads)}, not {n_embd}."
+            )
+        self.n_embd = n_embd
+        self.n_heads = n_heads
+        self.head_dim = n_embd // n_heads
+        self.nmm_spectral_norm = spectral_norm
+        self.finetune_mode = finetune_mode
+        self.retrieval_from_M_prev = retrieval_from_M_prev
+
+        # The conv-kernel `step_with_conv` semantic carries through — each
+        # head's NMM has its own conv buffer of last (k-1) head-dim tokens.
+        self.heads = nn.ModuleList([
+            NeuralMemoryModule(
+                n_embd=self.head_dim,
+                expansion=expansion,
+                kernel_size=kernel_size,
+                spectral_norm=spectral_norm,
+                finetune_mode=finetune_mode,
+                retrieval_from_M_prev=retrieval_from_M_prev,
+            )
+            for _ in range(n_heads)
+        ])
+
+    # --- Properties / helpers ----------------------------------------------
+
+    @property
+    def memory_mlp(self):
+        """For backward-compat with code paths that read `nmm.memory_mlp.W*`
+        for shape / dtype probes (e.g., `init_conv_buffer_from_prompt` dtype
+        inference, `_apply_gpt2_init`'s NMM-skip-by-id). Returns the FIRST
+        head's MemoryMLP — sufficient for shape/dtype-only consumers."""
+        return self.heads[0].memory_mlp
+
+    # --- Same-API methods as NeuralMemoryModule ----------------------------
+
+    def init_state(self, B: int, device) -> list:
+        """Per-head init states. Returns a list[n_heads] of `(M, S)` tuples."""
+        return [h.init_state(B, device) for h in self.heads]
+
+    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """Reshape last dim into (n_heads, head_dim). Works for [B, T, d] or
+        [B, d] inputs (the step path)."""
+        return x.view(*x.shape[:-1], self.n_heads, self.head_dim)
+
+    def _merge_heads(self, head_outputs: list) -> torch.Tensor:
+        """Concatenate per-head outputs back into a d_model tensor."""
+        return torch.cat(head_outputs, dim=-1)
+
+    def forward_chunk(self, x_chunk, state_in, doc_boundaries):
+        """Per-head dispatch of forward_chunk. doc_boundaries is shared
+        across heads (a token-level event is the same for every head)."""
+        x_split = self._split_heads(x_chunk)  # [B, T, n_heads, head_dim]
+        outputs = []
+        new_states = []
+        for i, head in enumerate(self.heads):
+            x_h = x_split[..., i, :].contiguous()  # [B, T, head_dim]
+            y_h, state_h = head.forward_chunk(x_h, state_in[i], doc_boundaries)
+            outputs.append(y_h)
+            new_states.append(state_h)
+        return self._merge_heads(outputs), new_states
+
+    def init_conv_buffer_from_prompt(self, x_chunk: torch.Tensor) -> list:
+        """Per-head conv buffer; the block stores a list[n_heads] of buffer
+        dicts in place of the single-head dict."""
+        x_split = self._split_heads(x_chunk)
+        return [
+            head.init_conv_buffer_from_prompt(x_split[..., i, :].contiguous())
+            for i, head in enumerate(self.heads)
+        ]
+
+    def step_with_conv(self, x_t, state, conv_buffer):
+        """Per-head step. x_t is [B, d_model]; split into per-head [B, head_dim]
+        slices, run each head's step_with_conv, concatenate outputs.
+        `conv_buffer` is a list[n_heads] of per-head buffer dicts."""
+        x_split = self._split_heads(x_t)  # [B, n_heads, head_dim]
+        outputs = []
+        new_states = []
+        new_buffers = []
+        for i, head in enumerate(self.heads):
+            x_h = x_split[..., i, :].contiguous()
+            y_h, s_h, b_h = head.step_with_conv(x_h, state[i], conv_buffer[i])
+            outputs.append(y_h)
+            new_states.append(s_h)
+            new_buffers.append(b_h)
+        return self._merge_heads(outputs), new_states, new_buffers
+
+    def step(self, x_t, state):
+        """Legacy single-token step (no conv buffer). Each head's step has
+        its own zero-padded conv window; per-head dispatch."""
+        x_split = self._split_heads(x_t)
+        outputs = []
+        new_states = []
+        for i, head in enumerate(self.heads):
+            x_h = x_split[..., i, :].contiguous()
+            y_h, s_h = head.step(x_h, state[i])
+            outputs.append(y_h)
+            new_states.append(s_h)
+        return self._merge_heads(outputs), new_states

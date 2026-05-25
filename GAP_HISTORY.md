@@ -3776,3 +3776,31 @@ Total: 70 new tests (test count: 324 → 394 non-gpu/non-ddp).
 **Test:** 11 new tests added (test count: 394 → 405). Verified all matrix refs resolve via:
   `grep -oE 'test_[a-z_0-9]+::[a-z_0-9_A-Z]+' TEST_PLAN.md | sort -u | xargs -I{} grep -rq "def $(echo {} | cut -d: -f3)\b" tests/`
 **Affects:** 5 test files extended (`test_forward_chunk.py`, `test_block.py`, `test_persistent_mask.py`, `test_attention.py`, plus T11's accompanying changes); `TEST_PLAN.md` §14 regression matrix rebuilt from actual test names.
+
+### G254 — Paper-strict ablation flags for the three documented TITANS divergences
+
+**Found:** Paper-fidelity audit (response to user query "is our implementation complete and accurate per the paper?").
+**Symptom:** The implementation deliberately diverges from the paper in three places (all documented in `ARCHITECTURE.md` Key Design Decisions), but the divergences were hardcoded — no way to flip them on per-experiment for paper-strict reproduction. The three divergences are:
+
+  1. **Retrieval ordering**: paper Eq. 15 specifies `y_t = M(q_t)` with M = M_{t-1} (read-then-write). Our code retrieved from M_t (write-then-read) per lucidrains.
+  2. **NMM input in MAG block**: paper Eq. 28 specifies `M(x̃)` (persistent-augmented). Our code fed only real tokens to the NMM.
+  3. **NMM head count**: NOT a paper requirement (lucidrains enhancement), but desirable for ablation parity. Our code was hardcoded single-head.
+
+Initial audit response misclassified #3 as paper-strict; it is actually a lucidrains-only enhancement. Implementing it anyway since the user explicitly asked.
+
+**Root cause:** Phase 1 implementation chose lucidrains-flavored defaults for stability and didn't preserve hooks for the paper-strict alternatives.
+**Fix:** Three new fields on `TitansConfig`:
+
+  - `retrieval_from_M_prev: bool = False` (default preserves write-then-read; True = paper Eq. 15). Modifies `NMM.step`, `step_with_conv`, `_forward_chunk_sequential`, `_forward_chunk_scan` — each captures `M_prev` before the update and retrieves from it when the flag is set. The scan path implements this by prepending `M_state` to the per-position `M_chunk` and dropping the last entry, so position t reads from M_{t-1}.
+  - `feed_persistent_to_nmm: bool = False` (default preserves real-tokens-only; True = paper Eq. 28). Modifies `TitansMAGBlock.forward` to feed `ln_nmm(x_aug)` to the NMM, augment `doc_boundaries` with a False prefix (persistent positions never trigger resets), and slice N_p positions off `y_mem` before the residual. `init_decode_cache` also branches so the conv buffer is seeded from `ln_nmm(x_aug)` for parity at the decode boundary.
+  - `nmm_n_heads: int = 1` (default preserves single-head; >1 instantiates `MultiHeadNMM`). New `MultiHeadNMM` class in `model/nmm.py` wraps N parallel `NeuralMemoryModule` instances each on `head_dim = n_embd // n_heads`. Exposes the same API (`init_state`, `forward_chunk`, `init_conv_buffer_from_prompt`, `step_with_conv`, `step`) so the block uses it as a drop-in. State structure becomes a list of per-head `(M, S)` tuples per layer; `detach_states` (in `model/nmm.py`) and `compute_nmm_norm` (in `train.py`) now recurse to handle the nested structure. `prepare_decode`'s G244 batch-dim validator updated to dig through the per-head list. `_apply_gpt2_init`'s NMM-skip-by-id still works because all heads are nested under the block's `nmm` attribute (and `MultiHeadNMM` exposes `memory_mlp` proxy for shape/dtype consumers).
+
+**Test:** New `tests/unit/test_paper_strict_flags.py` (25 tests):
+  - Defaults verified (each flag's OFF preserves current behavior; existing-test parity is the implicit guarantee — all 405 prior tests still pass).
+  - `retrieval_from_M_prev`: differs from default; state update bit-identical (only retrieval source changes); first-token y matches `out_scale * MLP(init_M, q̂_0)` when True; differs from M_init-retrieval when False.
+  - `feed_persistent_to_nmm`: flag propagates to block attribute; output shape preserved; differs from default; handles doc_boundaries without crashing.
+  - `nmm_n_heads`: default 1 keeps single-head NeuralMemoryModule; >1 instantiates MultiHeadNMM with correct head_dim; init_state returns list-of-(M,S); block forward+backward works; state threading carries across calls; full model forward+backward produces correctly-shaped logits and per-layer multi-head states; gradient flows to every head's NMM params.
+  - `detach_states` / `compute_nmm_norm` recursion: handles both single-head (tuple) and multi-head (list) per-layer state shapes; None passthrough preserved (G172 / G149).
+  - All three flags set simultaneously: full forward + backward + finite logits + grads on every head.
+
+**Affects:** `config.py` (3 new fields + validation); `model/nmm.py` (`retrieval_from_M_prev` arg on `NeuralMemoryModule`; modified `step`, `step_with_conv`, `_forward_chunk_sequential`, `_forward_chunk_scan`; new `MultiHeadNMM` class; recursive `detach_states` via `_detach_per_layer`); `model/block.py` (block instantiates `NeuralMemoryModule` or `MultiHeadNMM` based on `nmm_n_heads`; `feed_persistent_to_nmm` branch in `forward` and `init_decode_cache`); `model/titans_gpt2.py` (G244 batch-dim validator handles nested state); `train.py` (recursive `compute_nmm_norm` via `_layer_norm_M`); `ARCHITECTURE.md` 3 design-decisions rows updated to mention the flag-controllable nature; `CONFIG_REFERENCE.md` new "Paper-strict ablation flags" section + `nmm_n_heads` row.

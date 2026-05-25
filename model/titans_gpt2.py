@@ -189,7 +189,12 @@ class TitansMAGGPT2(nn.Module):
             # shape error inside the first block's NMM forward. Check the
             # first per-layer state's first M entry — all per-layer/per-key
             # tensors share the same B by construction in init_state.
-            first_layer_M = nmm_states[0][0]
+            # Multi-head (G254): nmm_states[0] is a list-of-states; dig in.
+            first_layer = nmm_states[0]
+            if isinstance(first_layer, list):
+                first_layer_M = first_layer[0][0]
+            else:
+                first_layer_M = first_layer[0]
             any_W = next(iter(first_layer_M.values()))
             if any_W.shape[0] != B:
                 raise ValueError(

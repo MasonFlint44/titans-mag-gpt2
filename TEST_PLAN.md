@@ -624,6 +624,16 @@ Every gap in `GAP_HISTORY.md` that introduced a silent-failure mode (or near-mis
 | G252 (T8) | `test_perf_smoke::test_train_step_throughput_is_non_degenerate`, `::test_train_step_does_not_leak_memory_across_steps`, `::test_generate_per_token_latency_does_not_grow_with_output_length`, `::test_generate_completes_within_reasonable_wall_time` | §12 |
 | G252 (T9) | `test_config::test_fuzzed_invalid_config_raises_value_error_with_informative_message` (40 parametrized) | §13 |
 | G252 (T10) | `test_tokenizer::test_encode_corpus_whole_file_pattern_produces_one_document` | §5 |
+| G253 (T11) | `test_forward_chunk::test_boundary_mask_cpu_precomputed_not_per_token_indexed`, `::test_boundary_precomputation_does_not_fire_for_none_boundaries` | §3 |
+| G253 (T12) | `test_block::test_nmm_receives_only_real_tokens_not_persistent_augmented` | §4 |
+| G253 (T13) | `test_block::test_nmm_forward_chunk_called_with_doc_boundaries_arg`, `::test_nmm_forward_chunk_called_with_none_when_doc_boundaries_none` | §4 |
+| G253 (T14) | `test_persistent_mask::test_aug_mask_no_row_is_fully_inf_standard_causal`, `::test_aug_mask_no_row_is_fully_inf_with_swa_at_edge_window`, `::test_aug_mask_softmax_produces_no_nan_in_attention_forward` | §4 |
+| G253 (T15) | `test_attention::test_attention_output_deterministic_at_dropout_zero`, `::test_attention_output_deterministic_at_dropout_zero_with_causal_mask`, `::test_attention_output_deterministic_in_train_mode_at_dropout_zero` | §4 |
+| G254 (retrieval_from_M_prev) | `test_paper_strict_flags::test_step_retrieval_from_M_prev_differs_from_default`, `::test_step_retrieval_from_M_prev_state_update_identical`, `::test_forward_chunk_retrieval_from_M_prev_first_token_uses_init_M`, `::test_forward_chunk_default_first_token_uses_M_1_not_init` | §3 |
+| G254 (feed_persistent_to_nmm) | `test_paper_strict_flags::test_block_feed_persistent_flag_propagates_to_attribute`, `::test_block_feed_persistent_changes_output_shape_invariant`, `::test_block_feed_persistent_changes_nmm_output`, `::test_block_feed_persistent_handles_doc_boundaries` | §4 |
+| G254 (nmm_n_heads) | `test_paper_strict_flags::test_block_n_heads_1_uses_single_head_NeuralMemoryModule`, `::test_block_n_heads_gt_1_uses_MultiHeadNMM`, `::test_multi_head_nmm_init_state_returns_list_of_per_head_states`, `::test_multi_head_block_forward_shape_invariant`, `::test_multi_head_block_is_differentiable`, `::test_multi_head_state_threads_across_calls`, `::test_multi_head_full_model_forward_shape_and_grad` | §4 |
+| G254 (nested state plumbing) | `test_paper_strict_flags::test_detach_states_handles_multi_head_nested_structure`, `::test_detach_states_single_head_unchanged`, `::test_compute_nmm_norm_handles_multi_head_nested_structure`, `::test_compute_nmm_norm_returns_none_on_none_multi_head_safe` | §3, §6 |
+| G254 (defaults + combined) | `test_paper_strict_flags::test_retrieval_from_M_prev_default_is_False`, `::test_feed_persistent_to_nmm_default_is_False`, `::test_nmm_n_heads_default_is_1`, `::test_nmm_n_heads_negative_rejected`, `::test_nmm_n_heads_not_dividing_n_embd_rejected`, `::test_all_three_flags_together_does_not_crash` | §2 |
 
 Gaps in `GAP_HISTORY.md` not appearing here are structural (documentation reorganization, comment additions, file renames) and are not separately testable. See `GAP_HISTORY.md` for full per-gap context.
 

@@ -32,6 +32,29 @@ class TitansConfig:
     # Fine-tuning
     finetune_mode: bool = True
 
+    # Paper-strict ablation flags (defaults preserve current
+    # lucidrains-flavored behavior; flip to True for paper-faithful runs).
+    #
+    # retrieval_from_M_prev: paper Eq. 15 specifies `y_t = M(q_t)` where M
+    #   is M_{t-1} (read-then-write). Our default (False) follows lucidrains:
+    #   retrieve from the freshly-updated M_t (write-then-read). True enables
+    #   the paper-strict ordering.
+    #
+    # feed_persistent_to_nmm: paper Eq. 28 specifies `M(x̃)` where x̃ = concat(
+    #   persistent, x). Our default (False) feeds only real tokens to the NMM
+    #   (persistent tokens are input-independent so memory updates on them
+    #   add noise; also avoids slicing the prefix from the NMM output). True
+    #   enables paper-strict input.
+    #
+    # nmm_n_heads: NOT in the paper (lucidrains enhancement). When > 1, the
+    #   NMM is replaced by `n_heads` parallel NMMs each on `head_dim = n_embd
+    #   // n_heads`. Default 1 = single-head (current behavior). Must divide
+    #   n_embd. Exposed as a config flag for parity with attention's n_head
+    #   and for future ablations against the lucidrains reference.
+    retrieval_from_M_prev: bool = False
+    feed_persistent_to_nmm: bool = False
+    nmm_n_heads: int = 1
+
     def __post_init__(self):
         # raise ValueError (never assert): `python -O` strips asserts, which
         # would let invalid configs ship silently in production.
@@ -70,6 +93,21 @@ class TitansConfig:
                 f"swa_window must be >= 1 when use_swa=True "
                 f"(got swa_window={self.swa_window}); empty window "
                 f"yields softmax NaN."
+            )
+
+        if self.nmm_n_heads < 1:
+            raise ValueError(
+                f"nmm_n_heads must be >= 1 (got {self.nmm_n_heads}); "
+                f"use 1 for single-head NMM (current default behavior)."
+            )
+
+        if self.n_embd % self.nmm_n_heads != 0:
+            head_dim = self.n_embd // self.nmm_n_heads
+            raise ValueError(
+                f"n_embd ({self.n_embd}) must be divisible by nmm_n_heads "
+                f"({self.nmm_n_heads}); head_dim would be {head_dim} but "
+                f"{self.nmm_n_heads} * {head_dim} = "
+                f"{self.nmm_n_heads * head_dim}, not {self.n_embd}."
             )
 
         # From-scratch with chunk_size < block_size leaves wpe rows above
