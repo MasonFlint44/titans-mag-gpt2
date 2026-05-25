@@ -547,7 +547,7 @@ config. **Defaults prefer the paper** (G255 default flip).
 At `finetune_mode=True` with `out_scale=0`, the NMM contributes 0 at init
 regardless of these flags, so HF parity at init is unaffected.
 
-### 5.5 Memory-saving flags (G256 / G257)
+### 5.5 Memory-saving flags (G256 / G257 / G258 / G259)
 
 Optional knobs that trade compute / minor numerical drift for VRAM.
 **Disabled by default**; the original numerical and performance
@@ -558,17 +558,31 @@ properties are preserved unless you opt in.
 | `nmm_state_dtype` | `"fp32"` | Storage dtype of `(M, S)` and per-step buffers. `"bf16"` halves their footprint. NS5 still casts to fp32 internally (G226 invariant preserved). | Minor accumulated rounding in the per-step `M_t = (1−α)M_{t-1} + S_t` update — measure loss curves before relying on it. |
 | `nmm_grad_checkpoint` | `False` | When `True`, segments `_forward_chunk_sequential`'s inner loop into `nmm_grad_checkpoint_segment_len` slices; each segment wrapped in `torch.utils.checkpoint.checkpoint(use_reentrant=True)`. | One extra forward per segment during backward (typical: 30-50% slower step). |
 | `nmm_grad_checkpoint_segment_len` | `64` | Segment length used when checkpointing is on. Smaller = less peak memory + more recompute. | None directly — but small `seg_len` ⇒ more checkpoint boundaries ⇒ more backward recompute. |
+| `nmm_cpu_offload_segments` | `False` | **Requires `nmm_grad_checkpoint=True`.** Replaces the GPU `torch.utils.checkpoint` with a custom `autograd.Function` (`_CPUOffloadCheckpoint` in `model/nmm.py`) that stashes saved-input tensors on **CPU** between forward and backward; backward moves them back to GPU one segment at a time, recomputes, and discards. Removes the `n_blocks × n_segments × per_segment` GPU ceiling that bounds the regular checkpoint. | PCIe transfer cost added to every backward (~16 GiB/s on PCIe 4.0 x16). Step time can be 5–10× slower at T=1024 — useful for "fit anything to do correctness work", not for production training on a 16 GiB consumer card. |
+| `nmm_compile_scan_training` | `False` | At construction, sets `_allow_scan_training=True` on every block's NMM so the dispatcher routes training-time forward through `_forward_chunk_scan` (associative-scan parallelism). **The user must still wrap the model in `torch.compile(model)`** — without compile, `associative_scan` has no autograd and silently zeros NMM gradients (G164 / G180). | (a) Scan is an **approximation**: per-token gradients are computed against chunk-start `M_0`, not paper-faithful `M_{t-1}`. Loss curves WILL differ from sequential. (b) Scan is a COMPUTE optimization (parallelism), NOT a memory optimization — at T=1024 the upfront `[T, B, h, d]` gradient tensors are *larger* than the sequential per-token graph. |
 
-**`use_reentrant=True` is required**, not just convenient.
-`use_reentrant=False` calls `disable_saved_tensors_hooks`, and
-`torch.func.grad` (used inside `per_sample_grad_fn`) rejects that
-at runtime. The reentrant path uses `torch.autograd.function.Function`
-which composes with `torch.func`.
+**`use_reentrant=True` is required** for the GPU checkpoint, not just
+convenient. `use_reentrant=False` calls `disable_saved_tensors_hooks`,
+and `torch.func.grad` (used inside `per_sample_grad_fn`) rejects that
+at runtime. The CPU-offload path uses the same legacy reentrant
+autograd-Function approach and composes with `torch.func` for the same
+reason.
+
+**Composition matrix** — which combinations make sense:
+
+| `grad_checkpoint` | `cpu_offload` | `bf16` | `compile_scan` | Effect |
+|---|---|---|---|---|
+| `True` | `False` | either | `False` | GPU checkpoint (default mitigation for OOM). |
+| `True` | `True` | either | `False` | CPU offload — fits longer T at significant step-time cost. |
+| `False` | `False` | either | `True` | Compile + scan — faster but APPROXIMATE gradients. |
+| `True` | `True` | either | `True` | Maximum-headroom but currently untested; scan + cpu_offload are different code paths in `forward_chunk` (scan ignores both checkpoint flags). |
+| anything | `True` | anything | anything | `nmm_grad_checkpoint=False` + `cpu_offload=True` raises `ValueError` at config construction (nothing to offload). |
 
 Validation:
 - `nmm_state_dtype` must be `"fp32"` or `"bf16"`. `fp16` is explicitly
   rejected (would require GradScaler wiring that doesn't exist).
 - `nmm_grad_checkpoint_segment_len >= 1`.
+- `nmm_cpu_offload_segments=True` AND `nmm_grad_checkpoint=False` → `ValueError`.
 
 ### 5.5 Attention / mode flags
 

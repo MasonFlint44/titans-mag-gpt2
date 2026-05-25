@@ -18,6 +18,133 @@ _STATE_DTYPE_MAP = {
 }
 
 
+class _CPUOffloadCheckpoint(torch.autograd.Function):
+    """Gradient-checkpoint variant that stashes saved tensors on CPU.
+
+    Standard `torch.utils.checkpoint.checkpoint(use_reentrant=True)` saves
+    its inputs on the SAME device (GPU) for later recompute. With many
+    blocks × many segments, those boundary `(M, S)` tensors dominate VRAM
+    at long T (G257 — 12 blocks × 64 segments × ~28 MiB per layer at
+    gpt2_small, ~20 GiB just for boundaries at T=1024).
+
+    This Function moves the saved input tensors to CPU after forward and
+    moves them back to GPU during backward, recomputes forward there with
+    autograd enabled, and runs backward through it. Net effect: identical
+    gradients to GPU checkpoint, ~20× less GPU memory used by saved
+    boundaries, at the cost of CPU↔GPU transfers per segment per backward
+    (~21 GB of transfers per training step at T=1024 — PCIe 4.0 x16 caps
+    at ~16 GB/s, so add ~1-2 s/step).
+
+    Why a custom Function and not `torch.autograd.graph.save_on_cpu`:
+    the latter uses `saved_tensors_hooks`, which `torch.func.grad`
+    (per_sample_grad_fn) rejects at runtime. The reentrant custom
+    Function path is hook-free, just like `use_reentrant=True` in
+    `torch.utils.checkpoint`.
+
+    Caller contract: pass a callable `fn` and ALL its tensor inputs as
+    positional args. Non-tensor inputs (None, bool masks that we slice
+    from larger tensors, etc.) get threaded through `non_tensor_args`
+    keyword. The callable must be deterministic given its inputs (no
+    hidden state changes between forward and recompute).
+    """
+
+    @staticmethod
+    def forward(ctx, fn, n_tensors, *args):
+        # Separate tensor inputs (must be backed up to CPU) from non-tensor
+        # constants (doc-boundary slices, None init_M_* sentinels).
+        tensor_args = args[:n_tensors]
+        other_args = args[n_tensors:]
+
+        ctx.fn = fn
+        ctx.other_args = other_args
+        ctx.n_tensors = n_tensors
+        # Save on CPU as DETACHED clones — backward will re-attach with
+        # requires_grad_ to rebuild the local autograd graph for recompute.
+        # non_blocking=True is silently ignored without pinned memory; we
+        # accept synchronous transfers here since the alternative
+        # (pin_memory allocation per call) is its own bottleneck.
+        ctx.cpu_tensors = tuple(
+            t.detach().to("cpu") for t in tensor_args
+        )
+        ctx.tensor_devices = tuple(t.device for t in tensor_args)
+        ctx.tensor_dtypes = tuple(t.dtype for t in tensor_args)
+        ctx.tensor_requires_grad = tuple(t.requires_grad for t in tensor_args)
+
+        # Run the actual forward in no_grad — we'll redo it WITH grad
+        # during backward.
+        with torch.no_grad():
+            outputs = fn(*tensor_args, *other_args)
+        return outputs
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        # Pull saved tensors back to GPU and rebuild a local autograd graph
+        # by setting requires_grad on the ones that originally required it.
+        gpu_inputs = []
+        for cpu_t, dev, dtype, rg in zip(
+            ctx.cpu_tensors,
+            ctx.tensor_devices,
+            ctx.tensor_dtypes,
+            ctx.tensor_requires_grad,
+        ):
+            gt = cpu_t.to(dev, dtype=dtype)
+            if rg:
+                gt = gt.detach().requires_grad_(True)
+            gpu_inputs.append(gt)
+
+        with torch.enable_grad():
+            outputs = ctx.fn(*gpu_inputs, *ctx.other_args)
+
+        # outputs can be a tuple. Pair with incoming gradients; non-tensor
+        # outputs (if any) are dropped on backward.
+        if not isinstance(outputs, (list, tuple)):
+            outputs = (outputs,)
+        # Only backprop through outputs that have a grad_fn (some scalar
+        # constants returned from fn would otherwise crash autograd.backward).
+        outs_with_grad = []
+        grads_with_grad = []
+        for o, g in zip(outputs, grad_outputs):
+            if isinstance(o, torch.Tensor) and o.requires_grad and g is not None:
+                outs_with_grad.append(o)
+                grads_with_grad.append(g)
+        if outs_with_grad:
+            torch.autograd.backward(outs_with_grad, grads_with_grad)
+
+        # Collect input grads in the original arg order.
+        input_grads = tuple(
+            (gt.grad if isinstance(gt, torch.Tensor) and rg else None)
+            for gt, rg in zip(gpu_inputs, ctx.tensor_requires_grad)
+        )
+        # Return tuple matching forward()'s signature: (fn, n_tensors, *args).
+        # First two are None (non-tensor); rest are grads for tensor_args
+        # then None for other_args.
+        return (None, None) + input_grads + (None,) * len(ctx.other_args)
+
+
+def cpu_offload_checkpoint(fn, *args):
+    """Wrapper around `_CPUOffloadCheckpoint` that auto-detects which
+    args are tensors. Tensor args (in order) come first; non-tensor args
+    must come AFTER all tensors. This is matched by the call site in
+    `_forward_chunk_sequential` which passes the segment-slice tensors
+    first and the bool / None constants last.
+    """
+    n_tensors = 0
+    for a in args:
+        if isinstance(a, torch.Tensor):
+            n_tensors += 1
+        else:
+            break
+    # Sanity: no tensor allowed after the first non-tensor.
+    for a in args[n_tensors:]:
+        if isinstance(a, torch.Tensor):
+            raise RuntimeError(
+                "cpu_offload_checkpoint requires all tensor args to come "
+                "before any non-tensor arg; got a tensor after a "
+                "non-tensor in the arg list."
+            )
+    return _CPUOffloadCheckpoint.apply(fn, n_tensors, *args)
+
+
 # Resolve torch.associative_scan across PyTorch versions (G215). 2.8+ exposes
 # it at `torch.associative_scan`; 2.6/2.7 only at the private path. Bind to
 # a module-level name so callers don't redo the lookup.
@@ -287,6 +414,8 @@ class NeuralMemoryModule(nn.Module):
         state_dtype: str = "fp32",
         grad_checkpoint: bool = False,
         grad_checkpoint_segment_len: int = 64,
+        cpu_offload_segments: bool = False,
+        allow_scan_training: bool = False,
     ):
         super().__init__()
         self.n_embd = n_embd
@@ -310,6 +439,17 @@ class NeuralMemoryModule(nn.Module):
                 f"(got {grad_checkpoint_segment_len})."
             )
         self.grad_checkpoint_segment_len = grad_checkpoint_segment_len
+        if cpu_offload_segments and not grad_checkpoint:
+            raise ValueError(
+                "cpu_offload_segments=True requires grad_checkpoint=True; "
+                "see TitansConfig validation note."
+            )
+        self.cpu_offload_segments = cpu_offload_segments
+        # `_allow_scan_training` was previously a runtime-only attribute set
+        # by the `allow_scan_training(model, True)` helper. Now also
+        # settable at construction via the corresponding config flag so the
+        # user doesn't need a separate post-construction step.
+        self._allow_scan_training = bool(allow_scan_training)
 
         # Q/K/V projections — SiLU/L2 applied at call site, not inside.
         self.k_proj = NMMProjection(n_embd, kernel_size)
@@ -738,27 +878,42 @@ class NeuralMemoryModule(nn.Module):
                 init_M_W1, init_M_Wg, init_M_W2,
             )
             if self.grad_checkpoint and torch.is_grad_enabled() and seg_len < T:
-                # use_reentrant=True is REQUIRED here even though the modern
-                # default is False: `use_reentrant=False` enables
-                # `disable_saved_tensors_hooks`, which `torch.func.grad`
-                # (used inside `per_sample_grad_fn`) rejects at runtime.
-                # The legacy reentrant path goes through
-                # `torch.autograd.function.Function` and does NOT touch
-                # saved-tensor hooks, so it composes with torch.func.
-                #
-                # Reentrant-path quirks we already handle:
-                # - All tensor inputs (state, init_M_*, segment slices)
-                #   must be properly tracked: the chunk-level state
-                #   tensors flow through `memory_mlp.W*.weight` which has
-                #   requires_grad=True, so autograd is connected.
-                # - boundary masks are bool / non-grad — fine, checkpoint
-                #   silently passes non-floats through.
-                # - autocast: reentrant captures + restores the autocast
-                #   state on recompute by default in modern torch.
-                y_seg, M_W1, M_Wg, M_W2, S_W1, S_Wg, S_W2 = _checkpoint.checkpoint(
-                    self._run_inner_loop, *args,
-                    use_reentrant=True,
-                )
+                if self.cpu_offload_segments:
+                    # Same recompute semantics as use_reentrant=True
+                    # checkpoint, but with all tensor inputs stashed on
+                    # CPU between forward and backward (G258 — VRAM win
+                    # at the cost of CPU↔GPU transfers). Argument order
+                    # MUST place all tensors before any non-tensor
+                    # constant (the `db_seg` bool slice / `init_M_*`
+                    # potentially-None sentinels) — see
+                    # `cpu_offload_checkpoint`.
+                    y_seg, M_W1, M_Wg, M_W2, S_W1, S_Wg, S_W2 = cpu_offload_checkpoint(
+                        self._run_inner_loop, *args,
+                    )
+                else:
+                    # use_reentrant=True is REQUIRED here even though the
+                    # modern default is False: `use_reentrant=False`
+                    # enables `disable_saved_tensors_hooks`, which
+                    # `torch.func.grad` (used inside `per_sample_grad_fn`)
+                    # rejects at runtime. The legacy reentrant path goes
+                    # through `torch.autograd.function.Function` and does
+                    # NOT touch saved-tensor hooks, so it composes with
+                    # torch.func.
+                    #
+                    # Reentrant-path quirks we already handle:
+                    # - All tensor inputs (state, init_M_*, segment slices)
+                    #   must be properly tracked: the chunk-level state
+                    #   tensors flow through `memory_mlp.W*.weight` which
+                    #   has requires_grad=True, so autograd is connected.
+                    # - boundary masks are bool / non-grad — fine,
+                    #   checkpoint silently passes non-floats through.
+                    # - autocast: reentrant captures + restores the
+                    #   autocast state on recompute by default in modern
+                    #   torch.
+                    y_seg, M_W1, M_Wg, M_W2, S_W1, S_Wg, S_W2 = _checkpoint.checkpoint(
+                        self._run_inner_loop, *args,
+                        use_reentrant=True,
+                    )
             else:
                 y_seg, M_W1, M_Wg, M_W2, S_W1, S_Wg, S_W2 = self._run_inner_loop(*args)
 
@@ -945,6 +1100,8 @@ class MultiHeadNMM(nn.Module):
         state_dtype: str = "fp32",
         grad_checkpoint: bool = False,
         grad_checkpoint_segment_len: int = 64,
+        cpu_offload_segments: bool = False,
+        allow_scan_training: bool = False,
     ):
         super().__init__()
         if n_heads < 1:
@@ -964,9 +1121,9 @@ class MultiHeadNMM(nn.Module):
 
         # The conv-kernel `step_with_conv` semantic carries through — each
         # head's NMM has its own conv buffer of last (k-1) head-dim tokens.
-        # state_dtype / grad_checkpoint propagate per-head (one bf16 per-head
-        # state plus per-head checkpointing). Per-head segment_len is the same
-        # since heads share the chunk-time dimension.
+        # state_dtype / grad_checkpoint / cpu_offload / allow_scan_training
+        # propagate per-head. Per-head segment_len is the same since heads
+        # share the chunk-time dimension.
         self.heads = nn.ModuleList([
             NeuralMemoryModule(
                 n_embd=self.head_dim,
@@ -978,6 +1135,8 @@ class MultiHeadNMM(nn.Module):
                 state_dtype=state_dtype,
                 grad_checkpoint=grad_checkpoint,
                 grad_checkpoint_segment_len=grad_checkpoint_segment_len,
+                cpu_offload_segments=cpu_offload_segments,
+                allow_scan_training=allow_scan_training,
             )
             for _ in range(n_heads)
         ])

@@ -208,6 +208,17 @@ cfg = TitansConfig.gpt2_small(
     nmm_state_dtype="bf16",
     nmm_expansion=1,
 )
+
+# 4. Last resort if you NEED long T and don't care about step time:
+#    enable CPU-offload of the checkpoint boundaries. Adds 5-10x to
+#    step time at long T due to PCIe transfers + extra recompute.
+#    Suitable for correctness work, not production training.
+cfg = TitansConfig.gpt2_small(
+    chunk_size=T, block_size=T,
+    nmm_grad_checkpoint=True, nmm_grad_checkpoint_segment_len=32,
+    nmm_state_dtype="bf16",
+    nmm_cpu_offload_segments=True,
+)
 ```
 
 ---

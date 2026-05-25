@@ -88,6 +88,35 @@ class TitansConfig:
     nmm_grad_checkpoint: bool = False
     nmm_grad_checkpoint_segment_len: int = 64
 
+    # Two more memory / compute knobs (G258, G259).
+    #
+    # nmm_compile_scan_training: opt the per-block NMM into the
+    #   `_forward_chunk_scan` path during training. This is the
+    #   associative-scan-based parallel path; it pre-computes all T per-
+    #   token gradients at chunk-start M_0 (an APPROXIMATION — does NOT
+    #   match the paper's M_{t-1}-conditioned gradients). The scan path
+    #   needs torch.compile to have autograd; without it autograd is
+    #   silently zeroed for the NMM (G164/G180). Setting this flag only
+    #   flips `_allow_scan_training` on each block's NMM at construction;
+    #   YOU STILL HAVE TO call `torch.compile(model)` yourself to actually
+    #   enable the scan path under autograd.
+    #   Note: scan is a COMPUTE optimization (parallelism), NOT a memory
+    #   optimization. It allocates `[T, B, h, d]` gradient tensors upfront,
+    #   which at T=1024 can be larger than the sequential path's per-token
+    #   graph — combine with cpu_offload below if VRAM is the bottleneck.
+    #
+    # nmm_cpu_offload_segments: when True, gradient-checkpoint boundary
+    #   (M, S) tensors are stashed on CPU between forward and backward
+    #   instead of staying on GPU. Backward moves them back to GPU one
+    #   segment at a time, recomputes, and discards. ~20x reduction in
+    #   GPU memory used by checkpoint boundaries at the cost of CPU↔GPU
+    #   transfer time (PCIe 4.0 x16: ~16 GB/s realistic). Requires
+    #   `nmm_grad_checkpoint=True` — without it there are no boundary
+    #   tensors to offload. Composes with `nmm_state_dtype="bf16"`
+    #   (offloaded tensors are bf16, transfer is half the size).
+    nmm_compile_scan_training: bool = False
+    nmm_cpu_offload_segments: bool = False
+
     def __post_init__(self):
         # raise ValueError (never assert): `python -O` strips asserts, which
         # would let invalid configs ship silently in production.
@@ -155,6 +184,20 @@ class TitansConfig:
             raise ValueError(
                 f"nmm_grad_checkpoint_segment_len must be >= 1 (got "
                 f"{self.nmm_grad_checkpoint_segment_len})."
+            )
+
+        # cpu_offload only makes sense when grad_checkpoint is on — without
+        # checkpointing there are no boundary tensors to offload (the full
+        # graph is on GPU). Fail loud so callers don't enable cpu_offload
+        # alone and wonder why memory didn't drop.
+        if self.nmm_cpu_offload_segments and not self.nmm_grad_checkpoint:
+            raise ValueError(
+                "nmm_cpu_offload_segments=True requires "
+                "nmm_grad_checkpoint=True. The CPU-offload only stashes "
+                "checkpoint-boundary tensors; with checkpointing off there "
+                "are no boundaries to offload (the full per-token graph "
+                "lives on GPU). Set nmm_grad_checkpoint=True too, or set "
+                "nmm_cpu_offload_segments=False."
             )
 
         # From-scratch with chunk_size < block_size leaves wpe rows above

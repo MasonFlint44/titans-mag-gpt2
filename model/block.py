@@ -198,6 +198,8 @@ class TitansMAGBlock(nn.Module):
             state_dtype=config.nmm_state_dtype,
             grad_checkpoint=config.nmm_grad_checkpoint,
             grad_checkpoint_segment_len=config.nmm_grad_checkpoint_segment_len,
+            cpu_offload_segments=config.nmm_cpu_offload_segments,
+            allow_scan_training=config.nmm_compile_scan_training,
         )
         if config.nmm_n_heads > 1:
             self.nmm = MultiHeadNMM(n_heads=config.nmm_n_heads, **nmm_kwargs)

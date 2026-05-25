@@ -74,6 +74,8 @@ properties are preserved.
 | `nmm_state_dtype` | `str` | `"fp32"` | Storage dtype for the recurrent `(M, S)` and per-step update buffers. `"bf16"` roughly halves per-step state retention. NS5 still casts to fp32 internally (G226), so the spectral-norm fixed point is preserved. The drift risk is the per-step `M_t = (1-α)·M_{t-1} + S_t` rounding in bf16 — measure loss curves before relying on it. Valid: `"fp32"`, `"bf16"`. `fp16` is rejected (would need loss scaling). |
 | `nmm_grad_checkpoint` | `bool` | `False` | When `True`, `_forward_chunk_sequential` runs the per-token inner loop in `nmm_grad_checkpoint_segment_len`-token segments, each wrapped in `torch.utils.checkpoint.checkpoint(use_reentrant=True)`. Backward recomputes inner-loop intermediates instead of storing them. **The unlock for `T ≥ 64` on a 16 GiB consumer card.** Composes with `nmm_state_dtype="bf16"` multiplicatively. The scan path (`_forward_chunk_scan`) ignores this flag. |
 | `nmm_grad_checkpoint_segment_len` | `int` | 64 | Segment size when grad-checkpointing is on (no effect otherwise). Smaller = less peak memory + more recompute; larger = more peak memory + less recompute. Tuning guidance: start at `64`; drop to `32` or `16` if OOM persists. |
+| `nmm_cpu_offload_segments` | `bool` | `False` | Requires `nmm_grad_checkpoint=True`. Replaces the GPU checkpoint with a CPU-offload variant: saved segment-boundary `(M, S)` tensors are stashed on CPU between forward and backward, and pulled back to GPU for recompute one segment at a time. Removes the `n_blocks × n_segments × per_segment` VRAM ceiling that bounds the GPU checkpoint at long `T`. **Trade:** PCIe transfer cost (~16 GiB/s on PCIe 4.0 x16) added to every backward — expect a 1.5–3× step-time slowdown depending on `T` and `seg_len`. Uses a custom `autograd.Function` (not `save_on_cpu`, which uses `saved_tensors_hooks` rejected by `torch.func.grad`). |
+| `nmm_compile_scan_training` | `bool` | `False` | Sets `_allow_scan_training=True` on every block's NMM at construction so the dispatcher in `forward_chunk` takes the associative-scan path **even with autograd enabled**. **You still need to wrap the model in `torch.compile(model)` yourself** — without compile, `associative_scan` has no autograd and silently zeros NMM gradients (G164 / G180). **This is a COMPUTE optimization (parallelism), NOT memory** — the scan path allocates `[T, B, h, d]` gradient tensors upfront, which at T=1024 is *larger* than the sequential path's per-token graph. Useful when paired with `cpu_offload` to fit T=1024 *and* run it faster. **Caveat:** scan is an APPROXIMATION — per-token gradients are computed against chunk-start `M_0`, not paper-faithful `M_{t-1}` — so training loss curves will differ from sequential. |
 
 **Why `use_reentrant=True`** is *required* (not just convenient):
 `use_reentrant=False` calls `disable_saved_tensors_hooks`, and
@@ -81,31 +83,70 @@ properties are preserved.
 at runtime. The reentrant path uses `torch.autograd.function.Function`
 which composes with `torch.func`.
 
-**Measured impact** (RTX 5070 Ti, 16 GiB, `gpt2_small` with `bf16` autocast):
+**Measured impact** (RTX 5070 Ti, 16 GiB, `gpt2_small` with `bf16` autocast,
+end-to-end `train_step` with backward + Adam):
 
-| Configuration | Peak VRAM | Status |
-|---|---|---|
-| `B=1, T=64`, fp32, no ckpt (baseline) | 12.6 GiB | OOM |
-| `B=1, T=64`, bf16, no ckpt | 12.6 GiB | OOM (bf16 alone ~no help — activations are already bf16) |
-| `B=1, T=64`, fp32, ckpt seg=16 | 10.9 GiB | OK |
-| `B=1, T=64`, bf16 + ckpt seg=16 | 7.7 GiB | OK |
-| `B=1, T=128`, bf16 + ckpt seg=16 | 9.0 GiB | OK |
-| `B=1, T=256`, bf16 + ckpt seg=16 | 11.7 GiB | OK ← **practical limit on this card** |
-| `B=2, T=128`, bf16 + ckpt seg=16 | 13.9 GiB | OOM |
-| `B=1, T=512`, bf16 + ckpt seg=16 | 12.8 GiB | OOM |
-| `B=1, T=1024`, bf16 + ckpt seg ∈ {8, 16, 32, 64} | ~13 GiB | OOM at every seg |
+| Configuration | Peak VRAM | Step time | Status |
+|---|---|---|---|
+| `B=1, T=64`, fp32, no ckpt (baseline) | 12.6 GiB | — | OOM |
+| `B=1, T=64`, bf16, no ckpt | 12.6 GiB | — | OOM (bf16 alone ~no help) |
+| `B=1, T=64`, fp32, ckpt seg=16 | 10.9 GiB | (fast) | OK |
+| `B=1, T=64`, bf16 + ckpt seg=16 | 7.7 GiB | (fast) | OK |
+| `B=1, T=128`, bf16 + ckpt seg=16 | 9.0 GiB | (fast) | OK |
+| `B=1, T=256`, bf16 + ckpt seg=16 | 11.7 GiB | (fast) | OK ← **fast practical limit** |
+| `B=2, T=128`, bf16 + ckpt seg=16 | 13.9 GiB | — | OOM |
+| `B=1, T=512`, bf16 + ckpt seg=16 | 12.8 GiB | — | OOM |
+| `B=1, T=1024`, bf16 + ckpt seg ∈ {8..64} | ~13 GiB | — | OOM at every seg |
+| `B=1, T=256`, bf16 + ckpt seg=32 + cpu_offload | 10.8 GiB | 103 s | OK (slow) |
+| `B=1, T=1024`, bf16 + ckpt seg=32 + cpu_offload | **11.1 GiB** | **405 s** | OK ← **T=1024 finally fits** |
+| `B=2, T=256`, bf16 + ckpt seg=32 + cpu_offload | 13.8 GiB | — | OOM (in-segment grows with B) |
 
-Checkpointing is the dominant unlock — it converts the per-token graph
-from "all T steps retained" to "boundary states retained, recompute
-within segment." The remaining cost scales as
-`n_blocks × (T / seg_len) × per_segment_state_bytes`. For `gpt2_small`
-that's `12 × (T/seg) × ~28·B MiB` per layer of M/S boundaries; T=1024
-needs >40 GiB of boundary storage at any reasonable seg_len.
+**Findings:**
 
-**To fit T=1024 on consumer hardware** you'd need: a smaller backbone
-(`gpt2_small(n_layer=6)`), `nmm_expansion=1` (halves state), or a
-GPU with ≥40 GiB. The implemented optimizations get a 16 GiB card to
-T=256, not T=1024.
+- Gradient checkpointing is the dominant unlock for `T ≥ 64`.
+- `bf16` state stacks on top, ~2× headroom.
+- **`cpu_offload` is what lets T=1024 fit on a 16 GiB card** — but at a
+  ~5–10× step-time cost (PCIe transfer + extra recompute per segment).
+  Useful for correctness verification at long context; **not practical
+  for production training** on this hardware.
+- All optimizations capped at `B=1` on this card. The in-segment forward
+  memory grows linearly with B and CPU-offload can't help with it.
+
+**Recommended configs by goal:**
+
+```python
+# Fast-but-short: real training on this card, ~256 tokens / step.
+TitansConfig.gpt2_small(
+    chunk_size=256, block_size=256,
+    nmm_state_dtype="bf16",
+    nmm_grad_checkpoint=True,
+    nmm_grad_checkpoint_segment_len=16,
+)
+
+# Long-but-slow: T=1024 fits, but 5+ minutes per step.
+TitansConfig.gpt2_small(
+    chunk_size=1024, block_size=1024,
+    nmm_state_dtype="bf16",
+    nmm_grad_checkpoint=True,
+    nmm_grad_checkpoint_segment_len=32,
+    nmm_cpu_offload_segments=True,
+)
+
+# Faster-but-approximate: scan path under torch.compile.
+# Caller must `model = torch.compile(model)` after construction.
+TitansConfig.gpt2_small(
+    chunk_size=512, block_size=512,
+    nmm_state_dtype="bf16",
+    nmm_compile_scan_training=True,
+)
+# Note: gradients are computed at chunk-start M_0 (approximation);
+# loss curves will differ from sequential training.
+```
+
+To do T=1024 + B>1 at practical step times, you really need a card
+with ≥24 GiB VRAM. The implemented optimizations get this 16 GiB card
+to T=256 at full speed, T=1024 at 5+ min/step, but cannot make T=1024
+fast.
 
 **G160 — `nmm_spectral_norm` and inner-loss reduction are linked:**
 

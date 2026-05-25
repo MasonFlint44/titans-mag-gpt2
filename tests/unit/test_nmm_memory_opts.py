@@ -333,3 +333,202 @@ def test_bf16_plus_grad_checkpoint_runs_end_to_end():
     for n, p in block.nmm.memory_mlp.named_parameters():
         assert p.grad is not None, f"{n} has no grad"
         assert torch.isfinite(p.grad).all(), f"{n} grad has NaN/Inf"
+
+
+# ---------------------------------------------------------------------------
+# nmm_compile_scan_training — flag wiring
+# ---------------------------------------------------------------------------
+
+
+def test_compile_scan_training_default_does_not_allow_scan():
+    """Default must keep _allow_scan_training=False so the sequential path
+    is always taken under autograd — the scan path is an APPROXIMATION
+    (gradients pre-computed at chunk-start M_0, not M_{t-1}) and silently
+    enabling it would change every existing training run's loss curve."""
+    cfg = TitansConfig(
+        n_layer=2, n_head=2, n_embd=8, vocab_size=16,
+        block_size=16, chunk_size=8, dropout=0.0,
+        nmm_n_persistent=0, finetune_mode=False,
+    )
+    from model.titans_gpt2 import TitansMAGGPT2
+    model = TitansMAGGPT2(cfg)
+    for block in model.blocks:
+        assert block.nmm._allow_scan_training is False
+
+
+def test_compile_scan_training_True_propagates_to_every_block():
+    """Setting nmm_compile_scan_training=True must flip
+    _allow_scan_training on every block's NMM at construction.
+    Without this, the user would have to call allow_scan_training(model)
+    manually before training, an easy step to forget."""
+    cfg = TitansConfig(
+        n_layer=3, n_head=2, n_embd=8, vocab_size=16,
+        block_size=16, chunk_size=8, dropout=0.0,
+        nmm_n_persistent=0, finetune_mode=False,
+        nmm_compile_scan_training=True,
+    )
+    from model.titans_gpt2 import TitansMAGGPT2
+    model = TitansMAGGPT2(cfg)
+    assert len(model.blocks) == 3
+    for i, block in enumerate(model.blocks):
+        assert block.nmm._allow_scan_training is True, (
+            f"block {i} did not receive _allow_scan_training=True"
+        )
+
+
+def test_compile_scan_training_propagates_through_multi_head():
+    """When nmm_n_heads > 1, the flag must reach every head's NMM."""
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=8, vocab_size=16,
+        block_size=16, chunk_size=8, dropout=0.0,
+        nmm_n_persistent=0, finetune_mode=False,
+        nmm_n_heads=2,
+        nmm_compile_scan_training=True,
+    )
+    from model.titans_gpt2 import TitansMAGGPT2
+    model = TitansMAGGPT2(cfg)
+    # nmm is a MultiHeadNMM; check each head.
+    for h_idx, head in enumerate(model.blocks[0].nmm.heads):
+        assert head._allow_scan_training is True, (
+            f"multi-head NMM head {h_idx} missing _allow_scan_training"
+        )
+
+
+# ---------------------------------------------------------------------------
+# nmm_cpu_offload_segments — config validation
+# ---------------------------------------------------------------------------
+
+
+def test_config_rejects_cpu_offload_without_grad_checkpoint():
+    """cpu_offload is meaningless without grad_checkpoint — there are no
+    segment boundary tensors to stash. Catch this loudly at construction
+    so the user doesn't enable cpu_offload and wonder why memory didn't
+    change."""
+    with pytest.raises(ValueError, match="requires nmm_grad_checkpoint=True"):
+        TitansConfig(nmm_cpu_offload_segments=True)
+
+
+def test_config_accepts_cpu_offload_when_grad_checkpoint_enabled():
+    TitansConfig(
+        nmm_grad_checkpoint=True,
+        nmm_cpu_offload_segments=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CPU-offload checkpoint — correctness
+# ---------------------------------------------------------------------------
+
+
+def _block_with_cpu_offload(seg_len=3):
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=8, vocab_size=16,
+        block_size=64, chunk_size=8, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=0,
+        finetune_mode=False,
+        nmm_grad_checkpoint=True,
+        nmm_grad_checkpoint_segment_len=seg_len,
+        nmm_cpu_offload_segments=True,
+    )
+    return TitansMAGBlock(cfg)
+
+
+def _block_with_gpu_checkpoint(seg_len=3):
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=8, vocab_size=16,
+        block_size=64, chunk_size=8, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=0,
+        finetune_mode=False,
+        nmm_grad_checkpoint=True,
+        nmm_grad_checkpoint_segment_len=seg_len,
+        nmm_cpu_offload_segments=False,
+    )
+    return TitansMAGBlock(cfg)
+
+
+def test_cpu_offload_backward_matches_gpu_checkpoint():
+    """Gradients of memory_mlp params must match between GPU checkpoint
+    and CPU-offload checkpoint within float-rounding tolerance. The
+    offload path moves saved inputs CPU→GPU on backward and recomputes;
+    if anything in the round-trip rounds or loses precision (dtype
+    casting bug, device-arg drop, requires_grad loss), the gradients
+    drift visibly."""
+    torch.manual_seed(0)
+    block_a = _block_with_gpu_checkpoint(seg_len=3)
+    block_b = _block_with_cpu_offload(seg_len=3)
+    block_b.load_state_dict(block_a.state_dict())
+
+    x_a = torch.randn(2, 8, 8, requires_grad=True)
+    x_b = x_a.detach().clone().requires_grad_(True)
+    s_a = block_a.nmm.init_state(B=2, device=torch.device("cpu"))
+    s_b = block_b.nmm.init_state(B=2, device=torch.device("cpu"))
+
+    y_a, _ = block_a(x_a, s_a)
+    y_b, _ = block_b(x_b, s_b)
+    y_a.sum().backward()
+    y_b.sum().backward()
+
+    for (n_a, p_a), (n_b, p_b) in zip(
+        block_a.nmm.memory_mlp.named_parameters(),
+        block_b.nmm.memory_mlp.named_parameters(),
+    ):
+        assert n_a == n_b
+        max_diff = (p_a.grad - p_b.grad).abs().max().item()
+        assert max_diff < 1e-4, (
+            f"cpu_offload diverged from gpu checkpoint on {n_a}: "
+            f"max grad diff = {max_diff:.3e}"
+        )
+
+
+def test_cpu_offload_runs_with_doc_boundaries():
+    """Doc-boundary reset must work across the offloaded segment edge.
+    The init_M_* tensors used by reset_state are passed through the same
+    arg list and must round-trip CPU/GPU correctly."""
+    torch.manual_seed(0)
+    block = _block_with_cpu_offload(seg_len=3)
+    state = block.nmm.init_state(B=2, device=torch.device("cpu"))
+    x = torch.randn(2, 8, 8, requires_grad=True)
+    db = torch.zeros(2, 8, dtype=torch.bool)
+    db[:, 4] = True  # boundary mid-chunk; init_M_* are tensors not None
+    y, _ = block(x, state, doc_boundaries=db)
+    y.sum().backward()
+    for p in block.nmm.memory_mlp.parameters():
+        assert torch.isfinite(p.grad).all()
+
+
+def test_cpu_offload_runs_without_doc_boundaries():
+    """The common path: no boundaries -> init_M_* are None. The arg list
+    has tensors-then-Nones, which `cpu_offload_checkpoint` handles by
+    auto-detecting the tensor prefix and threading non-tensors through
+    untouched."""
+    torch.manual_seed(0)
+    block = _block_with_cpu_offload(seg_len=3)
+    state = block.nmm.init_state(B=2, device=torch.device("cpu"))
+    x = torch.randn(2, 8, 8, requires_grad=True)
+    y, _ = block(x, state, doc_boundaries=None)
+    y.sum().backward()
+    for p in block.nmm.memory_mlp.parameters():
+        assert torch.isfinite(p.grad).all()
+
+
+def test_cpu_offload_plus_bf16_state_runs():
+    """All three memory knobs on at once — smoke test for finite gradients."""
+    torch.manual_seed(0)
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=8, vocab_size=16,
+        block_size=64, chunk_size=8, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=0,
+        finetune_mode=False,
+        nmm_state_dtype="bf16",
+        nmm_grad_checkpoint=True,
+        nmm_grad_checkpoint_segment_len=3,
+        nmm_cpu_offload_segments=True,
+    )
+    block = TitansMAGBlock(cfg)
+    state = block.nmm.init_state(B=2, device=torch.device("cpu"))
+    x = torch.randn(2, 8, 8, requires_grad=True)
+    y, _ = block(x, state)
+    y.sum().backward()
+    for n, p in block.nmm.memory_mlp.named_parameters():
+        assert p.grad is not None
+        assert torch.isfinite(p.grad).all(), f"{n} non-finite grad"
