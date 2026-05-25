@@ -65,6 +65,8 @@ class CausalSelfAttention(nn.Module):
         x_new: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
+        swa_window: int = None,
+        n_persistent: int = 0,
     ) -> tuple:
         """Decode-path attention: project a single new token's Q/K/V,
         append the new K, V to the cache, run SDPA with Q against the
@@ -73,13 +75,15 @@ class CausalSelfAttention(nn.Module):
         x_new: [B, 1, C] — the new token's pre-attention input (already
         ln_1-normalized by the caller).
         k_cache, v_cache: [B, n_head, T_seen, head_dim] — prior K, V.
+        swa_window: when set, the new real token attends only to the most
+          recent `swa_window` real positions (matches warm-up's banded
+          mask via `_aug_mask`). When None, full causal — every prior
+          position is allowed.
+        n_persistent: number of persistent-prefix positions at the START
+          of k_cache. Persistent positions are ALWAYS visible regardless
+          of `swa_window` (paper Fig. 3b). Only consulted when SWA fires.
 
         Returns (y [B, 1, C], new_k_cache, new_v_cache).
-
-        No mask is needed: the new token attends to everything in the
-        cache (all of which is in its causal past or is a persistent
-        token, both of which it's allowed to see). dropout_p=0 because
-        decode is inference-time.
         """
         B, T_new, C = x_new.shape
         assert T_new == 1, f"forward_with_kv_cache expects T=1, got T={T_new}"
@@ -93,8 +97,30 @@ class CausalSelfAttention(nn.Module):
         k_full = torch.cat([k_cache, k_new], dim=2)  # [B, n, T_seen + 1, d]
         v_full = torch.cat([v_cache, v_new], dim=2)
 
+        # SWA at decode: matches warm-up's `_aug_mask` semantics. The new
+        # real token (at the LAST absolute position) attends to:
+        #   - All persistent positions (0..n_persistent-1) — always open.
+        #   - The most recent `swa_window` real positions only.
+        # Without this branch, decode silently attends to every prior real
+        # token regardless of swa_window — i.e., a model trained with SWA
+        # would have learned a banded distribution but suddenly see the
+        # full history at generation time.
+        attn_mask = None
+        if swa_window is not None:
+            T_full = k_full.size(2)
+            # New token is at absolute position T_full - 1 in the cache.
+            # First REAL allowed position = max(n_persistent, T_full - swa_window).
+            first_real_allowed = max(n_persistent, T_full - swa_window)
+            # Build a length-T_full single-row additive mask: open on
+            # [0, n_persistent) ∪ [first_real_allowed, T_full); -inf elsewhere.
+            mask_row = torch.zeros(T_full, device=q.device, dtype=q.dtype)
+            if first_real_allowed > n_persistent:
+                mask_row[n_persistent:first_real_allowed] = float("-inf")
+            # SDPA expects mask shape broadcastable to [B, n, 1, T_full].
+            attn_mask = mask_row.view(1, 1, 1, T_full)
+
         y = F.scaled_dot_product_attention(
-            q, k_full, v_full, attn_mask=None, dropout_p=0.0
+            q, k_full, v_full, attn_mask=attn_mask, dropout_p=0.0
         )
         y = y.transpose(1, 2).contiguous().view(B, 1, C)
         y = self.proj(y)
@@ -270,10 +296,14 @@ class TitansMAGBlock(nn.Module):
         new_nmm_conv_buffer).
         """
         # Attention via KV cache. ln_1 on the new token; no x_aug concat
-        # (persistent prefix is already in the cache).
+        # (persistent prefix is already in the cache). Forward the SWA
+        # window + persistent-prefix length so SWA semantics survive at
+        # decode time (matches the warm-up path's `_aug_mask`).
         x_norm_attn = self.ln_1(x_new)
         y_attn, new_k_cache, new_v_cache = self.attn.forward_with_kv_cache(
-            x_norm_attn, k_cache, v_cache
+            x_norm_attn, k_cache, v_cache,
+            swa_window=self.swa_window if self.use_swa else None,
+            n_persistent=self.N_p,
         )
 
         # NMM via step_with_conv: one update per token, full conv context.

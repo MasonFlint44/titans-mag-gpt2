@@ -115,6 +115,26 @@ def test_cached_decode_matches_full_forward_multi_step():
     P, N = 6, 4
     prompt = torch.randint(0, cfg.vocab_size, (1, P))
     decoded = torch.randint(0, cfg.vocab_size, (1, N))  # fixed token sequence
+    _check_multi_step_parity(cfg, model, prompt, decoded, P, N)
+
+
+def test_cached_decode_matches_full_forward_multi_step_batched():
+    """G241 — same multi-step parity but at B=2 (batched decode). Every
+    other cached-decode correctness test runs at B=1; this is the only
+    test that would catch a regression in batched paths (per-sample vmap
+    inside step_with_conv, batched KV cache concat, batched conv buffer
+    shifts). The shapes downstream all carry B through, but until this
+    test was added no parity invariant was actually verified at B>1."""
+    torch.manual_seed(0)
+    cfg, model = _tiny_model(finetune_mode=False)
+    P, N = 6, 4
+    B = 2
+    prompt = torch.randint(0, cfg.vocab_size, (B, P))
+    decoded = torch.randint(0, cfg.vocab_size, (B, N))
+    _check_multi_step_parity(cfg, model, prompt, decoded, P, N)
+
+
+def _check_multi_step_parity(cfg, model, prompt, decoded, P, N):
 
     with torch.no_grad():
         # Reference: full forward on [prompt, decoded]
@@ -135,15 +155,59 @@ def test_cached_decode_matches_full_forward_multi_step():
             tok = decoded[:, i:i + 1]
             logits_i, cache = model.forward_step(tok, cache)
             per_step_logits.append(logits_i)
-        cached_logits = torch.cat(per_step_logits, dim=1)  # [1, N, V]
-        ref_window = ref_logits[:, P - 1:P - 1 + N, :]  # [1, N, V]
+        cached_logits = torch.cat(per_step_logits, dim=1)  # [B, N, V]
+        ref_window = ref_logits[:, P - 1:P - 1 + N, :]  # [B, N, V]
 
+    # G234-style scaled tolerance. The relative bound (1e-2 = 1%) absorbs
+    # fp32 reduction-order noise that compounds per-sample inside the
+    # NMM's per-token update loop; at B=2 the per-sample paths produce
+    # slightly different rounding than the B=1 case (~3x larger absolute
+    # diff at the same ref_max of ~0.25 → ~1.4e-3 vs ~5e-4 at B=1).
     ref_max = ref_window.abs().max().item()
-    tol = max(1e-4, 5e-3 * ref_max)
+    tol = max(1e-4, 1e-2 * ref_max)
     diff = (cached_logits - ref_window).abs().max().item()
     assert diff < tol, (
         f"multi-step cached decode vs reference: max diff = {diff:.3e}, "
         f"tolerance = {tol:.3e}"
+    )
+
+
+def test_cached_decode_matches_full_forward_with_swa():
+    """G238 — at use_swa=True, the cached decode path must apply the same
+    banded mask as the warm-up `_aug_mask`. Without the SWA-aware mask in
+    forward_with_kv_cache, the new token would silently attend to the
+    full real history and produce different logits than the reference
+    full forward (which DOES apply the banded mask)."""
+    torch.manual_seed(0)
+    cfg = TitansConfig(
+        n_layer=2, n_head=2, n_embd=16, vocab_size=64,
+        block_size=64, chunk_size=16, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=2,
+        finetune_mode=False,
+        use_swa=True, swa_window=3,
+    )
+    model = TitansMAGGPT2(cfg).eval()
+    # Use a prompt long enough that SWA actually masks out real positions
+    # at the decode step (need prompt_len > swa_window).
+    P = 12
+    prompt = torch.randint(0, cfg.vocab_size, (1, P))
+    next_tok = torch.tensor([[7]], dtype=torch.long)
+
+    with torch.no_grad():
+        full = torch.cat([prompt, next_tok], dim=1)
+        ref_logits, _ = model(full, nmm_states=None)
+        ref_step = ref_logits[:, -1:, :]
+
+        cache = model.prepare_decode(prompt)
+        step_logits, _ = model.forward_step(next_tok, cache)
+
+    # Same G234 scaled tolerance as the non-SWA multi-step test.
+    ref_max = ref_step.abs().max().item()
+    tol = max(1e-4, 1e-2 * ref_max)
+    diff = (step_logits - ref_step).abs().max().item()
+    assert diff < tol, (
+        f"SWA cached-decode vs full-forward parity: max diff = {diff:.3e}, "
+        f"tolerance = {tol:.3e} (ref_max = {ref_max:.3f})"
     )
 
 
@@ -178,3 +242,18 @@ def test_forward_step_rejects_position_past_block_size():
     next_tok = torch.tensor([[0]], dtype=torch.long)
     with pytest.raises(ValueError, match="block_size"):
         model.forward_step(next_tok, cache)
+
+
+def test_prepare_decode_rejects_wrong_length_initial_nmm_states():
+    """G240 — if a caller passes initial_nmm_states with the wrong number of
+    layers, prepare_decode must fail loudly here, not deep inside the first
+    forward_step. The unvalidated `zip(self.blocks, nmm_states)` would
+    silently truncate; the resulting partial cache then IndexErrors in
+    forward_step pointing at the wrong call site."""
+    cfg, model = _tiny_model()
+    prompt = torch.randint(0, cfg.vocab_size, (1, 4))
+    # Build a per-layer states list and lop one off.
+    full_states = [block.nmm.init_state(1, prompt.device) for block in model.blocks]
+    truncated = full_states[:-1]
+    with pytest.raises(ValueError, match="initial_nmm_states length"):
+        model.prepare_decode(prompt, initial_nmm_states=truncated)

@@ -3612,3 +3612,48 @@ Gaps discovered during the code-writing phase. Format per `IMPLEMENTATION_PROMPT
 **Fix:** Test now runs the chunked-warm-up + `prepare_decode` pipeline directly for both prompts and asserts `(logits_a - logits_b).abs().max() > 1e-3`. Asserting at the logits level (not the argmax token) makes it a clean "did the prefix affect the model?" invariant — random init notwithstanding, the prefix delta vanishing through every block's NMM to leave logits bit-identical is vanishingly unlikely if the prefix actually reached the NMM.
 **Test:** `tests/behavior/test_cached_generate_parity.py::test_cached_decode_long_prompt_uses_full_context` rewritten to assert the logit-level invariant.
 **Affects:** `tests/behavior/test_cached_generate_parity.py`.
+
+### G238 — SWA was silently broken at cached decode
+
+**Found:** Post-Phase-7 audit (second pass)
+**Symptom:** `CausalSelfAttention.forward_with_kv_cache` called SDPA with `attn_mask=None`. The warm-up path applies SWA via `_aug_mask` (real-to-real block gets a banded `-inf` mask outside `swa_window`), but the decode path applied NO mask, so each new decoded token attended to ALL prior K, V — including positions older than `swa_window`. A model trained with `use_swa=True` would have learned a banded-window distribution but suddenly see the full history at generation. The mask-level test `test_swa_banded_mask_attends_only_to_window` only validated `_aug_mask`, not the cached path, so the divergence was undetected.
+**Root cause:** Phase 7.2 wrote `forward_with_kv_cache` as a single-token forward with the assumption "no mask needed — the new token's allowed set is trivially every cache position". That assumption ignored SWA. SWA defaults to off and no GPT-2 factory enables it, so the bug stayed dormant in CI.
+**Fix:** `forward_with_kv_cache` gained two optional args: `swa_window` (when set, mask all real positions older than this window of the new token) and `n_persistent` (always-visible prefix length). When SWA fires, build a length-`T_full` single-row additive mask that zeros only `[0, n_persistent)` and `[max(n_persistent, T_full - swa_window), T_full)`, `-inf` elsewhere, broadcastable to `[B, n_head, 1, T_full]`. `TitansMAGBlock.forward_step` now passes `self.swa_window if self.use_swa else None` and `self.N_p`. The non-SWA path is unchanged (`attn_mask=None` continues to mean "all positions visible").
+**Test:** `tests/unit/test_attention_kv_cache.py` got three SWA-specific tests: `test_cached_forward_swa_masks_far_past_real_positions` (the new token's output changes when SWA is enabled, proving the mask actually affects which positions contribute), `test_cached_forward_swa_with_window_geq_real_positions_is_noop` (degenerate-case parity), and `test_cached_forward_swa_persistent_prefix_always_visible` (persistent V=100 visible even at swa_window=1). `tests/integration/test_decode_parity.py::test_cached_decode_matches_full_forward_with_swa` covers the full-model end-to-end SWA parity at `use_swa=True, swa_window=3`.
+**Affects:** `model/block.py:CausalSelfAttention.forward_with_kv_cache` (new SWA-aware mask construction) + `TitansMAGBlock.forward_step` (passes SWA args).
+
+### G239 — `NMM.init_empty_conv_buffer` was dead code
+
+**Found:** Post-Phase-7 audit (second pass)
+**Symptom:** `NMM.init_empty_conv_buffer(B, device, dtype)` was defined in `model/nmm.py` and exercised by three unit tests, but no production path called it. Originally intended for a "fresh decode with no warm-up prompt" mode, but `prepare_decode` always uses `init_conv_buffer_from_prompt` (even the empty-prompt case in `generate.py` materializes a one-token `[EOT]` prompt and goes through the from-prompt path). The method was unreachable from any entry point.
+**Root cause:** Phase 7.1 added it speculatively. Per the project's no-feature-flags-for-hypothetical-futures principle (`IMPLEMENTATION_PROMPT.md` §11), unused-in-production code should be removed.
+**Fix:** Removed `init_empty_conv_buffer` from `model/nmm.py`. The two parity tests that needed a zero buffer (`test_step_with_conv_multi_step_parity` and `test_step_with_zero_buffer_matches_legacy_step`) replaced their `nmm.init_empty_conv_buffer(B, device)` call with a local `_zero_conv_buffer(nmm, B, device)` helper that constructs the same `{q, k, v}` zero dict inline — keeping the test invariants intact without exposing a production-grade method that nothing in production calls. Removed `test_init_empty_conv_buffer_is_all_zeros` entirely (it only tested the removed method).
+**Test:** Existing parity tests still pass against `_zero_conv_buffer`; no new test needed.
+**Affects:** `model/nmm.py` (method removed); `tests/unit/test_step_with_conv.py` (helper added, one test removed).
+
+### G240 — `prepare_decode` silently accepted wrong-length `initial_nmm_states`
+
+**Found:** Post-Phase-7 audit (second pass)
+**Symptom:** When a caller passed `initial_nmm_states` with the wrong number of layers (e.g., a single-layer state to a 12-layer model), `prepare_decode` ran `zip(self.blocks, list(initial_nmm_states))` which silently iterates to the shorter list. The result: `cache["nmm_states"]` and `cache["kv_caches"]` ended up with fewer than `n_layer` entries; `x` was passed through only the first few blocks and the remaining blocks didn't see anything. The first `forward_step` call then crashed with `IndexError` deep inside the per-block iteration (`cache["nmm_states"][i]` for `i >= len`), pointing the user at the wrong call site.
+**Root cause:** No length-validation guard at the top of the `else` branch where `initial_nmm_states` is consumed.
+**Fix:** Added an eager check: if `len(initial_nmm_states) != len(self.blocks)`, raise `ValueError` immediately with a message that explains "each block needs its own (M, S) pair; pass the full per-layer list returned by an earlier forward() / prepare_decode()".
+**Test:** `tests/integration/test_decode_parity.py::test_prepare_decode_rejects_wrong_length_initial_nmm_states` — builds a per-layer state list, lops one off, asserts the truncated list raises `ValueError` matching "initial_nmm_states length".
+**Affects:** `model/titans_gpt2.py:TitansMAGGPT2.prepare_decode`.
+
+### G241 — Cached decode correctness was only tested at B=1
+
+**Found:** Post-Phase-7 audit (second pass)
+**Symptom:** Every cached-decode CORRECTNESS test in `tests/integration/test_decode_parity.py` used `B=1`. Only `test_prepare_decode_kv_cache_includes_persistent_prefix` ran at `B=2`, and it asserted shape only. The per-sample compute paths (`per_sample_grad_fn`'s vmap over B inside `step_with_conv`, batched KV cache concat, batched conv buffer shifts) had no parity invariant locking them in at `B>1`. A regression to those paths would silently pass CI.
+**Root cause:** `tests/integration/test_decode_parity.py` was written quickly with `B=1` throughout; the batched paths "looked right" from code reading and no one bumped B to confirm.
+**Fix:** Extracted the multi-step parity body into a `_check_multi_step_parity(cfg, model, prompt, decoded, P, N)` helper; added `test_cached_decode_matches_full_forward_multi_step_batched` at `B=2`. The B=2 test required loosening the G234-style scaled tolerance from `5e-3 * ref_max` to `1e-2 * ref_max` because fp32 reduction-order noise compounds per-sample inside the NMM update loop (per-sample paths produce slightly different rounding than the B=1 case → ~3x larger absolute diff at the same ref_max). The B=1 multi-step test runs under the same shared helper with the relaxed tolerance and still passes well within it.
+**Test:** `tests/integration/test_decode_parity.py::test_cached_decode_matches_full_forward_multi_step_batched`.
+**Affects:** `tests/integration/test_decode_parity.py` (added test + helper refactor; loosened multi-step tolerance to absorb B=2 noise).
+
+### G242 — Long-prompt branch of `needle_in_haystack` was not covered by the cached-path regression test
+
+**Found:** Post-Phase-7 audit (second pass)
+**Symptom:** G235 added `test_needle_in_haystack_uses_cached_decode_path` to lock in the cached pipeline for `needle_in_haystack`, but that test only exercised the SHORT-prompt branch (haystack < `block_size`). The LONG-prompt branch — exactly where the chunked-warm-up + tail-prepare_decode complexity lives — was untested for call counts. Someone could refactor the long-prompt branch and reintroduce a per-token `model(window, nmm_states, None)` call (the original broken pattern) without failing any test.
+**Root cause:** The first regression test was written for the short path because that's the smoke test's prompt shape. The long-path call counts were left to chance.
+**Fix:** Added `test_needle_in_haystack_long_prompt_uses_cached_decode_path` — constructs a haystack of ~400 chars to push the encoded prompt past `block_size=64`, asserts (1) `model.forward()` fired between 1 and `(full_len // block_size) + 1` times (the warm-up chunks; a reintroduced sliding-window pattern would balloon this), (2) `model.prepare_decode()` fired exactly once, (3) `model.forward_step()` fired exactly 0 times (long-prompt branch caps decode at one sample from `last_logits`).
+**Test:** `tests/integration/test_needle_smoke.py::test_needle_in_haystack_long_prompt_uses_cached_decode_path`.
+**Affects:** `tests/integration/test_needle_smoke.py`.

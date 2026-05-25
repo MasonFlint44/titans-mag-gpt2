@@ -151,6 +151,18 @@ class TitansMAGGPT2(nn.Module):
             ]
         else:
             nmm_states = list(initial_nmm_states)
+            # Without this check, zip(self.blocks, nmm_states) below silently
+            # iterates to the shorter list — leaving the cache with fewer
+            # per-block entries than n_layer. The first forward_step then
+            # IndexErrors deep in the per-block loop, pointing at the wrong
+            # call site. Validate eagerly so the error surfaces here.
+            if len(nmm_states) != len(self.blocks):
+                raise ValueError(
+                    f"initial_nmm_states length {len(nmm_states)} does not "
+                    f"match model n_layer {len(self.blocks)}. Each block "
+                    f"needs its own (M, S) pair; pass the full per-layer "
+                    f"list returned by an earlier forward() / prepare_decode()."
+                )
         kv_caches = []
         nmm_conv_buffers = []
         for block, nmm_state in zip(self.blocks, nmm_states):

@@ -396,18 +396,6 @@ class NeuralMemoryModule(nn.Module):
             "v": self.v_proj.linear(last),
         }
 
-    def init_empty_conv_buffer(self, B: int, device, dtype=None) -> dict:
-        """Zero-initialized conv buffer — for decode with no warm-up prompt.
-        step_with_conv on the very first token with this buffer reduces to
-        the same computation as step() (zero left-pad, only the last kernel
-        weight active)."""
-        k = self.k_proj.conv.kernel_size
-        pad_size = k - 1
-        if dtype is None:
-            dtype = self.memory_mlp.W1.weight.dtype
-        zeros = torch.zeros(B, pad_size, self.n_embd, device=device, dtype=dtype)
-        return {"q": zeros.clone(), "k": zeros.clone(), "v": zeros.clone()}
-
     def step_with_conv(
         self,
         x_t: torch.Tensor,

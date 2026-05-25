@@ -26,6 +26,18 @@ def _nmm(n_embd=8, expansion=2, kernel_size=4, finetune_mode=False):
     )
 
 
+def _zero_conv_buffer(nmm, B, device):
+    """Test helper: construct the zero conv buffer that step_with_conv on
+    the very first token reduces to (same compute as the legacy step()).
+    Production code never needs this — every decode path uses
+    init_conv_buffer_from_prompt — but it's the cleanest way to express
+    'fresh state, no warm-up' parity tests.
+    """
+    k = nmm.k_proj.conv.kernel_size
+    zeros = torch.zeros(B, k - 1, nmm.n_embd, device=device)
+    return {"q": zeros.clone(), "k": zeros.clone(), "v": zeros.clone()}
+
+
 # ---------------------------------------------------------------------------
 # Buffer helpers
 # ---------------------------------------------------------------------------
@@ -46,14 +58,6 @@ def test_init_conv_buffer_pads_when_prompt_shorter_than_k_minus_1():
     # First two positions of the buffer are zero-padded.
     for key in ("q", "k", "v"):
         assert torch.all(buf[key][:, :2, :] == 0.0)
-
-
-def test_init_empty_conv_buffer_is_all_zeros():
-    nmm = _nmm(n_embd=8, kernel_size=4)
-    buf = nmm.init_empty_conv_buffer(B=2, device=torch.device("cpu"))
-    for v in buf.values():
-        assert torch.all(v == 0.0)
-        assert v.shape == (2, 3, 8)
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +163,7 @@ def test_step_with_conv_multi_step_parity():
 
     # Stepped
     state = nmm.init_state(B, torch.device("cpu"))
-    conv_buf = nmm.init_empty_conv_buffer(B, torch.device("cpu"))
+    conv_buf = _zero_conv_buffer(nmm, B, torch.device("cpu"))
     y_steps = []
     for t in range(T):
         y_t, state, conv_buf = nmm.step_with_conv(x[:, t, :], state, conv_buf)
@@ -188,7 +192,7 @@ def test_step_with_zero_buffer_matches_legacy_step():
     y_legacy, state_legacy = nmm.step(x_t, state)
 
     state2 = nmm.init_state(2, torch.device("cpu"))
-    buf = nmm.init_empty_conv_buffer(2, torch.device("cpu"))
+    buf = _zero_conv_buffer(nmm, 2, torch.device("cpu"))
     y_conv, state_conv, _ = nmm.step_with_conv(x_t, state2, buf)
 
     assert torch.allclose(y_legacy, y_conv, atol=1e-6)
