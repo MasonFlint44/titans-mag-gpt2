@@ -234,10 +234,16 @@ def base_lrs_from_constants() -> list:
     return [BASE_LR_GPT2, BASE_LR_GPT2, BASE_LR_NMM, BASE_LR_NMM]
 
 
-def _layer_norm_M(layer_state) -> float:
+def _layer_norm_M(layer_state):
     """Compute ||M||_F (batch-mean) for a single per-layer state. Handles
-    both shapes (G254): single-head `(M, S)` tuple OR multi-head
-    `[(M_h, S_h), ...]` list. For multi-head, returns the per-head average."""
+    three shapes:
+      - None: returns None. Plain (non-NMM) blocks have None state slots
+        when `nmm_layer_indices` is set (G261).
+      - single-head: `(M, S)` tuple of dicts.
+      - multi-head: `[(M_h, S_h), ...]` list (G254) — returns per-head mean.
+    """
+    if layer_state is None:
+        return None
     if isinstance(layer_state, list):
         return sum(_layer_norm_M(s) for s in layer_state) / len(layer_state)
     M, _S = layer_state
@@ -252,7 +258,10 @@ def compute_nmm_norm(nmm_states) -> list:
     Multi-head safe (G254): when `nmm_n_heads > 1`, the per-layer state is a
     list of per-head `(M, S)` tuples; we report the mean of per-head norms
     per layer (so the returned list has length n_layer regardless of head
-    count — convenient for log parsers)."""
+    count — convenient for log parsers).
+
+    Subset-of-layers safe (G261): plain (non-NMM) blocks contribute a None
+    entry at their position rather than skewing the average."""
     if nmm_states is None:
         return None
     return [_layer_norm_M(s) for s in nmm_states]

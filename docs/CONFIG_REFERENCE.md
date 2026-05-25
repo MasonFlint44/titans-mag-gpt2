@@ -78,6 +78,20 @@ properties are preserved.
 | `nmm_compile_scan_training` | `bool` | `False` | Sets `_allow_scan_training=True` on every block's NMM at construction so the dispatcher in `forward_chunk` takes the associative-scan path **even with autograd enabled**. **You still need to wrap the model in `torch.compile(model)` yourself** — without compile, `associative_scan` has no autograd and silently zeros NMM gradients (G164 / G180). **This is a COMPUTE optimization (parallelism), NOT memory** — the scan path allocates `[T, B, h, d]` gradient tensors upfront, which at T=1024 is *larger* than the sequential path's per-token graph. Useful when paired with `cpu_offload` to fit T=1024 *and* run it faster. **Caveat:** scan is an APPROXIMATION — per-token gradients are computed against chunk-start `M_0`, not paper-faithful `M_{t-1}` — so training loss curves will differ from sequential. |
 | `nmm_block_grad_checkpoint` | `bool` | `False` | Wraps each `TitansMAGBlock.forward` in `torch.utils.checkpoint.checkpoint(use_reentrant=True)`. The whole block (attention + NMM forward_chunk + MAG gate + MLP) is recomputed on backward; only block-input/output tensors and the NMM `(M, S)` I/O dicts live in the autograd graph between blocks. Removes the `n_blocks × n_segments × per_segment` boundary term that dominates GPU memory at long T. **Combine with `nmm_grad_checkpoint=True`** — block checkpoint alone would re-build the full per-token NMM graph during a block's backward recompute (≈ 50 GiB at T=1024 gpt2_small), OOMing immediately. The segment checkpoint bounds the in-block transient during recompute. Cost: each block's forward runs twice (forward + backward recompute), ~2× step time on top of inner-segment recompute. Handles both single-head `(M, S)` and multi-head `[(M, S), ...]` states via the `_state_to_flat` / `_flat_to_state` helpers in `model/block.py`. |
 
+## Capacity-vs-memory knobs (G261, G262, G263)
+
+These trade NMM capacity for VRAM/speed. Together they're the **big
+unlock** for T=1024 on consumer hardware — at gpt2_small d=768 default
+expansion=4, the NMM's per-token autograd graph is ~300 MiB; combined
+they bring this to ~30 MiB without losing much (`low_rank=64` is well
+above the rank-of-meaningful-information for memory_mlp-style maps).
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `nmm_expansion` | `int` | `4` | Already an existing knob: the hidden-dim multiplier for `MemoryMLP` (paper has it implicit at 4× from the GPT-2 MLP convention). Setting `nmm_expansion=1` makes the three weight matrices square `[d, d]` and **quarters** the per-step NMM state. Paper ablation says lower expansion hurts capacity but is the smallest viable structure. NS5 still works on square matrices (no transpose). |
+| `nmm_layer_indices` | `Optional[list[int]]` | `None` | When set, NMM is wired only on the listed blocks; others become plain GPT-2 blocks (attention + MLP only, no NMM, no persistent prefix, no MAG gate). Linear reduction of NMM-related compute and memory in the number of NMM layers. The paper applies NMM at every block; this is a deliberate departure for VRAM. Validation rejects out-of-range / duplicate / non-int indices. **Decode path is supported**: plain blocks contribute a KV cache only (no NMM conv buffer; their slot in `nmm_conv_buffers` is `None`). |
+| `nmm_low_rank` | `Optional[int]` | `None` | When set, factor `MemoryMLP`'s three weight matrices as `A @ B` with intermediate rank `r`. Per-step NMM state drops from `3 × 4d²` to `3 × r × 5d` ≈ `5r/(4d)` of full-rank. At `d=768, r=64` that's ~10× smaller (the biggest single-knob win for long T). State key set goes from 3 to 6; the existing checkpoint plumbing handles this via the `state_keys` discovery at NMM construction time. NS5 still converges on the factored rectangles. Validation rejects `r >= n_embd` (factored form would be larger than full-rank — defeats the purpose). |
+
 **Why `use_reentrant=True`** is *required* (not just convenient):
 `use_reentrant=False` calls `disable_saved_tensors_hooks`, and
 `torch.func.grad` (used inside `per_sample_grad_fn`) rejects that
@@ -106,25 +120,33 @@ end-to-end `train_step` with backward + Adam):
 | `B=1, T=1024`, bf16 + ckpt seg=32 + block_ckpt | 11.8 GiB | 497 s | OK |
 | `B=1, T=1024`, bf16 + ckpt seg=32 + block_ckpt + cpu_offload | 11.0 GiB | 463 s | OK (combined, no big win) |
 | `B=2+`, T=512/1024 + block_ckpt + (optional) cpu_offload | ~13.8 GiB | — | OOM (in-segment transient scales with B) |
+| `B=1, T=1024`, bf16 + ckpt + **`nmm_expansion=1`** | 8.7 GiB | 193 s | OK |
+| `B=1, T=1024`, bf16 + ckpt + **`nmm_low_rank=64`** | **3.8 GiB** | 156 s | OK ← **the big unlock** |
+| `B=2, T=1024`, bf16 + ckpt + `nmm_low_rank=64` | **6.5 GiB** | 191 s | OK ← **B>1 at T=1024 finally** |
+| `B=4, T=1024`, bf16 + ckpt + `nmm_low_rank=64` | 12.0 GiB | 199 s | OK |
+| `B=8, T=1024`, bf16 + ckpt + `nmm_low_rank=64` | OOM @ 12.4 GiB | — | (probably fits with low_rank=32) |
+| `B=1, T=1024`, low_rank=64 + `nmm_layer_indices` (4 of 12) | 2.6 GiB | 52 s | OK |
+| `B=2, T=1024`, low_rank=64 + `nmm_layer_indices` (4 of 12) | 4.2 GiB | 62 s | OK |
+| `B=4, T=1024`, low_rank=64 + `nmm_layer_indices` (4 of 12) | 7.4 GiB | 67 s | OK |
+| `B=8, T=1024`, low_rank=64 + `nmm_layer_indices` (4 of 12) | **13.8 GiB** | **77 s** | OK ← **B=8 at T=1024** |
+| `B=16, T=1024`, low_rank=64 + 4 layers | OOM @ 13.8 GiB | — | (B=8 is the cap) |
 
 **Findings:**
 
 - Gradient checkpointing (`nmm_grad_checkpoint`) is the dominant unlock
   for `T ≥ 64`. Required as a baseline for any further memory work.
 - `bf16` state (`nmm_state_dtype="bf16"`) stacks on top, ~2× headroom.
-- **`cpu_offload` lets T=1024 fit on a 16 GiB card** at ~5–10× step-
-  time cost (PCIe + extra recompute). Correctness work, not production.
-- **`block_grad_checkpoint` also lets T=1024 fit**, and lets T=512 fit
-  (where it didn't before). Comparable step-time penalty to
-  `cpu_offload`. Choose one or the other; combining them gives no
-  meaningful additional win at T=1024.
-- **All optimizations cap at `B=1`** on this 16 GiB card. The in-segment
-  per-block transient (~`seg_len × B × per_step_state`) scales with B
-  and is *not* reduced by either `cpu_offload` (which only offloads
-  saved-input boundaries) or `block_grad_checkpoint` (which only
-  reduces cross-block boundary storage). To get B>1 at long T you need
-  either a smaller backbone, `nmm_expansion=1`, or hardware with more
-  VRAM.
+- **`nmm_low_rank=64` is the breakthrough for batch scaling at T=1024.**
+  Factoring `memory_mlp` weights shrinks the per-step state ~10×, so
+  the in-segment transient (which scales with B) finally has room.
+  T=1024 + B=4 fits at 12 GiB. T=1024 + B=1 uses only **3.8 GiB**,
+  leaving room for bigger models or longer T.
+- **`nmm_layer_indices` is the speed knob.** Reducing 12 NMM blocks
+  to 4 cuts step time roughly 4× (since NMM-segment recompute is the
+  dominant per-step cost).
+- `cpu_offload` / `block_grad_checkpoint` are still useful for scenarios
+  where you can't or won't reduce NMM capacity (e.g. paper-faithful
+  ablations) — they fit T=1024 at full NMM capacity, just slowly.
 
 **Recommended configs by goal:**
 
@@ -156,6 +178,31 @@ TitansConfig.gpt2_small(
     nmm_grad_checkpoint=True,
     nmm_grad_checkpoint_segment_len=32,
     nmm_block_grad_checkpoint=True,
+)
+
+# Long-context FAST on a 16 GiB consumer card (RECOMMENDED).
+# Low-rank factoring + segment checkpoint = T=1024 at B=4, ~3 min/step.
+# Loses some NMM capacity vs paper full-rank, but enables real training.
+TitansConfig.gpt2_small(
+    chunk_size=1024, block_size=1024,
+    nmm_state_dtype="bf16",
+    nmm_grad_checkpoint=True,
+    nmm_grad_checkpoint_segment_len=32,
+    nmm_low_rank=64,                # ~10x smaller per-step state
+)
+# At B=4 effective batch with `--grad-accum 4` → effective B=16
+# in 12 GiB peak. The right starting point for actual T=1024
+# training on this card.
+
+# Maximum speed at T=1024 if you accept lower NMM capacity
+# (50 s/step at B=1 vs ~3 min above).
+TitansConfig.gpt2_small(
+    chunk_size=1024, block_size=1024,
+    nmm_state_dtype="bf16",
+    nmm_grad_checkpoint=True,
+    nmm_grad_checkpoint_segment_len=32,
+    nmm_low_rank=64,
+    nmm_layer_indices=[0, 3, 6, 9], # NMM on 4 of 12 blocks
 )
 
 # Faster-but-approximate: scan path under torch.compile.

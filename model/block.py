@@ -9,48 +9,55 @@ from torch import cat
 from model.nmm import MultiHeadNMM, NeuralMemoryModule
 
 
-# Tensor key ordering inside each (M, S) dict. Used by the block-level
-# checkpoint flatten/unflatten helpers below. Fixed order across all
-# code paths so `_flat_to_state` reliably maps positions back to keys.
-_M_S_KEYS = ("W1.weight", "W_gate.weight", "W2.weight")
-
-
 def _state_to_flat(nmm_state) -> tuple:
     """Flatten an NMM state into a flat tuple of tensors + a structure
     descriptor. Supports single-head `(M, S)` and multi-head
     `[(M_h, S_h), ...]`. Used to thread NMM state through
     `torch.utils.checkpoint.checkpoint`, which expects tensor-only
-    positional args."""
+    positional args.
+
+    The key ordering is discovered from the dict itself (sorted) rather
+    than hardcoded, so low-rank `MemoryMLP` (6 state keys: W1_a, W1_b,
+    W_gate_a, W_gate_b, W2_a, W2_b) works identically to full-rank
+    (3 keys: W1, W_gate, W2). The descriptor carries the keys so
+    `_flat_to_state` can reverse it."""
     if isinstance(nmm_state, list):
-        # Multi-head: list[n_heads] of (M_dict, S_dict)
+        # Multi-head: list[n_heads] of (M_dict, S_dict). All heads share
+        # the same key set by construction (same MemoryMLP shape).
         n_heads = len(nmm_state)
+        sample_M, _ = nmm_state[0]
+        keys = tuple(sorted(sample_M.keys()))
         flat = []
         for M, S in nmm_state:
-            for k in _M_S_KEYS:
+            for k in keys:
                 flat.append(M[k])
-            for k in _M_S_KEYS:
+            for k in keys:
                 flat.append(S[k])
-        return tuple(flat), ("multi", n_heads)
+        return tuple(flat), ("multi", n_heads, keys)
     M, S = nmm_state
-    flat = [M[k] for k in _M_S_KEYS] + [S[k] for k in _M_S_KEYS]
-    return tuple(flat), ("single",)
+    keys = tuple(sorted(M.keys()))
+    flat = [M[k] for k in keys] + [S[k] for k in keys]
+    return tuple(flat), ("single", keys)
 
 
 def _flat_to_state(flat, descriptor):
     """Inverse of `_state_to_flat`. `flat` is an iterable of tensors;
     `descriptor` is the structure tag returned alongside the flat tuple."""
     if descriptor[0] == "multi":
-        n_heads = descriptor[1]
-        per_head = 2 * len(_M_S_KEYS)  # M keys + S keys
+        _, n_heads, keys = descriptor
+        k = len(keys)
+        per_head = 2 * k  # M keys + S keys
         states = []
         for h in range(n_heads):
             base = h * per_head
-            M = {k: flat[base + i] for i, k in enumerate(_M_S_KEYS)}
-            S = {k: flat[base + len(_M_S_KEYS) + i] for i, k in enumerate(_M_S_KEYS)}
+            M = {key: flat[base + i] for i, key in enumerate(keys)}
+            S = {key: flat[base + k + i] for i, key in enumerate(keys)}
             states.append((M, S))
         return states
-    M = {k: flat[i] for i, k in enumerate(_M_S_KEYS)}
-    S = {k: flat[len(_M_S_KEYS) + i] for i, k in enumerate(_M_S_KEYS)}
+    _, keys = descriptor
+    k = len(keys)
+    M = {key: flat[i] for i, key in enumerate(keys)}
+    S = {key: flat[k + i] for i, key in enumerate(keys)}
     return (M, S)
 
 
@@ -188,6 +195,89 @@ class GPT2MLP(nn.Module):
         return self.dropout(self.c_proj(F.gelu(self.c_fc(x), approximate="tanh")))
 
 
+class PlainGPT2Block(nn.Module):
+    """Standard GPT-2 transformer block — attn + MLP, no NMM, no persistent
+    prefix, no MAG gate.
+
+    Used when `config.nmm_layer_indices` is set and the current block's
+    position is NOT in that list (G261). Same forward signature as
+    `TitansMAGBlock` so the model's per-block loop is uniform:
+        x, state = block(x, state, doc_boundaries)
+    State is passed through unchanged (None for plain blocks); the
+    `nmm_states` list across the model has None entries at plain-block
+    positions.
+
+    Why a separate class rather than a flag on TitansMAGBlock: the latter
+    would carry dead `persistent_mem`, `ln_nmm`, `nmm`, and `gamma_mem`
+    parameters in the state_dict, breaking the simple invariant that
+    parameter counts match an equivalent subset config.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.use_swa = config.use_swa
+        self.swa_window = config.swa_window
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = CausalSelfAttention(
+            config.n_embd, config.n_head, config.dropout
+        )
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp = GPT2MLP(config.n_embd, config.dropout)
+
+    def _causal_mask(self, T: int, device, dtype):
+        """Standard causal mask (with optional banded SWA), no persistent
+        prefix. Mirrors `TitansMAGBlock._aug_mask` minus the N_p rows."""
+        mask = torch.triu(
+            torch.full((T, T), float("-inf"), device=device, dtype=dtype),
+            diagonal=1,
+        )
+        if self.use_swa:
+            far_past = torch.tril(
+                torch.full((T, T), float("-inf"), device=device, dtype=dtype),
+                diagonal=-self.swa_window,
+            )
+            mask = mask + far_past
+        return mask
+
+    def forward(self, x: torch.Tensor, nmm_state=None, doc_boundaries=None):
+        # nmm_state and doc_boundaries are accepted for signature uniformity
+        # with TitansMAGBlock; both are ignored. State passes through.
+        T = x.size(1)
+        mask = self._causal_mask(T, x.device, x.dtype)
+        x = x + self.attn(self.ln_1(x), mask=mask)
+        x = x + self.mlp(self.ln_2(x))
+        return x, nmm_state  # state pass-through (typically None)
+
+    def init_decode_cache(self, x_prompt: torch.Tensor, nmm_state=None) -> tuple:
+        """Decode-cache seed for the plain block: just the KV cache. No NMM
+        conv buffer (the block has no NMM). Returned tuple shape matches
+        TitansMAGBlock's so the model's per-block decode loop is uniform —
+        the third slot is None."""
+        B, T, _ = x_prompt.shape
+        x_norm = self.ln_1(x_prompt)
+        k_cache, v_cache = self.attn.project_kv(x_norm)
+        return k_cache, v_cache, None
+
+    def forward_step(
+        self,
+        x_new: torch.Tensor,
+        nmm_state,  # ignored (None)
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        nmm_conv_buffer,  # ignored (None)
+    ) -> tuple:
+        """Single-token decode through a plain block."""
+        x_norm = self.ln_1(x_new)
+        y_attn, new_k_cache, new_v_cache = self.attn.forward_with_kv_cache(
+            x_norm, k_cache, v_cache,
+            swa_window=self.swa_window if self.use_swa else None,
+            n_persistent=0,  # plain block has no persistent prefix
+        )
+        x = x_new + y_attn
+        x = x + self.mlp(self.ln_2(x))
+        return x, None, new_k_cache, new_v_cache, None
+
+
 class TitansMAGBlock(nn.Module):
     """One transformer block with persistent prefix + NMM combined via MAG gate.
 
@@ -252,6 +342,7 @@ class TitansMAGBlock(nn.Module):
             grad_checkpoint_segment_len=config.nmm_grad_checkpoint_segment_len,
             cpu_offload_segments=config.nmm_cpu_offload_segments,
             allow_scan_training=config.nmm_compile_scan_training,
+            low_rank=config.nmm_low_rank,
         )
         if config.nmm_n_heads > 1:
             self.nmm = MultiHeadNMM(n_heads=config.nmm_n_heads, **nmm_kwargs)

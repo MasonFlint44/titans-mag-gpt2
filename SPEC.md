@@ -562,6 +562,48 @@ properties are preserved unless you opt in.
 | `nmm_compile_scan_training` | `False` | At construction, sets `_allow_scan_training=True` on every block's NMM so the dispatcher routes training-time forward through `_forward_chunk_scan` (associative-scan parallelism). **The user must still wrap the model in `torch.compile(model)`** — without compile, `associative_scan` has no autograd and silently zeros NMM gradients (G164 / G180). | (a) Scan is an **approximation**: per-token gradients are computed against chunk-start `M_0`, not paper-faithful `M_{t-1}`. Loss curves WILL differ from sequential. (b) Scan is a COMPUTE optimization (parallelism), NOT a memory optimization — at T=1024 the upfront `[T, B, h, d]` gradient tensors are *larger* than the sequential per-token graph. |
 | `nmm_block_grad_checkpoint` | `False` | Wraps `TitansMAGBlock.forward` in `torch.utils.checkpoint.checkpoint(use_reentrant=True)`. The whole block (attn + NMM + MAG + MLP) is recomputed on backward; only block-input/output tensors + the NMM `(M, S)` I/O dicts live in the autograd graph between blocks. Both single-head `(M, S)` and multi-head `[(M, S), ...]` states are handled via the `_state_to_flat` / `_flat_to_state` helpers (`model/block.py`). **Combine with `nmm_grad_checkpoint=True`** — block alone re-builds the full per-token NMM graph during one block's backward recompute (~50 GiB at T=1024) and OOMs. Segment checkpoint bounds the in-block transient during recompute. | Each block's forward runs twice (forward + backward recompute), ~2× step time on top of segment-recompute overhead. Removes the `n_blocks × n_segments × per_segment` boundary term that dominated GPU memory at long T — but does NOT help with the in-segment per-block transient (which scales with B), so it does not unlock B>1 on a 16 GiB card. |
 
+### 5.6 Capacity-vs-memory knobs (G261, G262, G263)
+
+These deliberately trade NMM capacity for VRAM/speed. **Together they
+are the unlock for T=1024 on a 16 GiB consumer card** — measured peak
+drops from ~13 GiB (OOM) to **3.8 GiB** at B=1 T=1024 with
+`nmm_low_rank=64`, and B=4 fits at 12 GiB.
+
+| Field | Default | What it does | Cost |
+|---|---|---|---|
+| `nmm_expansion` | `4` | Hidden-dim multiplier in `MemoryMLP`. Setting `=1` makes weights square `[d, d]` and quarters per-step NMM state. Already-existing knob; documented here for completeness alongside the new ones. | Lower expansion = less NMM capacity. Paper ablation: `L_M=2` (depth) ≫ `L_M=1`; analogous ablation for expansion hasn't been measured but it's a paper departure. |
+| `nmm_layer_indices` | `None` | If a list, only listed transformer blocks have NMM; others are `PlainGPT2Block` (attn + MLP, no NMM, no persistent prefix, no MAG gate). Linear reduction of NMM cost. The per-block NMM `(M, S)` state slot is `None` at plain-block positions; `detach_states`, `compute_nmm_norm`, and the decode path all tolerate. Decode-time: plain blocks contribute only a KV cache; their slot in `nmm_conv_buffers` is `None`. | Fewer NMM blocks = less mid-stack memory branch. Paper applies NMM at every block; subset is a deliberate departure. Best paired with `nmm_low_rank` so the remaining NMM blocks are themselves cheap. |
+| `nmm_low_rank` | `None` | If an int `r`, factor each `MemoryMLP` weight as `[r, in] @ [out, r]`. Per-step state goes from `3 × 4d²` to `3 × r × 5d` (≈ `5r/(4d)` of full-rank). At `d=768, r=64`: ~10× smaller — the single biggest unlock for long-T training. The `MemoryMLP`'s recurrent state goes from 3 keys (W1, W_gate, W2) to 6 keys (W1_a, W1_b, …); the checkpoint plumbing handles this via `state_keys` discovery at NMM `__init__`. NS5 converges on the factored rectangles (no special-casing needed). | Lower expressiveness than full-rank — limits the rank of representations the meta-learned `M` can encode. r=64 at d=768 is well above typical informational rank for memory_mlp-style maps so the loss is usually modest, but measure loss curves vs full-rank baseline before committing. Validation: `r >= n_embd` rejected (factored form would be larger than full-rank). |
+
+### 5.7 Fused-kernel path (not implemented)
+
+A custom CUDA / Triton kernel for the per-token NMM update is the
+**only path** to T=1024 at *fast* (sub-second) step times on consumer
+hardware without further reducing NMM capacity. The work it would
+fuse:
+
+1. `per_sample_grad_fn` (currently a Python-loop-driven
+   `vmap(grad(inner_loss))`) — most of the per-step cost.
+2. Newton-Schulz 5 iteration on each gradient matrix.
+3. The momentum + decay-rate update of `(M, S)`.
+4. The retrieval call against `M` (or `M_prev`).
+
+A fused kernel would eliminate:
+- The Python overhead of 1024 sequential `torch.func.grad` calls.
+- The autograd-graph construction cost (`GradTrackingTensor` wrapping).
+- The intermediate-tensor allocations between each per-token op.
+
+Expected speedup: ~10-50× on the per-step path. Realistically gets
+T=1024 from ~3 min/step to ~5-10 s/step at gpt2_small B=4.
+
+This is a multi-week project requiring: writing the kernel (CUDA or
+Triton), integrating with PyTorch autograd (a custom
+`torch.autograd.Function`), correctness validation against the
+reference Python implementation, dtype + autocast handling, and
+multi-GPU / DDP plumbing. Out of scope for the configurability work
+that produced the knobs above; opening it up as a future capital
+project.
+
 **`use_reentrant=True` is required** for the GPU checkpoint, not just
 convenient. `use_reentrant=False` calls `disable_saved_tensors_hooks`,
 and `torch.func.grad` (used inside `per_sample_grad_fn`) rejects that

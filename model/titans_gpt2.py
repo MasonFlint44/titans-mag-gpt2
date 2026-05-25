@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 
-from model.block import TitansMAGBlock
+from model.block import PlainGPT2Block, TitansMAGBlock
 
 
 class TitansMAGGPT2(nn.Module):
@@ -30,9 +30,20 @@ class TitansMAGGPT2(nn.Module):
         self.wpe = nn.Embedding(config.block_size, config.n_embd)
         self.drop = nn.Dropout(config.dropout)
 
-        self.blocks = nn.ModuleList(
-            [TitansMAGBlock(config) for _ in range(config.n_layer)]
-        )
+        # Determine which blocks get the full TitansMAGBlock (with NMM /
+        # persistent / MAG gate) vs. PlainGPT2Block (attn + MLP only).
+        # nmm_layer_indices=None means every block has NMM (default,
+        # paper-faithful). When set, only listed indices get NMM. G261.
+        if config.nmm_layer_indices is None:
+            nmm_idx_set = set(range(config.n_layer))
+        else:
+            nmm_idx_set = set(config.nmm_layer_indices)
+        self.blocks = nn.ModuleList([
+            TitansMAGBlock(config) if i in nmm_idx_set else PlainGPT2Block(config)
+            for i in range(config.n_layer)
+        ])
+        # Cache the boolean mask for fast per-block dispatch in forward.
+        self._block_has_nmm = [i in nmm_idx_set for i in range(config.n_layer)]
 
         self.ln_f = nn.LayerNorm(config.n_embd)
 
@@ -97,8 +108,11 @@ class TitansMAGGPT2(nn.Module):
         x = self.drop(self.wte(idx) + self.wpe(pos))
 
         if nmm_states is None:
+            # Plain blocks have no NMM — their slot is None. The per-block
+            # forward signature is uniform; PlainGPT2Block ignores the state.
             nmm_states = [
-                block.nmm.init_state(B, idx.device) for block in self.blocks
+                block.nmm.init_state(B, idx.device) if has_nmm else None
+                for block, has_nmm in zip(self.blocks, self._block_has_nmm)
             ]
 
         new_nmm_states = []
@@ -168,7 +182,8 @@ class TitansMAGGPT2(nn.Module):
 
         if initial_nmm_states is None:
             nmm_states = [
-                block.nmm.init_state(B, prompt_idx.device) for block in self.blocks
+                block.nmm.init_state(B, prompt_idx.device) if has_nmm else None
+                for block, has_nmm in zip(self.blocks, self._block_has_nmm)
             ]
         else:
             nmm_states = list(initial_nmm_states)
@@ -186,24 +201,27 @@ class TitansMAGGPT2(nn.Module):
                 )
             # Same eager-failure rationale (G244): a mismatched B between the
             # passed nmm_states and the prompt produces a deep, confusing
-            # shape error inside the first block's NMM forward. Check the
-            # first per-layer state's first M entry — all per-layer/per-key
-            # tensors share the same B by construction in init_state.
-            # Multi-head (G254): nmm_states[0] is a list-of-states; dig in.
-            first_layer = nmm_states[0]
-            if isinstance(first_layer, list):
-                first_layer_M = first_layer[0][0]
-            else:
-                first_layer_M = first_layer[0]
-            any_W = next(iter(first_layer_M.values()))
-            if any_W.shape[0] != B:
-                raise ValueError(
-                    f"initial_nmm_states batch dim {any_W.shape[0]} does not "
-                    f"match prompt batch dim {B}. The state's B must equal "
-                    f"the prompt's leading dim; rebuild the state with "
-                    f"nmm.init_state(B={B}, ...) or pass a prompt whose "
-                    f"leading dim matches the state's."
-                )
+            # shape error inside the first block's NMM forward. Find the
+            # first non-None layer state to check batch dim (G261: with
+            # nmm_layer_indices, some entries are None).
+            # Multi-head (G254): each non-None entry is a list-of-states.
+            for first_layer in nmm_states:
+                if first_layer is None:
+                    continue
+                if isinstance(first_layer, list):
+                    first_layer_M = first_layer[0][0]
+                else:
+                    first_layer_M = first_layer[0]
+                any_W = next(iter(first_layer_M.values()))
+                if any_W.shape[0] != B:
+                    raise ValueError(
+                        f"initial_nmm_states batch dim {any_W.shape[0]} does not "
+                        f"match prompt batch dim {B}. The state's B must equal "
+                        f"the prompt's leading dim; rebuild the state with "
+                        f"nmm.init_state(B={B}, ...) or pass a prompt whose "
+                        f"leading dim matches the state's."
+                    )
+                break  # one non-None layer is enough to verify B
         kv_caches = []
         nmm_conv_buffers = []
         for block, nmm_state in zip(self.blocks, nmm_states):

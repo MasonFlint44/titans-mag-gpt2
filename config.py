@@ -1,7 +1,8 @@
 """TitansConfig dataclass + GPT-2 factory presets."""
 
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
@@ -143,6 +144,28 @@ class TitansConfig:
     # top of any segment-level recompute overhead.
     nmm_block_grad_checkpoint: bool = False
 
+    # nmm_layer_indices (G261): if not None, NMM is wired only on the
+    # listed transformer blocks; other blocks are plain GPT-2 blocks
+    # (attn + MLP only, no persistent prefix, no MAG gate). Cuts NMM-
+    # related memory/time roughly proportionally — at n_layer=12 with
+    # nmm_layer_indices=[0, 4, 8] (3 NMM blocks), the per-step NMM
+    # transient drops 4x. Paper applies NMM at every block, so subset
+    # is an ablation departure; useful when the alternative is "can't
+    # train at all" because of VRAM. None = all blocks have NMM (default).
+    nmm_layer_indices: Optional[list] = None
+
+    # nmm_low_rank (G262): factor the MemoryMLP weights as A @ B with an
+    # intermediate dim of `nmm_low_rank`. At gpt2_small d=768, default
+    # expansion=4: full-rank state per layer is 3 × [4d, d] = ~28 MB bf16;
+    # low-rank state per layer is 3 × ([4d, r] + [r, d]) = 3 × r × 5d.
+    # At r=64: ~7.5 MB per layer per token, ~10x smaller. Most impactful
+    # knob for per-step NMM memory at long T. NS5 still works on the
+    # factored matrices (it transposes tall rectangles). The factored
+    # MLP has slightly different expressiveness; treat as an ablation
+    # and measure loss curves vs full-rank baseline. None = full-rank
+    # (default, paper-faithful).
+    nmm_low_rank: Optional[int] = None
+
     def __post_init__(self):
         # raise ValueError (never assert): `python -O` strips asserts, which
         # would let invalid configs ship silently in production.
@@ -225,6 +248,52 @@ class TitansConfig:
                 "lives on GPU). Set nmm_grad_checkpoint=True too, or set "
                 "nmm_cpu_offload_segments=False."
             )
+
+        # nmm_layer_indices: must reference valid block indices, no dupes.
+        if self.nmm_layer_indices is not None:
+            if not isinstance(self.nmm_layer_indices, (list, tuple)):
+                raise ValueError(
+                    f"nmm_layer_indices must be a list/tuple of ints or None "
+                    f"(got {type(self.nmm_layer_indices).__name__})."
+                )
+            idx_list = list(self.nmm_layer_indices)
+            if len(set(idx_list)) != len(idx_list):
+                raise ValueError(
+                    f"nmm_layer_indices has duplicate entries: {idx_list}."
+                )
+            for i in idx_list:
+                if not isinstance(i, int):
+                    raise ValueError(
+                        f"nmm_layer_indices entries must be ints (got {i!r})."
+                    )
+                if i < 0 or i >= self.n_layer:
+                    raise ValueError(
+                        f"nmm_layer_indices entry {i} out of range "
+                        f"[0, {self.n_layer}). With n_layer={self.n_layer}, "
+                        f"valid indices are 0..{self.n_layer - 1}."
+                    )
+            # Normalize to sorted list for deterministic iteration order.
+            self.nmm_layer_indices = sorted(idx_list)
+
+        # nmm_low_rank: must be a positive int; reject ranks >= d_model
+        # (low-rank wouldn't actually be low-rank — would have MORE params
+        # than full-rank because of the doubled matmul).
+        if self.nmm_low_rank is not None:
+            if not isinstance(self.nmm_low_rank, int) or self.nmm_low_rank < 1:
+                raise ValueError(
+                    f"nmm_low_rank must be a positive int or None "
+                    f"(got {self.nmm_low_rank!r})."
+                )
+            # Threshold: low-rank with r >= d_model is wasteful.
+            # At r = d_model the factored form has more params than full-rank
+            # (each [4d, d] becomes [4d, d] + [d, d] = 5d² > 4d²).
+            if self.nmm_low_rank >= self.n_embd:
+                raise ValueError(
+                    f"nmm_low_rank={self.nmm_low_rank} >= n_embd={self.n_embd}. "
+                    f"At this rank the factored form has MORE parameters than "
+                    f"full-rank, defeating the purpose. Use r << d_model "
+                    f"(e.g. 32, 64, 128 for d=768)."
+                )
 
         # From-scratch with chunk_size < block_size leaves wpe rows above
         # chunk_size untrained -- generation beyond chunk_size hits random

@@ -223,17 +223,34 @@ cfg = TitansConfig.gpt2_small(
 # 5. Alternative to #4: block-level checkpointing. Wraps each
 #    TitansMAGBlock.forward in a recompute boundary so only block I/O
 #    lives across the stack. Comparable VRAM win to cpu_offload at the
-#    same step-time scale (~5-10x slower than no checkpointing). Choose
-#    block_ckpt over cpu_offload if you don't have fast CPU-GPU
-#    bandwidth (e.g. PCIe 3.0) or if you also want the same per-block
-#    isolation in the autograd graph for analysis tools. They can
-#    compose — block_ckpt + cpu_offload may push max-T a little higher
-#    on hardware that can pay for both.
+#    same step-time scale (~5-10x slower than no checkpointing).
 cfg = TitansConfig.gpt2_small(
     chunk_size=T, block_size=T,
     nmm_grad_checkpoint=True, nmm_grad_checkpoint_segment_len=32,
     nmm_state_dtype="bf16",
-    nmm_block_grad_checkpoint=True,  # block recompute on backward
+    nmm_block_grad_checkpoint=True,
+)
+
+# 6. The unlock for T=1024 + B>1 on a 16 GiB card: low-rank NMM.
+#    Factors memory_mlp weights so per-step state is ~10x smaller.
+#    Loses some NMM capacity vs paper full-rank; measure loss vs
+#    baseline before committing.
+cfg = TitansConfig.gpt2_small(
+    chunk_size=T, block_size=T,
+    nmm_grad_checkpoint=True, nmm_grad_checkpoint_segment_len=32,
+    nmm_state_dtype="bf16",
+    nmm_low_rank=64,
+)
+
+# 7. If you need MAX speed at T=1024 and accept lower NMM capacity
+#    (paper applies NMM at every block — reducing to 4-of-12 cuts
+#    NMM-recompute cost ~3x).
+cfg = TitansConfig.gpt2_small(
+    chunk_size=T, block_size=T,
+    nmm_grad_checkpoint=True, nmm_grad_checkpoint_segment_len=32,
+    nmm_state_dtype="bf16",
+    nmm_low_rank=64,
+    nmm_layer_indices=[0, 3, 6, 9],
 )
 ```
 

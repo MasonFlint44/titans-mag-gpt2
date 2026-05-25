@@ -758,3 +758,449 @@ def test_state_flatten_unflatten_multi_head_round_trip():
         for k in M_o:
             assert torch.equal(M_o[k], M_r[k])
             assert torch.equal(S_o[k], S_r[k])
+
+
+# ---------------------------------------------------------------------------
+# nmm_expansion=1 (G263) — paper ablation: smallest viable NMM size.
+# ---------------------------------------------------------------------------
+
+
+def test_expansion_1_state_shapes_are_square_dxd():
+    """With expansion=1, all three full-rank state matrices become [B, d, d]
+    (hidden = d, not 4d). Quartet drop in per-step state vs default expansion=4."""
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=8, vocab_size=16,
+        block_size=16, chunk_size=8, dropout=0.0,
+        nmm_expansion=1, nmm_n_persistent=0,
+    )
+    from model.titans_gpt2 import TitansMAGGPT2
+    m = TitansMAGGPT2(cfg)
+    state = m.blocks[0].nmm.init_state(B=2, device=torch.device("cpu"))
+    M, S = state
+    # All three weights are square [2, 8, 8] at expansion=1.
+    for k, v in M.items():
+        assert tuple(v.shape) == (2, 8, 8), f"{k} shape {tuple(v.shape)} != (2,8,8)"
+    for k, v in S.items():
+        assert tuple(v.shape) == (2, 8, 8)
+
+
+def test_expansion_1_param_count_quarter_of_expansion_4():
+    """memory_mlp param count at expansion=1 should be ~1/4 of expansion=4
+    (excluding the LayerNorm which is the same). The 3 weight matrices
+    go from 3 × 4d² to 3 × d², so 1/4."""
+    def _count(exp):
+        cfg = TitansConfig(
+            n_layer=1, n_head=2, n_embd=16, vocab_size=16,
+            block_size=16, chunk_size=8, dropout=0.0,
+            nmm_expansion=exp, nmm_n_persistent=0,
+        )
+        from model.titans_gpt2 import TitansMAGGPT2
+        m = TitansMAGGPT2(cfg)
+        return sum(
+            p.numel() for n, p in m.named_parameters()
+            if "memory_mlp" in n and "norm" not in n
+        )
+    n_full = _count(4)
+    n_one = _count(1)
+    # 3 * 4 * d² = 3072 at d=16, exp=4. 3 * d² = 768 at exp=1.
+    assert n_full == 3 * 4 * 16 * 16, f"unexpected exp=4 count {n_full}"
+    assert n_one == 3 * 16 * 16, f"unexpected exp=1 count {n_one}"
+    assert n_one * 4 == n_full
+
+
+def test_expansion_1_trains_end_to_end():
+    """Forward + backward should produce finite gradients with expansion=1.
+    NS5 has to converge on square matrices (no transpose needed)."""
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=8, vocab_size=16,
+        block_size=16, chunk_size=8, dropout=0.0,
+        nmm_expansion=1, nmm_n_persistent=0,
+        finetune_mode=False,
+    )
+    from model.titans_gpt2 import TitansMAGGPT2
+    torch.manual_seed(0)
+    m = TitansMAGGPT2(cfg)
+    ids = torch.randint(0, cfg.vocab_size, (2, 8))
+    db = torch.zeros(2, 8, dtype=torch.bool); db[:, 0] = True
+    logits, _ = m(ids, None, db)
+    logits.sum().backward()
+    for n, p in m.named_parameters():
+        if p.requires_grad:
+            assert p.grad is not None and torch.isfinite(p.grad).all(), f"bad grad on {n}"
+
+
+# ---------------------------------------------------------------------------
+# nmm_layer_indices (G261) — subset-of-layers
+# ---------------------------------------------------------------------------
+
+
+def test_layer_indices_default_is_None_keeps_NMM_on_every_block():
+    """Default behavior: every block is a TitansMAGBlock."""
+    cfg = TitansConfig(
+        n_layer=4, n_head=2, n_embd=8, vocab_size=16,
+        block_size=16, chunk_size=8, dropout=0.0, nmm_n_persistent=0,
+    )
+    from model.titans_gpt2 import TitansMAGGPT2
+    from model.block import TitansMAGBlock
+    m = TitansMAGGPT2(cfg)
+    for b in m.blocks:
+        assert isinstance(b, TitansMAGBlock)
+
+
+def test_layer_indices_only_listed_blocks_have_NMM():
+    """nmm_layer_indices=[1, 3] -> blocks 1 and 3 are TitansMAGBlock,
+    blocks 0 and 2 are PlainGPT2Block."""
+    cfg = TitansConfig(
+        n_layer=4, n_head=2, n_embd=8, vocab_size=16,
+        block_size=16, chunk_size=8, dropout=0.0, nmm_n_persistent=2,
+        nmm_layer_indices=[1, 3],
+    )
+    from model.titans_gpt2 import TitansMAGGPT2
+    from model.block import PlainGPT2Block, TitansMAGBlock
+    m = TitansMAGGPT2(cfg)
+    types = [type(b).__name__ for b in m.blocks]
+    assert types == ["PlainGPT2Block", "TitansMAGBlock", "PlainGPT2Block", "TitansMAGBlock"]
+    # _block_has_nmm parallels the block types.
+    assert m._block_has_nmm == [False, True, False, True]
+
+
+def test_layer_indices_state_has_None_at_plain_block_positions():
+    """The nmm_states list returned by forward contains None for plain
+    blocks; downstream helpers (detach_states, compute_nmm_norm) must
+    tolerate."""
+    cfg = TitansConfig(
+        n_layer=4, n_head=2, n_embd=8, vocab_size=16,
+        block_size=16, chunk_size=8, dropout=0.0,
+        nmm_layer_indices=[1, 3],
+    )
+    from model.titans_gpt2 import TitansMAGGPT2
+    m = TitansMAGGPT2(cfg)
+    ids = torch.randint(0, cfg.vocab_size, (2, 8))
+    db = torch.zeros(2, 8, dtype=torch.bool); db[:, 0] = True
+    _, states = m(ids, None, db)
+    assert states[0] is None and states[1] is not None
+    assert states[2] is None and states[3] is not None
+
+
+def test_layer_indices_detach_states_tolerates_None_entries():
+    from model.nmm import detach_states
+    cfg = TitansConfig(
+        n_layer=3, n_head=2, n_embd=8, vocab_size=16,
+        block_size=16, chunk_size=8, dropout=0.0,
+        nmm_layer_indices=[1],
+    )
+    from model.titans_gpt2 import TitansMAGGPT2
+    m = TitansMAGGPT2(cfg)
+    states = [
+        block.nmm.init_state(B=2, device=torch.device("cpu")) if has_nmm else None
+        for block, has_nmm in zip(m.blocks, m._block_has_nmm)
+    ]
+    detached = detach_states(states)
+    assert detached[0] is None and detached[2] is None
+    # detached[1] is a (M, S) tuple of dicts of detached tensors.
+    M, S = detached[1]
+    for v in {**M, **S}.values():
+        assert v.requires_grad is False
+
+
+def test_layer_indices_compute_nmm_norm_returns_None_for_plain_blocks():
+    from train import compute_nmm_norm
+    cfg = TitansConfig(
+        n_layer=3, n_head=2, n_embd=8, vocab_size=16,
+        block_size=16, chunk_size=8, dropout=0.0,
+        nmm_layer_indices=[1],
+    )
+    from model.titans_gpt2 import TitansMAGGPT2
+    m = TitansMAGGPT2(cfg)
+    ids = torch.randint(0, cfg.vocab_size, (2, 8))
+    _, states = m(ids, None, torch.zeros(2, 8, dtype=torch.bool).index_fill_(1, torch.tensor([0]), True))
+    norms = compute_nmm_norm(states)
+    assert norms[0] is None
+    assert isinstance(norms[1], float) and norms[1] > 0
+    assert norms[2] is None
+
+
+def test_layer_indices_rejects_out_of_range_index():
+    with pytest.raises(ValueError, match="out of range"):
+        TitansConfig(n_layer=4, nmm_layer_indices=[5])
+
+
+def test_layer_indices_rejects_negative_index():
+    with pytest.raises(ValueError, match="out of range"):
+        TitansConfig(n_layer=4, nmm_layer_indices=[-1])
+
+
+def test_layer_indices_rejects_duplicate_indices():
+    with pytest.raises(ValueError, match="duplicate"):
+        TitansConfig(n_layer=4, nmm_layer_indices=[1, 1])
+
+
+def test_layer_indices_rejects_non_int_entries():
+    with pytest.raises(ValueError, match="ints"):
+        TitansConfig(n_layer=4, nmm_layer_indices=[1.5])
+
+
+def test_layer_indices_normalizes_to_sorted_list():
+    """Input [3, 1, 2] should normalize to [1, 2, 3] so iteration order
+    is deterministic across runs and rank ordering doesn't surprise users."""
+    cfg = TitansConfig(n_layer=4, nmm_layer_indices=[3, 1, 2])
+    assert cfg.nmm_layer_indices == [1, 2, 3]
+
+
+def test_layer_indices_param_count_lower_than_all_layers():
+    """Setting nmm_layer_indices=[0] on a 4-layer model means only block 0
+    has NMM/persistent/MAG params — total param count should be much lower
+    than every-block-has-NMM."""
+    cfg_all = TitansConfig(
+        n_layer=4, n_head=2, n_embd=8, vocab_size=16,
+        block_size=16, chunk_size=8, dropout=0.0, nmm_n_persistent=2,
+    )
+    cfg_subset = TitansConfig(
+        n_layer=4, n_head=2, n_embd=8, vocab_size=16,
+        block_size=16, chunk_size=8, dropout=0.0, nmm_n_persistent=2,
+        nmm_layer_indices=[0],
+    )
+    from model.titans_gpt2 import TitansMAGGPT2
+    n_all = sum(p.numel() for p in TitansMAGGPT2(cfg_all).parameters())
+    n_subset = sum(p.numel() for p in TitansMAGGPT2(cfg_subset).parameters())
+    assert n_subset < n_all, f"subset {n_subset} not < all {n_all}"
+
+
+def test_layer_indices_full_model_backward_propagates_through_mixed_stack():
+    """End-to-end: backward through a mixed plain+NMM stack must yield
+    finite gradients on EVERY trainable param. The plain blocks have
+    their own params (attn, mlp, ln); the NMM blocks have those + the
+    NMM-specific params. Both must receive gradients."""
+    cfg = TitansConfig(
+        n_layer=3, n_head=2, n_embd=8, vocab_size=16,
+        block_size=16, chunk_size=8, dropout=0.0, nmm_n_persistent=2,
+        finetune_mode=False,
+        nmm_layer_indices=[1],
+    )
+    from model.titans_gpt2 import TitansMAGGPT2
+    torch.manual_seed(0)
+    m = TitansMAGGPT2(cfg)
+    ids = torch.randint(0, cfg.vocab_size, (2, 8))
+    db = torch.zeros(2, 8, dtype=torch.bool); db[:, 0] = True
+    logits, _ = m(ids, None, db)
+    logits.sum().backward()
+    for n, p in m.named_parameters():
+        if p.requires_grad:
+            assert p.grad is not None, f"{n} no grad"
+            assert torch.isfinite(p.grad).all(), f"{n} non-finite grad"
+
+
+def test_layer_indices_decode_path_works_with_mixed_blocks():
+    """prepare_decode + forward_step should work end-to-end with a mix
+    of TitansMAGBlock and PlainGPT2Block — plain blocks contribute a
+    KV cache only (no NMM conv buffer)."""
+    cfg = TitansConfig(
+        n_layer=3, n_head=2, n_embd=8, vocab_size=16,
+        block_size=16, chunk_size=4, dropout=0.0, nmm_n_persistent=2,
+        nmm_layer_indices=[1],
+    )
+    from model.titans_gpt2 import TitansMAGGPT2
+    m = TitansMAGGPT2(cfg).eval()
+    prompt = torch.randint(0, cfg.vocab_size, (1, 4))
+    cache = m.prepare_decode(prompt)
+    # Plain block's conv buffer slot is None; NMM block's is a dict.
+    assert cache["nmm_conv_buffers"][0] is None
+    assert isinstance(cache["nmm_conv_buffers"][1], dict)
+    assert cache["nmm_conv_buffers"][2] is None
+    # One step of decode should run end-to-end and produce finite logits.
+    next_tok = torch.tensor([[0]])
+    logits, _ = m.forward_step(next_tok, cache)
+    assert torch.isfinite(logits).all()
+
+
+# ---------------------------------------------------------------------------
+# nmm_low_rank (G262) — factored MemoryMLP for smaller per-step state
+# ---------------------------------------------------------------------------
+
+
+def test_low_rank_default_is_None_full_rank():
+    cfg = TitansConfig()
+    assert cfg.nmm_low_rank is None
+
+
+def test_low_rank_state_keys_expand_to_six():
+    """Full-rank has 3 state keys (W1, W_gate, W2). Low-rank has 6
+    (W1_a, W1_b, W_gate_a, W_gate_b, W2_a, W2_b). state_keys is
+    discovered from MemoryMLP at NMM construction time."""
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=16, vocab_size=16,
+        block_size=16, chunk_size=8, dropout=0.0,
+        nmm_expansion=2, nmm_low_rank=4, nmm_n_persistent=0,
+    )
+    from model.titans_gpt2 import TitansMAGGPT2
+    m = TitansMAGGPT2(cfg)
+    keys = m.blocks[0].nmm.state_keys
+    assert sorted(keys) == sorted([
+        "W1_a.weight", "W1_b.weight",
+        "W_gate_a.weight", "W_gate_b.weight",
+        "W2_a.weight", "W2_b.weight",
+    ])
+
+
+def test_low_rank_state_init_shapes_match_factored_layout():
+    """Each factored matmul has two matrices: A is [r, d_in], B is
+    [d_out, r]. init_state replicates these per-batch."""
+    d, r, expansion = 16, 4, 2
+    h = d * expansion
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=d, vocab_size=16,
+        block_size=16, chunk_size=8, dropout=0.0,
+        nmm_expansion=expansion, nmm_low_rank=r, nmm_n_persistent=0,
+    )
+    from model.titans_gpt2 import TitansMAGGPT2
+    m = TitansMAGGPT2(cfg)
+    M, _S = m.blocks[0].nmm.init_state(B=2, device=torch.device("cpu"))
+    expected = {
+        "W1_a.weight":     (2, r, d),
+        "W1_b.weight":     (2, h, r),
+        "W_gate_a.weight": (2, r, d),
+        "W_gate_b.weight": (2, h, r),
+        "W2_a.weight":     (2, r, h),
+        "W2_b.weight":     (2, d, r),
+    }
+    for k, shape in expected.items():
+        assert tuple(M[k].shape) == shape, f"{k}: got {tuple(M[k].shape)}, want {shape}"
+
+
+def test_low_rank_param_count_much_smaller_than_full_rank():
+    """At r << d, the factored MemoryMLP has way fewer params. With
+    d=16, expansion=4 (h=64): full-rank is 3 × d×h = 192*3 = 576 (per
+    direction) Wait — full-rank state per W is [h, d] or [d, h], so
+    d*h = 256 per matrix × 3 = 768 params. Hmm, math check below."""
+    cfg_full = TitansConfig(
+        n_layer=1, n_head=2, n_embd=16, vocab_size=16,
+        block_size=16, chunk_size=8, dropout=0.0,
+        nmm_expansion=4, nmm_n_persistent=0,
+    )
+    cfg_lr = TitansConfig(
+        n_layer=1, n_head=2, n_embd=16, vocab_size=16,
+        block_size=16, chunk_size=8, dropout=0.0,
+        nmm_expansion=4, nmm_low_rank=2, nmm_n_persistent=0,
+    )
+    from model.titans_gpt2 import TitansMAGGPT2
+    def _mm_params(model):
+        return sum(
+            p.numel() for n, p in model.named_parameters()
+            if "memory_mlp" in n and "norm" not in n
+        )
+    n_full = _mm_params(TitansMAGGPT2(cfg_full))
+    n_lr = _mm_params(TitansMAGGPT2(cfg_lr))
+    # Each Wx [h, d] = h*d. Three of them = 3*h*d.
+    # Factored Wx = [r, d] + [h, r] = r*(d+h). Three of them = 3*r*(d+h).
+    # d=16, h=64, r=2: full = 3*64*16=3072, lr = 3*2*(16+64) = 480.
+    assert n_full == 3 * 64 * 16
+    assert n_lr == 3 * 2 * (16 + 64)
+    assert n_lr < n_full / 4  # at r=2 << d=16, much smaller
+
+
+def test_low_rank_trains_end_to_end():
+    """Forward + backward must yield finite gradients on all params
+    (the 6 factored linears + outer-loop NMM controllers)."""
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=16, vocab_size=16,
+        block_size=16, chunk_size=8, dropout=0.0,
+        nmm_expansion=2, nmm_low_rank=4, nmm_n_persistent=0,
+        finetune_mode=False,
+    )
+    from model.titans_gpt2 import TitansMAGGPT2
+    torch.manual_seed(0)
+    m = TitansMAGGPT2(cfg)
+    ids = torch.randint(0, cfg.vocab_size, (2, 8))
+    db = torch.zeros(2, 8, dtype=torch.bool); db[:, 0] = True
+    logits, _ = m(ids, None, db)
+    logits.sum().backward()
+    for n, p in m.named_parameters():
+        if p.requires_grad:
+            assert p.grad is not None, f"{n} no grad"
+            assert torch.isfinite(p.grad).all(), f"{n} non-finite grad"
+
+
+def test_low_rank_composes_with_grad_checkpoint():
+    """Low-rank state flows through the segmented checkpoint loop. The
+    flat-tensor checkpoint plumbing must respect the dynamic state_keys
+    (6 items instead of 3)."""
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=16, vocab_size=16,
+        block_size=16, chunk_size=8, dropout=0.0,
+        nmm_expansion=2, nmm_low_rank=4, nmm_n_persistent=0,
+        finetune_mode=False,
+        nmm_grad_checkpoint=True,
+        nmm_grad_checkpoint_segment_len=3,
+    )
+    from model.block import TitansMAGBlock
+    torch.manual_seed(0)
+    block = TitansMAGBlock(cfg)
+    state = block.nmm.init_state(B=2, device=torch.device("cpu"))
+    x = torch.randn(2, 8, 16, requires_grad=True)
+    y, _ = block(x, state)
+    y.sum().backward()
+    for n, p in block.nmm.memory_mlp.named_parameters():
+        assert p.grad is not None
+        assert torch.isfinite(p.grad).all(), f"{n} non-finite"
+
+
+def test_low_rank_composes_with_bf16_state():
+    """bf16 state dtype + low-rank — gradients still finite."""
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=16, vocab_size=16,
+        block_size=16, chunk_size=8, dropout=0.0,
+        nmm_expansion=2, nmm_low_rank=4, nmm_n_persistent=0,
+        finetune_mode=False,
+        nmm_state_dtype="bf16",
+    )
+    from model.block import TitansMAGBlock
+    torch.manual_seed(0)
+    block = TitansMAGBlock(cfg)
+    state = block.nmm.init_state(B=2, device=torch.device("cpu"))
+    # State must be bf16 with low-rank.
+    M, _ = state
+    for v in M.values():
+        assert v.dtype == torch.bfloat16
+    x = torch.randn(2, 8, 16, requires_grad=True)
+    y, _ = block(x, state)
+    y.sum().backward()
+    for p in block.nmm.memory_mlp.parameters():
+        assert p.grad is not None
+        assert torch.isfinite(p.grad).all()
+
+
+def test_low_rank_composes_with_block_checkpoint():
+    """block_grad_checkpoint flattens state via state_keys discovery —
+    must work for the 6-key low-rank state too."""
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=16, vocab_size=16,
+        block_size=16, chunk_size=8, dropout=0.0,
+        nmm_expansion=2, nmm_low_rank=4, nmm_n_persistent=0,
+        finetune_mode=False,
+        nmm_grad_checkpoint=True,
+        nmm_grad_checkpoint_segment_len=3,
+        nmm_block_grad_checkpoint=True,
+    )
+    from model.block import TitansMAGBlock
+    torch.manual_seed(0)
+    block = TitansMAGBlock(cfg)
+    state = block.nmm.init_state(B=2, device=torch.device("cpu"))
+    x = torch.randn(2, 8, 16, requires_grad=True)
+    y, _ = block(x, state)
+    y.sum().backward()
+    for p in block.nmm.memory_mlp.parameters():
+        assert torch.isfinite(p.grad).all()
+
+
+def test_low_rank_rejects_rank_geq_n_embd():
+    """At rank >= d_model the factored form has MORE params than full —
+    catch this loud at config time."""
+    with pytest.raises(ValueError, match="defeating the purpose"):
+        TitansConfig(n_head=2, n_embd=16, nmm_low_rank=16)
+
+
+def test_low_rank_rejects_zero_or_negative_rank():
+    with pytest.raises(ValueError, match="positive int"):
+        TitansConfig(n_head=2, n_embd=8, nmm_low_rank=0)
+    with pytest.raises(ValueError, match="positive int"):
+        TitansConfig(n_head=2, n_embd=8, nmm_low_rank=-1)
