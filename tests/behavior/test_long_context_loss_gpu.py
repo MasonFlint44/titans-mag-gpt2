@@ -1,4 +1,4 @@
-"""TEST_PLAN.md §10: per-position loss across a long sequence.
+"""docs/TEST_PLAN.md §10: per-position loss across a long sequence.
 
 With HF GPT-2 weights loaded and the NMM zeroed (out_scale=0), the
 backbone is vanilla GPT-2 and per-position cross-entropy should look
@@ -45,7 +45,7 @@ def _per_position_loss(model, idx: torch.Tensor) -> torch.Tensor:
 
 
 def test_loss_decreases_across_repetitions_with_HF_loaded():
-    """TEST_PLAN.md §10: loss should DECREASE as more context accumulates
+    """docs/TEST_PLAN.md §10: loss should DECREASE as more context accumulates
     (model has more to condition on). On a repeating text, the second
     repetition should have substantially lower loss than the first because
     the pattern is now in the attention context.

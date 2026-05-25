@@ -149,7 +149,7 @@ def needle_in_haystack_sweep(
     `insert_fraction`, decode the probe completion, check whether the
     secret appears. Aggregate per-position and per-secret recall.
 
-    The TEST_PLAN.md §10 specification ("Top-1 token includes the secret
+    The docs/TEST_PLAN.md §10 specification ("Top-1 token includes the secret
     for ≥80% of positions") is implemented here as `result["recall"]`.
 
     Args:

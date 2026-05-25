@@ -185,10 +185,10 @@ def test_scan_output_finite_and_reasonable_magnitude():
     """Behavioural check: the scan must not produce NaN/Inf, and output
     magnitude must stay within the same order as the sequential path.
 
-    The "<5%" target in PLAN.md §6.1 is aspirational for trained models
+    The "<5%" target in docs/PLAN.md §6.1 is aspirational for trained models
     (gradients structured, small in magnitude). On a random untrained NMM
     with random inputs, the M_0-vs-M_{t-1} approximation can reach 70-90%
-    relative error per chunk — see G232 in GAP_HISTORY.md.
+    relative error per chunk — see G232 in docs/GAP_HISTORY.md.
     """
     if not _HAS_ASSOC_SCAN:
         pytest.skip("associative_scan unavailable")

@@ -370,7 +370,7 @@ def run_training(
 
     Training continues until `step >= max_steps`. When the loader exhausts
     mid-training (max_steps > batches-per-epoch), the iterator is rebuilt
-    and iteration continues — matching PLAN.md §4.5's
+    and iteration continues — matching docs/PLAN.md §4.5's
     `for epoch in range(N_EPOCHS):` structure. Without this, small corpora
     silently early-stop after one pass and the user sees max_steps not
     reached with no error.

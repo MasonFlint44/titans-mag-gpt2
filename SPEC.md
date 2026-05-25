@@ -2,8 +2,9 @@
 
 This document is the authoritative specification for what the code in this
 repository actually does. It is the single source of truth for the
-implementation; sister documents (`ARCHITECTURE.md`, `CONFIG_REFERENCE.md`,
-`RUNBOOK.md`, `GLOSSARY.md`, `PLAN.md`, `TEST_PLAN.md`) describe design
+implementation; sister documents in [`docs/`](docs/) (`ARCHITECTURE.md`,
+`CONFIG_REFERENCE.md`, `RUNBOOK.md`, `GLOSSARY.md`, `PLAN.md`,
+`TEST_PLAN.md`) describe design
 rationale, knobs, operations, terminology, planning history, and tests
 respectively. Where any of those disagree with this file, this file is
 correct and the others should be updated.
@@ -435,7 +436,8 @@ Two MAG gate variants:
 ## 5. Configuration
 
 `TitansConfig` is a `@dataclass` in `config.py`. Full field-by-field
-reference is in `CONFIG_REFERENCE.md`; this section codifies the
+reference is in [`docs/CONFIG_REFERENCE.md`](docs/CONFIG_REFERENCE.md);
+this section codifies the
 **invariants the implementation depends on**.
 
 ### 5.1 Validation (`__post_init__`)
@@ -860,18 +862,20 @@ block_size` enforces.
 
 ```
 titans-mag-gpt2/
-├── SPEC.md                  This document.
 ├── README.md                Quickstart, install, headlines.
-├── ARCHITECTURE.md          Design decisions, equations, block diagram.
-├── PLAN.md                  Phase-by-phase implementation guide.
-├── CONFIG_REFERENCE.md      Every config knob with range / defaults.
-├── TEST_PLAN.md             Unit / integration / parity / DDP test plan.
-├── RUNBOOK.md               What to do when training breaks.
-├── GLOSSARY.md              TITANS terminology.
-├── EXPERIMENTS.md           Ablation plan and success criteria.
-├── GAP_HISTORY.md           Audit log (background reading).
-├── ROADMAP.md               Phase-by-phase delivery plan.
-├── IMPLEMENTATION_PROMPT.md One-shot bootstrap prompt for fresh agents.
+├── SPEC.md                  This document.
+├── LICENSE                  MIT.
+├── docs/
+│   ├── ARCHITECTURE.md          Design decisions, equations, block diagram.
+│   ├── PLAN.md                  Phase-by-phase implementation guide.
+│   ├── CONFIG_REFERENCE.md      Every config knob with range / defaults.
+│   ├── TEST_PLAN.md             Unit / integration / parity / DDP test plan.
+│   ├── RUNBOOK.md               What to do when training breaks.
+│   ├── GLOSSARY.md              TITANS terminology.
+│   ├── EXPERIMENTS.md           Ablation plan and success criteria.
+│   ├── GAP_HISTORY.md           Audit log (background reading).
+│   ├── ROADMAP.md               Phase-by-phase delivery plan.
+│   └── IMPLEMENTATION_PROMPT.md One-shot bootstrap prompt for fresh agents.
 ├── config.py                TitansConfig dataclass + factories.
 ├── model/
 │   ├── __init__.py          _unwrap helper.
@@ -888,7 +892,7 @@ titans-mag-gpt2/
 ├── train.py                 build_optimizer, train_step, run_training, schedule, ckpts.
 ├── generate.py              Cached autoregressive sampling.
 ├── eval.py                  Perplexity + needle-in-haystack.
-├── tests/                   See TEST_PLAN.md.
+├── tests/                   See docs/TEST_PLAN.md.
 └── diagrams/                Mermaid diagrams.
 ```
 

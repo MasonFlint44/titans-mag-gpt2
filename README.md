@@ -19,15 +19,15 @@ test time — that's the whole point.
 | Doc | What it is |
 |---|---|
 | [`SPEC.md`](SPEC.md) | **Authoritative implementation spec** — what the code actually does |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Design decisions, equations, block diagram |
-| [`ROADMAP.md`](ROADMAP.md) | Phase-by-phase implementation guide (start here) |
-| [`PLAN.md`](PLAN.md) | Full code sketches and every gap-driven safeguard |
-| [`TEST_PLAN.md`](TEST_PLAN.md) | Unit / integration / parity / DDP test plan |
-| [`CONFIG_REFERENCE.md`](CONFIG_REFERENCE.md) | Every config knob with range and defaults |
-| [`RUNBOOK.md`](RUNBOOK.md) | What to do when training breaks |
-| [`GLOSSARY.md`](GLOSSARY.md) | TITANS terminology |
-| [`EXPERIMENTS.md`](EXPERIMENTS.md) | Ablation plan and success criteria |
-| [`GAP_HISTORY.md`](GAP_HISTORY.md) | Audit log (background reading) |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Design decisions, equations, block diagram |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Phase-by-phase implementation guide (start here) |
+| [`docs/PLAN.md`](docs/PLAN.md) | Full code sketches and every gap-driven safeguard |
+| [`docs/TEST_PLAN.md`](docs/TEST_PLAN.md) | Unit / integration / parity / DDP test plan |
+| [`docs/CONFIG_REFERENCE.md`](docs/CONFIG_REFERENCE.md) | Every config knob with range and defaults |
+| [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | What to do when training breaks |
+| [`docs/GLOSSARY.md`](docs/GLOSSARY.md) | TITANS terminology |
+| [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) | Ablation plan and success criteria |
+| [`docs/GAP_HISTORY.md`](docs/GAP_HISTORY.md) | Audit log (background reading) |
 | [`diagrams/`](diagrams/) | Mermaid diagrams (architecture, sequences, lifecycle, DDP) |
 
 ## What you get
@@ -128,17 +128,17 @@ pytest tests/parity/                       # HF GPT-2 logit/perplexity parity
 pytest tests/ddp/ -m ddp                   # spawns 2-rank ranges
 ```
 
-CI tiers in [`TEST_PLAN.md`](TEST_PLAN.md) §15.
+CI tiers in [`docs/TEST_PLAN.md`](docs/TEST_PLAN.md) §15.
 
 ## Pointers if something is off
 
 | Symptom | Likely cause | See |
 |---|---|---|
-| Loss NaN after a few steps | Inner-loop NS5 leaking bf16 | RUNBOOK.md §NaN loss |
-| Logits drift from HF GPT-2 at init | Conv1D transpose or `out_scale ≠ 0` | RUNBOOK.md §Logit parity |
-| DDP hang during accumulation | Missing `model.no_sync()` or G222 off-by-one | RUNBOOK.md §DDP hang |
-| LR shrinking every resume | `base_lrs` read from `param_groups` instead of constants (G162) | RUNBOOK.md §LR deflation |
-| Generation gibberish beyond `block_size` | Conv window not maintained at T=1 step | RUNBOOK.md §Long-context drift |
+| Loss NaN after a few steps | Inner-loop NS5 leaking bf16 | docs/RUNBOOK.md §NaN loss |
+| Logits drift from HF GPT-2 at init | Conv1D transpose or `out_scale ≠ 0` | docs/RUNBOOK.md §Logit parity |
+| DDP hang during accumulation | Missing `model.no_sync()` or G222 off-by-one | docs/RUNBOOK.md §DDP hang |
+| LR shrinking every resume | `base_lrs` read from `param_groups` instead of constants (G162) | docs/RUNBOOK.md §LR deflation |
+| Generation gibberish beyond `block_size` | Conv window not maintained at T=1 step | docs/RUNBOOK.md §Long-context drift |
 
 ## Citation
 

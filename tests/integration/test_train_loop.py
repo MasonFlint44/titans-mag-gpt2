@@ -96,7 +96,7 @@ def test_run_training_with_grad_accum_single_gpu():
 
 def test_run_training_restarts_loader_on_exhaustion_to_reach_max_steps():
     """The naive single-iter(loader) outside the while loop silently early-stops
-    when max_steps > batches-per-epoch on a small corpus. PLAN.md §4.5 wraps
+    when max_steps > batches-per-epoch on a small corpus. docs/PLAN.md §4.5 wraps
     in `for epoch in range(N_EPOCHS):` — verify run_training does the equivalent
     by restarting the iterator on StopIteration."""
     cfg = TitansConfig(

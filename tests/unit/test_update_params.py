@@ -4,7 +4,7 @@ from model.nmm import NeuralMemoryModule
 
 
 def _call_pattern(linear: torch.nn.Linear, x: torch.Tensor) -> torch.Tensor:
-    """The canonical call-site form from PLAN.md §1.3 / §1.7."""
+    """The canonical call-site form from docs/PLAN.md §1.3 / §1.7."""
     return torch.sigmoid(linear(x)).squeeze(-1)
 
 
@@ -75,7 +75,7 @@ def test_perturbing_W_alpha_does_not_change_theta_output():
 
 
 def test_no_bias_on_update_params():
-    """bias=False per PLAN.md §1.3 — keeps init-time output at sigmoid(0) = 0.5."""
+    """bias=False per docs/PLAN.md §1.3 — keeps init-time output at sigmoid(0) = 0.5."""
     nmm = NeuralMemoryModule(n_embd=8)
     assert nmm.W_theta.bias is None
     assert nmm.W_eta.bias is None

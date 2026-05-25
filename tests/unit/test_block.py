@@ -133,7 +133,7 @@ def test_nmm_receives_only_real_tokens_when_feed_persistent_flag_is_False():
     flip) is feed_persistent_to_nmm=True, where the block feeds [B, T+N_p, d]
     (paper Eq. 28) — verified by the complementary test below.
 
-    Spec from TEST_PLAN.md §4 + G254: "patch nmm.forward_chunk to record
+    Spec from docs/TEST_PLAN.md §4 + G254: "patch nmm.forward_chunk to record
     x.shape[1]; verify T (real tokens) when flag False, T+N_p when True".
     """
     cfg = _cfg(N_p=4, T=6, feed_persistent_to_nmm=False)

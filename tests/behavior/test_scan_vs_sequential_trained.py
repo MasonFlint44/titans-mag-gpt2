@@ -1,6 +1,6 @@
 """Behavior test: scan approximation vs true sequential, chunk_size monotonicity.
 
-PLAN.md §6.1 (G232 update) claims the gap is "monotonically decreasing with
+docs/PLAN.md §6.1 (G232 update) claims the gap is "monotonically decreasing with
 shorter chunk_size". This is the part of the claim we CAN verify directly:
 at T=1 the gap is exactly zero (only one gradient, no M drift); at larger T
 the M drift accumulates and the all-grads-at-M_0 approximation diverges
@@ -37,7 +37,7 @@ def _rel_error_at_T(model, T: int) -> float:
 
 @pytest.mark.slow
 def test_scan_sequential_gap_increases_with_chunk_size():
-    """G232 / PLAN.md §6.1: 'monotonically decreasing with shorter chunk_size'.
+    """G232 / docs/PLAN.md §6.1: 'monotonically decreasing with shorter chunk_size'.
     Equivalent statement: rel error monotonically INCREASES with longer
     chunk_size. At T=1 the gap is exactly 0 (no M drift); at T>1 it grows.
     """

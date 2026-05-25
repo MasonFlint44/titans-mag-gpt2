@@ -2,7 +2,7 @@
 
 Defends G216 (HF model name derived from n_embd; previously named test
 in regression matrix didn't exist). Also covers Conv1D-transpose
-correctness and all-params-loaded invariants from TEST_PLAN.md §4.
+correctness and all-params-loaded invariants from docs/TEST_PLAN.md §4.
 
 These tests do NOT download from HuggingFace — they exercise the static
 derivation logic and (where actual weight copy is needed) construct a

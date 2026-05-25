@@ -240,7 +240,7 @@ class MemoryMLP(nn.Module):
 class NeuralMemoryModule(nn.Module):
     """Online memory module with surprise-driven weight updates.
 
-    The constructor wires together the components from PLAN.md §1.2–§1.4:
+    The constructor wires together the components from docs/PLAN.md §1.2–§1.4:
     Q/K/V projections, the three data-dependent update params, the
     MemoryMLP (whose W*.weight ARE the meta-learned initial state), and
     a learnable per-channel output scale.

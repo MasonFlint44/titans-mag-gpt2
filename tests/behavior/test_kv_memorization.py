@@ -1,6 +1,6 @@
 """Behavior test: NMM learns associative recall on a synthetic key->value task.
 
-TEST_PLAN.md §10 spec is slow_gpu (500-step train). This CPU-feasible version
+docs/TEST_PLAN.md §10 spec is slow_gpu (500-step train). This CPU-feasible version
 trains a tiny model on a repeating K->V pattern and verifies the model's
 prediction probability of V given K improves substantially over training —
 demonstrating the NMM is actually updating memory in a useful direction.

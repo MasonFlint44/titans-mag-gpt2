@@ -2,8 +2,8 @@
 
 Option B from the audit: each decoded token gets exactly ONE NMM update
 (matching the TITANS spec) instead of re-feeding the full sliding window
-through the NMM at every step (the old behavior). See PLAN.md §5.1 +
-RUNBOOK.md "Long-context generation drift" §4.
+through the NMM at every step (the old behavior). See docs/PLAN.md §5.1 +
+docs/RUNBOOK.md "Long-context generation drift" §4.
 
 Pipeline:
   1. prepare_decode: chunked warm-up on the prompt (existing forward_chunk

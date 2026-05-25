@@ -31,7 +31,7 @@ def test_spectral_norm_bound_for_any_shape(shape):
     # (a+b+c = 0.701, not 1). For random inputs the 5-step iteration
     # converges to a basin near sigma ~ 1.0-1.20 — bounded, not exact.
     # The bound is what we need for inner-loop stability; "approximately 1"
-    # in PLAN.md / the diagram refers to this loose basin. See G230.
+    # in docs/PLAN.md / the diagram refers to this loose basin. See G230.
     assert 0.80 < s < 1.25, f"shape={shape}: out of post-NS5 basin, got {s}"
 
 
@@ -74,7 +74,7 @@ def test_transpose_guard_preserves_output_shape():
 
 
 # ---------------------------------------------------------------------------
-# Theta-cancellation property (paper §3.2 / PLAN.md §1.5)
+# Theta-cancellation property (paper §3.2 / docs/PLAN.md §1.5)
 # ---------------------------------------------------------------------------
 
 def test_pre_scaling_is_cancelled_by_NS():

@@ -42,7 +42,7 @@ def test_xavier_uniform_init_via_NMM_constructor(d: int, expansion: int):
     ]:
         expected_std = math.sqrt(2.0 / (fan_in + fan_out))
         actual_std = weight.std().item()
-        # 5% tolerance per TEST_PLAN.md.
+        # 5% tolerance per docs/TEST_PLAN.md.
         assert abs(actual_std - expected_std) / expected_std < 0.05, (
             f"{name}: expected std ~{expected_std:.4f}, got {actual_std:.4f}"
         )
