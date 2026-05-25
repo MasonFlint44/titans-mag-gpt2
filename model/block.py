@@ -223,3 +223,71 @@ class TitansMAGBlock(nn.Module):
         x = x + o
         x = x + self.mlp(self.ln_2(x))
         return x, nmm_state
+
+    def init_decode_cache(self, x_prompt: torch.Tensor, nmm_state: tuple) -> tuple:
+        """Seed the per-block decode caches from a warm-up prompt.
+
+        Called once per block AFTER block.forward has already updated
+        nmm_state on the prompt. Computes:
+        - (k_cache, v_cache): K, V from attn over ln_1(x_aug_prompt),
+          length N_p + T_prompt — includes the persistent prefix.
+        - nmm_conv_buffer: dict for NMM step_with_conv (last k-1 Linear
+          projections of ln_nmm(prompt)).
+
+        x_prompt: [B, T, d] — the block's INPUT prompt (pre-block, not
+        post-block). nmm_state is the post-warmup NMM state.
+        Returns (k_cache, v_cache, nmm_conv_buffer).
+        """
+        B, T, _ = x_prompt.shape
+        # KV cache: project K, V from ln_1(x_aug) where x_aug includes the
+        # persistent prefix. Decode-time queries against this cache see the
+        # persistent positions exactly the way warm-up's attention saw them.
+        x_aug = cat([self.persistent_mem.expand(B, -1, -1), x_prompt], dim=1)
+        x_aug_norm = self.ln_1(x_aug)
+        k_cache, v_cache = self.attn.project_kv(x_aug_norm)
+
+        # NMM conv buffer: last (k-1) Linear projections of ln_nmm(prompt).
+        x_nmm_norm = self.ln_nmm(x_prompt)
+        nmm_conv_buffer = self.nmm.init_conv_buffer_from_prompt(x_nmm_norm)
+        return k_cache, v_cache, nmm_conv_buffer
+
+    def forward_step(
+        self,
+        x_new: torch.Tensor,
+        nmm_state: tuple,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        nmm_conv_buffer: dict,
+    ) -> tuple:
+        """Single-token decode forward through one block.
+
+        x_new: [B, 1, d] — embedded new token (wte+wpe).
+        nmm_state: (M, S) from prior step.
+        k_cache, v_cache: [B, n_head, T_seen, head_dim] — prior K, V.
+        nmm_conv_buffer: dict from prior step.
+
+        Returns (x_out [B, 1, d], new_nmm_state, new_k_cache, new_v_cache,
+        new_nmm_conv_buffer).
+        """
+        # Attention via KV cache. ln_1 on the new token; no x_aug concat
+        # (persistent prefix is already in the cache).
+        x_norm_attn = self.ln_1(x_new)
+        y_attn, new_k_cache, new_v_cache = self.attn.forward_with_kv_cache(
+            x_norm_attn, k_cache, v_cache
+        )
+
+        # NMM via step_with_conv: one update per token, full conv context.
+        x_norm_nmm = self.ln_nmm(x_new).squeeze(1)  # [B, d]
+        y_mem_t, new_nmm_state, new_nmm_conv_buffer = self.nmm.step_with_conv(
+            x_norm_nmm, nmm_state, nmm_conv_buffer
+        )
+        y_mem = y_mem_t.unsqueeze(1)  # [B, 1, d]
+
+        if self.finetune_mode:
+            o = y_attn + F.silu(self.gamma_mem * y_mem) * y_attn
+        else:
+            o = F.silu(self.gamma_attn * y_attn) * F.silu(self.gamma_mem * y_mem)
+
+        x = x_new + o
+        x = x + self.mlp(self.ln_2(x))
+        return x, new_nmm_state, new_k_cache, new_v_cache, new_nmm_conv_buffer

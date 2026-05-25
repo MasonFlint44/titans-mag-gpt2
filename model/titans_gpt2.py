@@ -108,3 +108,109 @@ class TitansMAGGPT2(nn.Module):
         x = self.ln_f(x)
         logits = x @ self.wte.weight.T  # tied weights
         return logits, new_nmm_states
+
+    def prepare_decode(self, prompt_idx: torch.Tensor) -> dict:
+        """Warm up on a prompt, return the full DecodeCache for forward_step.
+
+        Runs forward() over the prompt (NMM gets exactly one update per
+        prompt token via forward_chunk), then captures per-block
+        (k_cache, v_cache, nmm_conv_buffer) by re-projecting the prompt's
+        ln_1/ln_nmm outputs. The KV cache for each block includes the
+        persistent prefix at positions 0..N_p-1.
+
+        prompt_idx: [B, P] token ids. P must be <= block_size.
+
+        Returns dict:
+          last_logits:  [B, 1, vocab_size]
+          nmm_states:   list[n_layer] of (M, S)
+          kv_caches:    list[n_layer] of (k_cache, v_cache)
+          nmm_conv_buffers: list[n_layer] of dict {'q', 'k', 'v'}
+          position:     int — position index of the next decoded token
+                        (= prompt length P)
+        """
+        B, P = prompt_idx.shape
+        if P > self.config.block_size:
+            raise ValueError(
+                f"prompt length {P} exceeds block_size {self.config.block_size}. "
+                f"Truncate prompt or use the non-cached generate path."
+            )
+
+        pos = torch.arange(0, P, device=prompt_idx.device)
+        x = self.drop(self.wte(prompt_idx) + self.wpe(pos))
+
+        nmm_states = [
+            block.nmm.init_state(B, prompt_idx.device) for block in self.blocks
+        ]
+        kv_caches = []
+        nmm_conv_buffers = []
+        for block, nmm_state in zip(self.blocks, nmm_states):
+            # Capture decode caches BEFORE the block mutates x — they're
+            # functions of the block's INPUT, not its output.
+            k_cache, v_cache, conv_buf = block.init_decode_cache(x, nmm_state)
+            kv_caches.append((k_cache, v_cache))
+            nmm_conv_buffers.append(conv_buf)
+            x, nmm_state = block(x, nmm_state, None)
+            nmm_states[len(kv_caches) - 1] = nmm_state
+
+        x = self.ln_f(x)
+        logits = x @ self.wte.weight.T
+        last_logits = logits[:, -1:, :]
+        return {
+            "last_logits": last_logits,
+            "nmm_states": nmm_states,
+            "kv_caches": kv_caches,
+            "nmm_conv_buffers": nmm_conv_buffers,
+            "position": P,
+        }
+
+    def forward_step(self, token_id: torch.Tensor, cache: dict) -> tuple:
+        """Single-token decode forward.
+
+        token_id: [B, 1] new token id.
+        cache: dict from prepare_decode (or from a prior forward_step).
+
+        Returns (logits [B, 1, vocab_size], new_cache).
+
+        Mutates the cache structure (in spirit; returns a new dict). Decode
+        position bounded by block_size — wpe lookup goes OOB past that.
+        Caller should respect that bound.
+        """
+        B, T_new = token_id.shape
+        assert T_new == 1, f"forward_step expects single token, got T={T_new}"
+        pos_idx = cache["position"]
+        if pos_idx >= self.config.block_size:
+            raise ValueError(
+                f"decode position {pos_idx} >= block_size {self.config.block_size}; "
+                f"wpe lookup would go out of bounds. Cap max_new_tokens at "
+                f"block_size - prompt_len."
+            )
+
+        pos = torch.tensor([pos_idx], device=token_id.device)
+        x = self.drop(self.wte(token_id) + self.wpe(pos))  # [B, 1, d]
+
+        new_nmm_states = []
+        new_kv_caches = []
+        new_nmm_conv_buffers = []
+        for i, block in enumerate(self.blocks):
+            k_cache, v_cache = cache["kv_caches"][i]
+            x, nmm_state, k_cache, v_cache, conv_buf = block.forward_step(
+                x,
+                cache["nmm_states"][i],
+                k_cache,
+                v_cache,
+                cache["nmm_conv_buffers"][i],
+            )
+            new_nmm_states.append(nmm_state)
+            new_kv_caches.append((k_cache, v_cache))
+            new_nmm_conv_buffers.append(conv_buf)
+
+        x = self.ln_f(x)
+        logits = x @ self.wte.weight.T  # [B, 1, vocab_size]
+        new_cache = {
+            "last_logits": logits,
+            "nmm_states": new_nmm_states,
+            "kv_caches": new_kv_caches,
+            "nmm_conv_buffers": new_nmm_conv_buffers,
+            "position": pos_idx + 1,
+        }
+        return logits, new_cache
