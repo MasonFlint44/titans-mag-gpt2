@@ -90,16 +90,16 @@ Note: field is `swa_window`, **not** `window_size` (G126).
 |---|---|---|---|
 | `finetune_mode` | `bool` | `True` | Selects the MAG gate formula and `out_scale` init (see below) |
 
-## Paper-strict ablation flags (G254)
+## Paper-vs-lucidrains flags (G254)
 
 These flags expose two deliberate paper/lucidrains divergences as runtime
-config so paper-faithful experiments can be run side-by-side with the
-default lucidrains-flavored behavior. Defaults preserve current behavior.
+config. **Defaults prefer paper-strict** (G254 default-flip). Flip to
+`False` for lucidrains-flavored ablations.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `retrieval_from_M_prev` | `bool` | `False` | Paper Eq. 15: `y_t = M(q_t)` where M is M_{t-1} (read-then-write). Default `False` = lucidrains write-then-read (retrieve from freshly-updated M_t). Flip to `True` for paper-strict ordering. Applies to all NMM forward paths (`step`, `step_with_conv`, `_forward_chunk_sequential`, `_forward_chunk_scan`). |
-| `feed_persistent_to_nmm` | `bool` | `False` | Paper Eq. 28: `M(x̃)` where x̃ = `concat(persistent, x)`. Default `False` = NMM sees only real tokens (lucidrains-flavored). `True` = the block feeds `ln_nmm(x_aug)` to NMM, augments `doc_boundaries` with a False prefix (persistent positions never trigger resets), and slices the prefix off `y_mem` before the residual. |
+| `retrieval_from_M_prev` | `bool` | `True` (paper Eq. 15) | Paper Eq. 15: `y_t = M(q_t)` where M is M_{t-1} (read-then-write). Default `True` = paper-strict. Flip to `False` for lucidrains write-then-read (retrieve from freshly-updated M_t). Applies to all NMM forward paths (`step`, `step_with_conv`, `_forward_chunk_sequential`, `_forward_chunk_scan`). |
+| `feed_persistent_to_nmm` | `bool` | `True` (paper Eq. 28) | Paper Eq. 28: `M(x̃)` where x̃ = `concat(persistent, x)`. Default `True` = paper-strict — the block feeds `ln_nmm(x_aug)` to NMM, augments `doc_boundaries` with a False prefix (persistent positions never trigger resets), and slices the prefix off `y_mem` before the residual. Flip to `False` for lucidrains-flavored (NMM sees only real tokens). |
 
 ### `finetune_mode=True` (default, recommended for pretrained init)
 

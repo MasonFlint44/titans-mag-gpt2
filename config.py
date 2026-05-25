@@ -32,27 +32,27 @@ class TitansConfig:
     # Fine-tuning
     finetune_mode: bool = True
 
-    # Paper-strict ablation flags (defaults preserve current
-    # lucidrains-flavored behavior; flip to True for paper-faithful runs).
+    # Paper-strict vs lucidrains flags. Defaults PREFER PAPER for the two
+    # paper-vs-lucidrains divergences; single-head NMM is itself paper-
+    # aligned so the third flag's default also matches the paper. Flip
+    # to False to recover the lucidrains-flavored behavior for ablation.
     #
     # retrieval_from_M_prev: paper Eq. 15 specifies `y_t = M(q_t)` where M
-    #   is M_{t-1} (read-then-write). Our default (False) follows lucidrains:
-    #   retrieve from the freshly-updated M_t (write-then-read). True enables
-    #   the paper-strict ordering.
+    #   is M_{t-1} (read-then-write). Our default (True) is paper-strict.
+    #   Set False for lucidrains "write-then-read" (retrieve from M_t).
     #
     # feed_persistent_to_nmm: paper Eq. 28 specifies `M(x̃)` where x̃ = concat(
-    #   persistent, x). Our default (False) feeds only real tokens to the NMM
-    #   (persistent tokens are input-independent so memory updates on them
-    #   add noise; also avoids slicing the prefix from the NMM output). True
-    #   enables paper-strict input.
+    #   persistent, x). Our default (True) is paper-strict — feeds the
+    #   persistent-augmented input to NMM, slices the prefix off the output.
+    #   Set False for lucidrains-flavored "real tokens only" (NMM receives
+    #   ln_nmm(x), persistent tokens never influence the surprise update).
     #
-    # nmm_n_heads: NOT in the paper (lucidrains enhancement). When > 1, the
-    #   NMM is replaced by `n_heads` parallel NMMs each on `head_dim = n_embd
-    #   // n_heads`. Default 1 = single-head (current behavior). Must divide
-    #   n_embd. Exposed as a config flag for parity with attention's n_head
-    #   and for future ablations against the lucidrains reference.
-    retrieval_from_M_prev: bool = False
-    feed_persistent_to_nmm: bool = False
+    # nmm_n_heads: NOT in the paper proper (single-head implicit; multi-head
+    #   is a lucidrains enhancement). Default 1 = paper-aligned single-head.
+    #   Setting >1 instantiates `MultiHeadNMM` (lucidrains-style); must
+    #   divide n_embd.
+    retrieval_from_M_prev: bool = True
+    feed_persistent_to_nmm: bool = True
     nmm_n_heads: int = 1
 
     def __post_init__(self):

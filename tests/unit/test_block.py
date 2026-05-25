@@ -7,13 +7,16 @@ from config import TitansConfig
 from model.block import TitansMAGBlock
 
 
-def _cfg(finetune_mode=True, N_p=2, T=8, use_swa=False, n_embd=8, n_head=2):
+def _cfg(finetune_mode=True, N_p=2, T=8, use_swa=False, n_embd=8, n_head=2,
+         feed_persistent_to_nmm=True, retrieval_from_M_prev=True):
     return TitansConfig(
         n_layer=1, n_head=n_head, n_embd=n_embd, vocab_size=16,
         block_size=64, chunk_size=T, dropout=0.0,
         nmm_expansion=2, nmm_n_persistent=N_p,
         use_swa=use_swa,
         finetune_mode=finetune_mode,
+        feed_persistent_to_nmm=feed_persistent_to_nmm,
+        retrieval_from_M_prev=retrieval_from_M_prev,
     )
 
 
@@ -121,60 +124,73 @@ def _capture_nmm_forward_chunk_args(block):
     return captured
 
 
-def test_nmm_receives_only_real_tokens_not_persistent_augmented():
-    """T12 — block.forward(x) where x has T real tokens must call
-    nmm.forward_chunk with a [B, T, d] tensor — NOT [B, T+N_p, d].
-    A refactor that accidentally passes x_aug (with persistent prefix
-    concatenated) would silently train the NMM on persistent-prefix-
-    augmented inputs, contaminating the meta-learned init.
+def test_nmm_receives_only_real_tokens_when_feed_persistent_flag_is_False():
+    """T12 (lucidrains-flavored branch) — with `feed_persistent_to_nmm=False`,
+    block.forward(x) where x has T real tokens calls nmm.forward_chunk with
+    a [B, T, d] tensor — NOT [B, T+N_p, d].
 
-    Spec from TEST_PLAN.md §4: "patch nmm.forward_chunk to record
-    x.shape[1]; verify T (real tokens), not T + N_p".
+    This is the lucidrains-flavored behavior. The DEFAULT (post-G254 default
+    flip) is feed_persistent_to_nmm=True, where the block feeds [B, T+N_p, d]
+    (paper Eq. 28) — verified by the complementary test below.
+
+    Spec from TEST_PLAN.md §4 + G254: "patch nmm.forward_chunk to record
+    x.shape[1]; verify T (real tokens) when flag False, T+N_p when True".
     """
-    cfg = _cfg(N_p=4, T=6)  # N_p=4 persistent, T=6 real
+    cfg = _cfg(N_p=4, T=6, feed_persistent_to_nmm=False)
     block = TitansMAGBlock(cfg)
     captured = _capture_nmm_forward_chunk_args(block)
     state = block.nmm.init_state(B=2, device=torch.device("cpu"))
-    x = torch.randn(2, 6, 8)  # B=2, T=6, d=8
+    x = torch.randn(2, 6, 8)
 
     _ = block(x, nmm_state=state)
 
-    assert len(captured) == 1, f"expected exactly 1 forward_chunk call, got {len(captured)}"
     args, kwargs = captured[0]
-    # First positional arg is the input tensor.
     x_to_nmm = args[0]
     assert x_to_nmm.shape == (2, 6, 8), (
         f"nmm.forward_chunk received shape {tuple(x_to_nmm.shape)}, expected "
-        f"(2, 6, 8). If shape[1] == 10 (= T + N_p = 6 + 4), the block is "
-        f"passing the persistent-augmented x_aug instead of x."
+        f"(2, 6, 8) under feed_persistent_to_nmm=False."
     )
 
 
-def test_nmm_forward_chunk_called_with_doc_boundaries_arg():
-    """T13 — block.forward(x, nmm_state, doc_boundaries=db) must pass
-    `db` through to nmm.forward_chunk as its third argument. A regression
-    that drops the doc_boundaries arg (`forward_chunk(x_norm, state)`
-    instead of 3 args) would silently disable within-chunk state resets.
+def test_nmm_receives_persistent_augmented_when_feed_persistent_flag_is_True():
+    """T12 (paper-strict branch, post-G254 default) — with
+    `feed_persistent_to_nmm=True` (the new default), the NMM sees the
+    persistent-augmented input [B, T+N_p, d] per paper Eq. 28."""
+    cfg = _cfg(N_p=4, T=6, feed_persistent_to_nmm=True)
+    block = TitansMAGBlock(cfg)
+    captured = _capture_nmm_forward_chunk_args(block)
+    state = block.nmm.init_state(B=2, device=torch.device("cpu"))
+    x = torch.randn(2, 6, 8)
 
-    Spec from TEST_PLAN.md §4: "NMM called with 3 args — `forward_chunk(
-    x_norm, state, doc_boundaries)`, not 2".
+    _ = block(x, nmm_state=state)
+
+    args, kwargs = captured[0]
+    x_to_nmm = args[0]
+    assert x_to_nmm.shape == (2, 10, 8), (
+        f"nmm.forward_chunk received shape {tuple(x_to_nmm.shape)}, expected "
+        f"(2, 10, 8) under feed_persistent_to_nmm=True (= T + N_p = 6 + 4)."
+    )
+
+
+def test_nmm_forward_chunk_called_with_doc_boundaries_arg_lucidrains_branch():
+    """T13 (lucidrains-flavored branch) — with `feed_persistent_to_nmm=False`,
+    block.forward(x, nmm_state, doc_boundaries=db) passes `db` VERBATIM to
+    nmm.forward_chunk as its third argument. (Under the paper-strict default
+    feed_persistent_to_nmm=True, db is augmented with N_p False entries —
+    covered by the next test.)
     """
-    cfg = _cfg(N_p=2, T=6)
+    cfg = _cfg(N_p=2, T=6, feed_persistent_to_nmm=False)
     block = TitansMAGBlock(cfg)
     captured = _capture_nmm_forward_chunk_args(block)
     state = block.nmm.init_state(B=2, device=torch.device("cpu"))
     x = torch.randn(2, 6, 8)
     db = torch.zeros(2, 6, dtype=torch.bool)
     db[0, 0] = True
-    db[1, 3] = True  # mid-chunk boundary — would be ignored if dropped
+    db[1, 3] = True
 
     _ = block(x, nmm_state=state, doc_boundaries=db)
 
-    assert len(captured) == 1
     args, kwargs = captured[0]
-    # forward_chunk's signature: (x_chunk, state_in, doc_boundaries). The
-    # block could pass these as positional OR mix; check that doc_boundaries
-    # reaches the call by reconstructing the value.
     all_call_values = list(args) + list(kwargs.values())
     db_seen = any(
         isinstance(v, torch.Tensor) and v.dtype == torch.bool
@@ -182,10 +198,49 @@ def test_nmm_forward_chunk_called_with_doc_boundaries_arg():
         for v in all_call_values
     )
     assert db_seen, (
-        f"nmm.forward_chunk was NOT called with the doc_boundaries tensor "
-        f"the caller passed. Args seen: {[type(a).__name__ for a in args]}, "
-        f"kwargs: {list(kwargs.keys())}. The block must thread doc_boundaries "
-        f"through to nmm.forward_chunk."
+        f"nmm.forward_chunk was NOT called with the verbatim doc_boundaries "
+        f"under feed_persistent_to_nmm=False. Args: {[type(a).__name__ for a in args]}, "
+        f"kwargs: {list(kwargs.keys())}."
+    )
+
+
+def test_nmm_forward_chunk_called_with_augmented_doc_boundaries_paper_branch():
+    """T13 (paper-strict branch, post-G254 default) — with
+    `feed_persistent_to_nmm=True` the block augments doc_boundaries with
+    N_p False entries at the front (persistent positions never trigger doc
+    resets). NMM receives a [B, N_p + T] bool tensor whose first N_p columns
+    are all False and whose tail matches the caller's db."""
+    N_p, T = 2, 6
+    cfg = _cfg(N_p=N_p, T=T, feed_persistent_to_nmm=True)
+    block = TitansMAGBlock(cfg)
+    captured = _capture_nmm_forward_chunk_args(block)
+    state = block.nmm.init_state(B=2, device=torch.device("cpu"))
+    x = torch.randn(2, T, 8)
+    db = torch.zeros(2, T, dtype=torch.bool)
+    db[0, 0] = True
+    db[1, 3] = True
+
+    _ = block(x, nmm_state=state, doc_boundaries=db)
+
+    args, kwargs = captured[0]
+    all_call_values = list(args) + list(kwargs.values())
+    # Find the augmented db: [B, N_p + T] bool, prefix False, tail == db.
+    matched = None
+    for v in all_call_values:
+        if (isinstance(v, torch.Tensor) and v.dtype == torch.bool
+                and v.shape == (2, N_p + T)):
+            matched = v
+            break
+    assert matched is not None, (
+        f"nmm.forward_chunk did not receive the augmented doc_boundaries "
+        f"[{2}, {N_p + T}] under feed_persistent_to_nmm=True."
+    )
+    assert not matched[:, :N_p].any(), (
+        f"augmented doc_boundaries prefix should be all False (persistent "
+        f"positions never trigger resets); got non-False entries in [:, :{N_p}]."
+    )
+    assert torch.equal(matched[:, N_p:], db), (
+        "tail of augmented doc_boundaries does not match the caller's db."
     )
 
 

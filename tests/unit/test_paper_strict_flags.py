@@ -41,10 +41,11 @@ def _nmm(retrieval_from_M_prev=False, n_embd=8):
     )
 
 
-def test_retrieval_from_M_prev_default_is_False():
-    """Default config preserves the lucidrains write-then-read behavior."""
+def test_retrieval_from_M_prev_default_is_True():
+    """Post-G254-default-flip: default config prefers paper Eq. 15 (read-
+    then-write). Flip to False for lucidrains-flavored write-then-read."""
     cfg = TitansConfig()
-    assert cfg.retrieval_from_M_prev is False
+    assert cfg.retrieval_from_M_prev is True
 
 
 def test_step_retrieval_from_M_prev_differs_from_default():
@@ -147,9 +148,12 @@ def _cfg_feed_persistent(feed):
     )
 
 
-def test_feed_persistent_to_nmm_default_is_False():
+def test_feed_persistent_to_nmm_default_is_True():
+    """Post-G254-default-flip: default config prefers paper Eq. 28 (NMM
+    sees x̃, the persistent-augmented input). Flip to False for lucidrains-
+    flavored real-tokens-only NMM input."""
     cfg = TitansConfig()
-    assert cfg.feed_persistent_to_nmm is False
+    assert cfg.feed_persistent_to_nmm is True
 
 
 def test_block_feed_persistent_flag_propagates_to_attribute():

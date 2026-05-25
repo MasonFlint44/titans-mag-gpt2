@@ -160,11 +160,18 @@ def test_scan_implementation_matches_M0_approx_sequential_exactly():
         alpha = torch.sigmoid(nmm.W_alpha(x)).squeeze(-1)
         y_list = []
         for t in range(x.shape[1]):
+            # Capture M_prev BEFORE the update — the scan honors the model
+            # config's `retrieval_from_M_prev`; our manual reference must
+            # mirror that branch to keep the parity invariant valid.
+            M_prev = {k: v.clone() for k, v in M.items()}
             g = nmm.per_sample_grad_fn(M0, k_hat[:, t, :], v_arr[:, t, :])
             g_tilde = {key: newton_schulz5(val) for key, val in g.items()}
             S = _dict_sub(_scale(eta[:, t], S), _scale(theta[:, t], g_tilde))
             M = _dict_add(_scale(1 - alpha[:, t], M), S)
-            y_t = nmm.out_scale * nmm._batched_retrieve(M, q_hat[:, t, :])
+            M_for_retrieval = M_prev if nmm.retrieval_from_M_prev else M
+            y_t = nmm.out_scale * nmm._batched_retrieve(
+                M_for_retrieval, q_hat[:, t, :],
+            )
             y_list.append(y_t)
         y_ref = torch.stack(y_list, dim=1)
 

@@ -3804,3 +3804,25 @@ Initial audit response misclassified #3 as paper-strict; it is actually a lucidr
   - All three flags set simultaneously: full forward + backward + finite logits + grads on every head.
 
 **Affects:** `config.py` (3 new fields + validation); `model/nmm.py` (`retrieval_from_M_prev` arg on `NeuralMemoryModule`; modified `step`, `step_with_conv`, `_forward_chunk_sequential`, `_forward_chunk_scan`; new `MultiHeadNMM` class; recursive `detach_states` via `_detach_per_layer`); `model/block.py` (block instantiates `NeuralMemoryModule` or `MultiHeadNMM` based on `nmm_n_heads`; `feed_persistent_to_nmm` branch in `forward` and `init_decode_cache`); `model/titans_gpt2.py` (G244 batch-dim validator handles nested state); `train.py` (recursive `compute_nmm_norm` via `_layer_norm_M`); `ARCHITECTURE.md` 3 design-decisions rows updated to mention the flag-controllable nature; `CONFIG_REFERENCE.md` new "Paper-strict ablation flags" section + `nmm_n_heads` row.
+
+### G255 — Flip defaults of `retrieval_from_M_prev` and `feed_persistent_to_nmm` to True (prefer paper over lucidrains)
+
+**Found:** User request after G254 review — "the defaults should prefer the paper implementation over lucidrains".
+**Symptom:** G254 added the three flags with defaults preserving the existing lucidrains-flavored behavior (`retrieval_from_M_prev=False`, `feed_persistent_to_nmm=False`, `nmm_n_heads=1`). A new user building a model with `TitansConfig()` would get the lucidrains-flavored variant, which silently differs from the TITANS paper at two equations (Eq. 15 and Eq. 28). The intent of having ablation flags is to let users opt INTO the alternative; the default should be the paper.
+**Root cause:** G254 conservatism — wanted zero behavior change to the existing test suite, so picked lucidrains as the default. The right call for a new project is to default to the published spec and let users opt out, not the other way around.
+**Fix:** Flipped two defaults in `config.py`:
+  - `retrieval_from_M_prev: bool = False` → `True` (paper Eq. 15: read M_{t-1}, then write).
+  - `feed_persistent_to_nmm: bool = False` → `True` (paper Eq. 28: M(x̃)).
+  - `nmm_n_heads: int = 1` — UNCHANGED. Single-head IS the paper-aligned default; multi-head is itself a lucidrains enhancement. Default 1 already prefers paper here.
+
+Five tests broke and were updated:
+  1. `test_scan_implementation_matches_M0_approx_sequential_exactly` — the manual M_0-approx reference was hardcoded write-then-read; updated to honor `nmm.retrieval_from_M_prev` (captures `M_prev` before each step's update, retrieves from it when the flag is True).
+  2. `test_nmm_receives_only_real_tokens_not_persistent_augmented` → renamed `..._when_feed_persistent_flag_is_False` and given an explicit `feed_persistent_to_nmm=False`; added complementary `test_nmm_receives_persistent_augmented_when_feed_persistent_flag_is_True` for the new default (verifies NMM sees [B, T+N_p, d]).
+  3. `test_nmm_forward_chunk_called_with_doc_boundaries_arg` → renamed `..._lucidrains_branch` with explicit `feed_persistent_to_nmm=False`; added `..._augmented_doc_boundaries_paper_branch` for the new default (verifies the augmented [B, N_p+T] db has all-False prefix and tail == caller's db).
+  4. `test_retrieval_from_M_prev_default_is_False` → `test_retrieval_from_M_prev_default_is_True`.
+  5. `test_feed_persistent_to_nmm_default_is_False` → `test_feed_persistent_to_nmm_default_is_True`.
+
+All other tests (incl. the entire HF-parity, decode-parity, train-loop, perplexity, and behavior suites) pass unchanged — the defaults change semantically but the existing tests either (a) construct configs that override the flags explicitly, or (b) test invariants that hold under both branches (e.g., shape correctness, gradient flow, eval-mode guards).
+
+**Test:** Full suite 430 → 432 tests passing (+2 from the new "paper branch" complementary tests on T12 / T13).
+**Affects:** `config.py` (2 default flips, comment block rewritten); `tests/unit/test_block.py` (T12 and T13 split into "lucidrains branch" + "paper branch" tests; `_cfg` helper gained `feed_persistent_to_nmm` and `retrieval_from_M_prev` kwargs); `tests/unit/test_paper_strict_flags.py` (default-assertion tests renamed); `tests/integration/test_scan_dispatcher.py` (manual reference made flag-aware); `ARCHITECTURE.md` two rows updated to mark paper-strict as DEFAULT; `CONFIG_REFERENCE.md` "Paper-strict ablation flags" section retitled and defaults updated.
