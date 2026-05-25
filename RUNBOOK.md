@@ -194,13 +194,12 @@ Look for "Active memory" — if it's much larger than "Allocated memory" expecta
 
 3. **From-scratch model with `chunk_size < block_size`.** Untrained wpe rows beyond `chunk_size` silently degrade long-context generation. The config emits a `warnings.warn` for this case — check the run logs.
 
-4. **NMM sliding-window reprocessing during generation.** `generate.py` re-feeds the entire `block_size` window through the NMM at every decoded token. State updates compound by ~`block_size` per generated token, drifting M far from its trained regime. The longer the generation, the worse the drift. The correct architecture is KV-cache attention + single-token `step()` for the NMM; this repo's v1 does not have it. See the LOUD WARNING comment in `generate.py:generate`.
+4. **(FIXED in v2 via Option B — KV cache + `step_with_conv` for NMM.)** Previously `generate.py` re-fed the entire `block_size` window through the NMM at every decoded token, compounding state updates ~`block_size`× per generated token. The current `generate.py` uses `model.prepare_decode` + `model.forward_step`: each decoded token gets exactly one NMM update via `step_with_conv` (full k-token conv context via a conv buffer) and one attention pass via KV cache. Per-step decode cost is now O(1) for NMM and O(T) for attention, matching standard transformer decoding. If you're debugging older checkpoints/scripts that still re-feed the window, port to the new entry points or accept the drift.
 
 ### Fix
-- Implement (or verify) the conv-window mitigation in `generate.step()`.
-- Chunk long prompts through the model — never feed >`block_size` tokens in one forward.
+- Chunk long prompts through the model — never feed >`block_size` tokens in one forward (the new `generate.py` handles this automatically via the chunked warm-up path).
 - For from-scratch runs intended for long context, set `chunk_size = block_size`.
-- For #4, mitigations a user can apply WITHOUT a code change: cap `max_new_tokens`, or keep `out_scale` small so the NMM contribution stays bounded even when M has drifted. The proper fix is a KV cache + `step()`-based NMM update.
+- For #1's conv-window limitation, the new `NMM.step_with_conv` + per-step conv buffer mitigates it at decode time — the conv now sees a full k-token window via the buffer.
 
 ---
 

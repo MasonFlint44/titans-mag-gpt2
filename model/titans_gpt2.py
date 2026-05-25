@@ -109,7 +109,11 @@ class TitansMAGGPT2(nn.Module):
         logits = x @ self.wte.weight.T  # tied weights
         return logits, new_nmm_states
 
-    def prepare_decode(self, prompt_idx: torch.Tensor) -> dict:
+    def prepare_decode(
+        self,
+        prompt_idx: torch.Tensor,
+        initial_nmm_states=None,
+    ) -> dict:
         """Warm up on a prompt, return the full DecodeCache for forward_step.
 
         Runs forward() over the prompt (NMM gets exactly one update per
@@ -119,6 +123,9 @@ class TitansMAGGPT2(nn.Module):
         persistent prefix at positions 0..N_p-1.
 
         prompt_idx: [B, P] token ids. P must be <= block_size.
+        initial_nmm_states: optional list[n_layer] of (M, S) — for long
+        prompts where an earlier chunked warm-up established NMM state
+        that this prepare_decode call should continue from.
 
         Returns dict:
           last_logits:  [B, 1, vocab_size]
@@ -138,9 +145,12 @@ class TitansMAGGPT2(nn.Module):
         pos = torch.arange(0, P, device=prompt_idx.device)
         x = self.drop(self.wte(prompt_idx) + self.wpe(pos))
 
-        nmm_states = [
-            block.nmm.init_state(B, prompt_idx.device) for block in self.blocks
-        ]
+        if initial_nmm_states is None:
+            nmm_states = [
+                block.nmm.init_state(B, prompt_idx.device) for block in self.blocks
+            ]
+        else:
+            nmm_states = list(initial_nmm_states)
         kv_caches = []
         nmm_conv_buffers = []
         for block, nmm_state in zip(self.blocks, nmm_states):

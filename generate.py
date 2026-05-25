@@ -1,4 +1,20 @@
-"""Autoregressive generation with chunked prompt warm-up and conv-window mitigation."""
+"""Autoregressive generation via KV-cache attention + single-token NMM step.
+
+Option B from the audit: each decoded token gets exactly ONE NMM update
+(matching the TITANS spec) instead of re-feeding the full sliding window
+through the NMM at every step (the old behavior). See PLAN.md §5.1 +
+RUNBOOK.md "Long-context generation drift" §4.
+
+Pipeline:
+  1. prepare_decode: chunked warm-up on the prompt (existing forward_chunk
+     for the NMM; KV cache + conv buffer captured at the end).
+  2. Decode loop: for each new token, call model.forward_step — one NMM
+     update via step_with_conv (full k-token conv context), one attention
+     pass via KV cache.
+
+Bounded by block_size: total tokens (prompt + generated) <= block_size,
+because GPT-2's wpe table only covers positions 0..block_size-1.
+"""
 
 import torch
 import torch.nn.functional as F
@@ -15,23 +31,20 @@ def generate(
     top_k: int = 50,
     tokenizer: Tokenizer = None,
 ) -> str:
-    """Autoregressive sampling. Carries NMM state across calls so test-time
-    learning accumulates across the full generation.
+    """Autoregressive sampling using KV-cache + single-token NMM step.
 
-    Sampling order is: temperature scale -> top-k mask -> softmax -> multinomial
-    (G173). Top-k AFTER softmax requires manual renormalization and is a
-    common silent bug. Temperature <= 0 collapses to argmax.
+    Sampling order: temperature -> top-k mask -> softmax -> multinomial (G173).
+    Temperature <= 0 collapses to argmax.
 
-    For prompts longer than block_size, the warm-up runs in block_size-sized
-    chunks (G176) — truncating to `[-block_size:]` would silently drop the
-    long-context prefix that the NMM is supposed to memorize. wpe(pos) wraps
-    per chunk so positions stay in-bounds.
+    `tokenizer` is optional (G208); pass the same Tokenizer instance used
+    at training/eval time to avoid reproducibility drift.
 
-    `tokenizer` is optional (G208); pass the same Tokenizer instance used at
-    training/eval time to avoid reproducibility drift between train and gen.
+    Mode is captured-and-restored via try/finally (G161).
 
-    Mode is captured-and-restored via try/finally (G161) so an enclosing
-    training loop continues in train mode regardless of what this helper saw.
+    max_new_tokens is capped to `block_size - prompt_len` because the
+    KV-cache decode path uses absolute positions for wpe and would go OOB
+    past block_size. For longer generation you'd need RoPE or extrapolation
+    (not implemented).
     """
     was_training = model.training
     model.eval()
@@ -45,18 +58,36 @@ def generate(
         ).unsqueeze(0)
 
         block_size = model.config.block_size
-        nmm_states = None
-
-        # Chunked warm-up so the NMM sees the full prompt, not just the tail.
         prompt_len = context_ids.size(1)
-        for start in range(0, prompt_len, block_size):
-            end = min(start + block_size, prompt_len)
-            chunk = context_ids[:, start:end]
-            logits, nmm_states = model(chunk, nmm_states, None)
-        next_logits = logits[:, -1, :]
+
+        if prompt_len > block_size:
+            # Long-prompt path (G176): NMM sees the full prompt; KV cache
+            # holds only the last block_size tokens (wpe table is bounded).
+            # Chunk the prefix through forward() so the NMM accumulates
+            # state, then prepare_decode on the tail with that state.
+            tail_start = prompt_len - block_size
+            nmm_states = None
+            for start in range(0, tail_start, block_size):
+                end = min(start + block_size, tail_start)
+                chunk = context_ids[:, start:end]
+                _, nmm_states = model(chunk, nmm_states, None)
+            tail = context_ids[:, tail_start:]
+            cache = model.prepare_decode(tail, initial_nmm_states=nmm_states)
+            # Position in cache is block_size; KV cache holds block_size
+            # real positions + N_p persistent. forward_step would go OOB on
+            # wpe immediately. The user can sample at most ONE new token
+            # from the cache's last_logits (which IS valid for the position
+            # immediately AFTER block_size - 1, the last prompt token); any
+            # further generation requires shortening the prompt.
+            max_new = 1 if max_new_tokens >= 1 else 0
+        else:
+            # Single-shot warm-up.
+            cache = model.prepare_decode(context_ids)
+            max_new = min(max_new_tokens, block_size - prompt_len)
+        next_logits = cache["last_logits"].squeeze(1)  # [B, vocab]
 
         generated = []
-        for _ in range(max_new_tokens):
+        for i in range(max_new):
             if temperature <= 0:
                 next_token = next_logits.argmax(dim=-1, keepdim=True)
             else:
@@ -71,26 +102,13 @@ def generate(
             if next_token.item() == tok.eot_token:
                 break
 
-            context_ids = torch.cat([context_ids, next_token], dim=1)
-            window = context_ids[:, -block_size:]
-            # !!! KNOWN LIMITATION: sliding-window NMM reprocessing !!!
-            # Every decoded token re-feeds the ENTIRE window through the
-            # NMM, which compounds state updates by ~block_size per
-            # generated token. After N generated tokens, M has absorbed
-            # ~N*block_size token-worth of updates instead of N+prompt_len.
-            # State magnitude drifts away from the train-time regime fast
-            # — generation quality (especially the NMM's contribution)
-            # degrades.
-            #
-            # The correct architecture is a KV cache for attention + a
-            # single-token step() for the NMM each decode iter. This
-            # repo's v1 does NOT have that. Mitigations a user can apply:
-            #   - cap max_new_tokens
-            #   - set out_scale near 0 (or finetune_mode=True) so NMM
-            #     contribution stays small even with drifted M
-            #   - implement KV cache (substantial change to attn forward)
-            logits, nmm_states = model(window, nmm_states, None)
-            next_logits = logits[:, -1, :]
+            # No need to run forward_step on the LAST iteration — we already
+            # have the sampled token, no next_logits needed. Saves one
+            # NMM update + attention call. Also guards against OOB wpe when
+            # the long-prompt path has already pushed position to block_size.
+            if i + 1 < max_new and cache["position"] < block_size:
+                new_logits, cache = model.forward_step(next_token, cache)
+                next_logits = new_logits.squeeze(1)
 
         return tok.decode(generated)
     finally:

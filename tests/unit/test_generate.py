@@ -91,36 +91,50 @@ def test_generate_constructs_default_tokenizer_when_none_passed():
 # ---------------------------------------------------------------------------
 
 def test_generate_chunks_long_prompts_through_NMM():
-    """For prompt_len > block_size, the warm-up loop must run multiple times
-    (one per chunk). Truncating to [-block_size:] would drop everything before
-    the tail. Verify the call pattern via a forward-call counter."""
+    """G176 — for prompt_len > block_size, the full prompt is processed
+    (no [-block_size:] truncation). The new cached-decode generate splits
+    this into:
+      - model.forward() calls for the prefix [0 .. prompt_len - block_size]
+      - model.prepare_decode() once for the final block_size tail
+    Verify both call counts so the total covers the full prompt."""
     cfg, model = _tiny_model_real_vocab()
     model.eval()
     tok = Tokenizer()
 
-    # Build a prompt that tokenizes to >2 * block_size = >64 tokens.
-    long_prompt = "the quick brown fox jumps over the lazy dog " * 50  # ~450 chars
+    long_prompt = "the quick brown fox jumps over the lazy dog " * 50
     prompt_ids_len = len(tok.encode(long_prompt))
-    assert prompt_ids_len > 2 * cfg.block_size  # confirm test setup
+    assert prompt_ids_len > 2 * cfg.block_size
 
-    call_count = {"n": 0}
+    fwd_calls = {"n": 0}
+    prep_calls = {"n": 0}
     orig_forward = model.forward
+    orig_prep = model.prepare_decode
 
-    def counting(*args, **kwargs):
-        call_count["n"] += 1
+    def counting_forward(*args, **kwargs):
+        fwd_calls["n"] += 1
         return orig_forward(*args, **kwargs)
 
-    model.forward = counting
+    def counting_prep(*args, **kwargs):
+        prep_calls["n"] += 1
+        return orig_prep(*args, **kwargs)
 
-    # max_new_tokens=1 so the bulk of model() calls come from warm-up.
+    model.forward = counting_forward
+    model.prepare_decode = counting_prep
+
     _ = generate(model, long_prompt, max_new_tokens=1, top_k=10, tokenizer=tok)
-    # Warm-up alone needs ceil(prompt_ids_len / block_size) calls.
-    expected_warmup_calls = (prompt_ids_len + cfg.block_size - 1) // cfg.block_size
-    # +1 for the post-sample model() call inside the generation loop.
-    assert call_count["n"] >= expected_warmup_calls, (
-        f"only {call_count['n']} forward calls; expected >= "
-        f"{expected_warmup_calls} chunked-warm-up calls for "
-        f"prompt_len={prompt_ids_len}, block_size={cfg.block_size}"
+
+    # Total chunks covering the prompt = ceil(prompt_len / block_size).
+    # The final chunk goes through prepare_decode (always 1 call); the
+    # earlier ones go through forward() (one per block_size).
+    expected_total = (prompt_ids_len + cfg.block_size - 1) // cfg.block_size
+    actual_total = fwd_calls["n"] + prep_calls["n"]
+    assert prep_calls["n"] == 1, (
+        f"prepare_decode should fire once for the warm-up; got {prep_calls['n']}"
+    )
+    assert actual_total >= expected_total, (
+        f"only {actual_total} prompt-chunk passes (forward={fwd_calls['n']} + "
+        f"prepare_decode={prep_calls['n']}); expected >= {expected_total} "
+        f"for prompt_len={prompt_ids_len}, block_size={cfg.block_size}"
     )
 
 

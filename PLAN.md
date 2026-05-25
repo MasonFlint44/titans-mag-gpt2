@@ -3582,24 +3582,28 @@ generation quality for the NMM projections. Mitigations:
 Default implementation: sliding-window approach (correctness over efficiency). The NMM
 state carries memory across the full generation, not just the window.
 
-**NMM reprocessing limitation (known)**: The sliding-window approach has a subtle
-correctness issue for the NMM. When generating token t+1, we call `model.forward`
-with the window `[tokens 0..t]` and carry the NMM state from the previous step.
-But the previous step already processed tokens `[0..t-1]` through the NMM and updated
-the state; now we process those same tokens again in this new call. Each old token
-accumulates extra NMM updates at every subsequent generation step — a form of
-double-counting that grows with each generated token.
+**NMM reprocessing limitation — FIXED (Phase 7, Option B)**: The original
+v1 implementation re-fed the full sliding window through the NMM at every
+decoded token, compounding state updates ~`block_size`× per token. The
+current implementation uses `prepare_decode` + `forward_step`:
+- `prepare_decode` warms up on the prompt (NMM gets one update per prompt
+  token via `forward_chunk`) and captures `(k_cache, v_cache,
+  nmm_conv_buffer)` per block.
+- `forward_step` does single-token decode: KV-cache attention against the
+  cached `K, V` and `NMM.step_with_conv` for exactly one NMM update with
+  the full k-token conv context (via the conv buffer).
 
-The root cause: attention wants the full window context but NMM should process each
-token exactly once. Reconciling these requires KV-cached attention + `step()` for the
-single new token only:
-```
-attention: look up KV cache for old tokens + compute KV for new token
-NMM:       call step(new_token, nmm_state) — exactly one new update
-```
-This is the correct architecture for generation but requires implementing a KV cache.
-For a first version, the sliding-window reprocessing is an acknowledged approximation.
-Document the discrepancy in comments at the `model.forward` call site in `generate.py`.
+The behavior parity test
+`tests/behavior/test_cached_generate_parity.py::test_cached_argmax_decode_matches_reset_and_replay_reference`
+locks in the equivalence: cached argmax-decode produces the same token
+sequence as a reset-and-replay reference.
+
+Long prompts (`prompt_len > block_size`): `generate.py` chunks the prefix
+through `forward()` to accumulate NMM state, then calls
+`prepare_decode(tail, initial_nmm_states=...)` on the last `block_size`
+tokens. Only 1 token can then be sampled from the cache's `last_logits`
+before hitting the position bound; longer generation from long prompts
+would need RoPE or position extrapolation (not implemented).
 
 **Done:** produces non-degenerate (non-repeating) output from a GPT-2 prompt; perplexity
 on a held-out set matches eval.py to within 0.5 bits/char (verifying correct position
