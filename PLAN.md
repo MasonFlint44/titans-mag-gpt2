@@ -3845,8 +3845,29 @@ def forward_chunk(self, x_chunk, state_in, doc_boundaries):
 This is the approximation (gradients at M_0 not M_{t-1}), but it is the practical
 approach. The S_0/M_0 incorporation from state_in is required for cross-chunk continuity.
 
-**Done:** scan output approximates sequential reference; max relative error < 5% on
-a random sequence, monotonically decreasing with shorter chunk_size.
+**Done:** two verifiable invariants (G232):
+
+1. **Implementation correctness:** scan output matches "sequential with all
+   gradients computed at M_0" exactly (bit-exact within fp32 noise). This is
+   the scan's contract and verifiable on any model regardless of training
+   state — `test_scan_implementation_matches_M0_approx_sequential_exactly`
+   locks it in.
+
+2. **Chunk-size monotonicity:** the relative error vs true sequential
+   (gradients at `M_{t-1}`, not `M_0`) is 0 at `T=1` and grows
+   monotonically with `T` — defended by
+   `tests/behavior/test_scan_vs_sequential_trained.py`.
+
+The originally-claimed "<5% on any sequence" tightness bound is NOT a
+property of the scan implementation; it depends on the inner-loop
+dynamics (θ/η/α gate magnitudes, k̂/v̂ structure) and varies with
+training stage. At random Xavier init, the gap can be 60–90% per chunk.
+Empirically, brief synthetic training can make the gap GROW because
+θ/η/α move away from sigmoid(~0)≈0.5 into more variable values that
+produce larger per-step M drift. Treat the scan as an inference-only
+speed optimization whose accuracy is workload-specific; the tightness
+should be re-measured on the actual target distribution rather than
+assumed from this Done condition.
 
 ### 6.2 Integrate with `torch.associative_scan`
 Replace the Python loop in `forward_chunk` with `torch.associative_scan`.
