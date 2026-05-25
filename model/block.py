@@ -46,6 +46,61 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_dropout(self.proj(y))
 
+    def project_kv(self, x: torch.Tensor) -> tuple:
+        """Project x into (K, V) tensors shaped [B, n_head, T, head_dim].
+
+        Used to seed the KV cache during warm-up: caller runs ln_1(x_aug),
+        passes that here, gets the K, V that the attention would have used,
+        stores them. No attention is computed — that runs separately during
+        the warm-up forward.
+        """
+        B, T, C = x.shape
+        n, d = self.n_head, self.head_dim
+        k = self.k_proj(x).view(B, T, n, d).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, n, d).transpose(1, 2)
+        return k, v
+
+    def forward_with_kv_cache(
+        self,
+        x_new: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+    ) -> tuple:
+        """Decode-path attention: project a single new token's Q/K/V,
+        append the new K, V to the cache, run SDPA with Q against the
+        full cached K, V.
+
+        x_new: [B, 1, C] — the new token's pre-attention input (already
+        ln_1-normalized by the caller).
+        k_cache, v_cache: [B, n_head, T_seen, head_dim] — prior K, V.
+
+        Returns (y [B, 1, C], new_k_cache, new_v_cache).
+
+        No mask is needed: the new token attends to everything in the
+        cache (all of which is in its causal past or is a persistent
+        token, both of which it's allowed to see). dropout_p=0 because
+        decode is inference-time.
+        """
+        B, T_new, C = x_new.shape
+        assert T_new == 1, f"forward_with_kv_cache expects T=1, got T={T_new}"
+        n, d = self.n_head, self.head_dim
+
+        q = self.q_proj(x_new).view(B, 1, n, d).transpose(1, 2)  # [B, n, 1, d]
+        k_new = self.k_proj(x_new).view(B, 1, n, d).transpose(1, 2)
+        v_new = self.v_proj(x_new).view(B, 1, n, d).transpose(1, 2)
+
+        # Append to cache along the T dim.
+        k_full = torch.cat([k_cache, k_new], dim=2)  # [B, n, T_seen + 1, d]
+        v_full = torch.cat([v_cache, v_new], dim=2)
+
+        y = F.scaled_dot_product_attention(
+            q, k_full, v_full, attn_mask=None, dropout_p=0.0
+        )
+        y = y.transpose(1, 2).contiguous().view(B, 1, C)
+        y = self.proj(y)
+        # resid_dropout at p=0 (eval) is a no-op; skip for clarity at decode.
+        return y, k_full, v_full
+
 
 class GPT2MLP(nn.Module):
     """Standard GPT-2 feedforward. Uses gelu approximate='tanh' (HF's gelu_new)
