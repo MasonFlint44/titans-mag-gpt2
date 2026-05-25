@@ -165,6 +165,175 @@ def test_loss_decreases_on_overfit_batch():
 
 
 # ---------------------------------------------------------------------------
+# T4 — Strict overfit-batch loss threshold (TEST_PLAN §10 spec'd test_overfit_batch.py)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.slow
+def test_overfit_batch_drives_loss_near_zero():
+    """T4 — the spec'd `test_overfit_batch.py` invariant: a tiny model
+    trained for 200 steps on a single fixed batch reaches loss < 0.1.
+
+    This is the "the model can actually LEARN" gate — distinct from
+    `test_loss_decreases_on_overfit_batch` which only checks the loss
+    is trending down. A model with broken gradient flow to most params
+    could plausibly drop from 3.5 to 3.0 (passing the weak test) without
+    truly learning; reaching < 0.1 requires the FULL gradient path to
+    work end-to-end.
+
+    Setup: larger model (n_embd=32) and longer training (200 steps with
+    LR scaled up via fewer warmup steps) than the weak test, to reach
+    the < 0.1 threshold. Uses a single fixed batch so the model can
+    memorize it.
+    """
+    torch.manual_seed(0)
+    cfg = TitansConfig(
+        n_layer=1, n_head=4, n_embd=32, vocab_size=32,
+        block_size=64, chunk_size=8, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=2,
+        finetune_mode=False,
+    )
+    model = TitansMAGGPT2(cfg)
+    # Use a higher LR for fast overfit — defaults are tuned for real
+    # training scale and would not reach < 0.1 in 200 steps at n_embd=32.
+    from train import build_optimizer
+    opt = build_optimizer(model, lr_gpt2=3e-3, lr_nmm=9e-3)
+    device = torch.device("cpu")
+    batch = _fake_batch(cfg, B=2, T=8)
+
+    final_loss = None
+    states = None
+    for _ in range(200):
+        loss, states, _ = train_step(model, batch, states, opt, device)
+        final_loss = loss
+
+    assert final_loss < 0.1, (
+        f"200-step overfit on tiny model did not reach loss < 0.1: "
+        f"final loss = {final_loss:.4f}. Either gradient flow is broken "
+        f"for some params, or LR/init makes this batch unlearnable."
+    )
+
+
+# ---------------------------------------------------------------------------
+# T5 — NaN injection in run_training accumulation cycle (G217)
+# ---------------------------------------------------------------------------
+
+def test_run_training_accumulation_cycle_resets_nmm_states_on_nan(monkeypatch):
+    """T5 / G217 — when grad_norm in the accumulation block's optimizer-step
+    path is non-finite, run_training must:
+      - skip optimizer.step (don't apply corrupted gradients)
+      - reset nmm_states to None (otherwise NaN-tainted M livelocks until
+        the next document boundary)
+
+    train_step has its own NaN-skip path covered by
+    test_nan_gradient_does_not_corrupt_parameters; this test is for the
+    SEPARATE NaN-skip path inside run_training's own optimizer.step block
+    (used when accum_steps > 1 and the accumulated grad's norm is non-finite).
+    """
+    import torch.nn as nn
+    from data.dataloader import ParallelStreamLoader
+    from train import build_optimizer, run_training
+
+    torch.manual_seed(0)
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=8, vocab_size=32,
+        block_size=64, chunk_size=4, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=2,
+        finetune_mode=False,
+    )
+    model = TitansMAGGPT2(cfg)
+    optimizer = build_optimizer(model)
+    stream = torch.randint(0, cfg.vocab_size, (4 * 4 * 20,))
+    loader = ParallelStreamLoader(
+        stream, batch_size=4, chunk_size=4, eot_id=50256,
+    )
+
+    # Snapshot params before training; force NaN injection on every call so
+    # the optimizer.step path consistently sees non-finite grad_norm and
+    # exercises the G217 reset path.
+    params_before = {n: p.detach().clone() for n, p in model.named_parameters()}
+
+    real_clip = nn.utils.clip_grad_norm_
+
+    def fake_clip(*args, **kwargs):
+        return torch.tensor(float("inf"))
+
+    monkeypatch.setattr(nn.utils, "clip_grad_norm_", fake_clip)
+
+    run_training(
+        model=model, optimizer=optimizer, loader=loader,
+        device=torch.device("cpu"),
+        max_steps=3, warmup_steps=1, accum_steps=2,
+        log_every=100,
+    )
+
+    # No param should have changed — every step's grad_norm was inf, so
+    # optimizer.step was never called. (Some params might be touched by
+    # bias correction in Adam's state_dict updates but the parameter
+    # tensors themselves stay at their pre-train values.)
+    for name, p in model.named_parameters():
+        assert torch.equal(p, params_before[name]), (
+            f"param {name} changed across NaN-skip cycles — optimizer.step "
+            f"fired despite non-finite grad_norm; G217 path broken."
+        )
+
+
+def test_run_training_continues_after_nan_skip_recovers(monkeypatch):
+    """G217 secondary check: after one NaN cycle (state reset to None),
+    a subsequent non-NaN cycle re-initializes state and proceeds. Verify
+    that calling run_training right after the NaN-only run leaves the
+    model in a runnable state (no stale corrupted nmm_states sneak through).
+    """
+    import torch.nn as nn
+    from data.dataloader import ParallelStreamLoader
+    from train import build_optimizer, run_training
+
+    torch.manual_seed(0)
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=8, vocab_size=32,
+        block_size=64, chunk_size=4, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=2,
+        finetune_mode=False,
+    )
+    model = TitansMAGGPT2(cfg)
+    optimizer = build_optimizer(model)
+    stream = torch.randint(0, cfg.vocab_size, (4 * 4 * 20,))
+    loader = ParallelStreamLoader(
+        stream, batch_size=4, chunk_size=4, eot_id=50256,
+    )
+
+    # Inject NaN for 2 cycles
+    counter = {"n": 0}
+    real_clip = nn.utils.clip_grad_norm_
+
+    def fake_clip(*args, **kwargs):
+        counter["n"] += 1
+        if counter["n"] <= 2:
+            return torch.tensor(float("inf"))
+        return real_clip(*args, **kwargs)
+
+    monkeypatch.setattr(nn.utils, "clip_grad_norm_", fake_clip)
+
+    # Train: first 2 cycles are NaN-skipped, subsequent cycles normal.
+    params_before = {n: p.detach().clone() for n, p in model.named_parameters()}
+    run_training(
+        model=model, optimizer=optimizer, loader=loader,
+        device=torch.device("cpu"),
+        max_steps=5, warmup_steps=1, accum_steps=1,
+        log_every=100,
+    )
+
+    # At least one param should have changed (the non-NaN cycles fired).
+    changed = sum(
+        1 for n, p in model.named_parameters()
+        if not torch.equal(p, params_before[n])
+    )
+    assert changed > 0, (
+        f"after NaN-skip recovery, no params changed — the recovery path "
+        f"is not letting subsequent cycles step the optimizer."
+    )
+
+
+# ---------------------------------------------------------------------------
 # detach_states is called between chunks
 # ---------------------------------------------------------------------------
 

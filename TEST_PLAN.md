@@ -582,7 +582,7 @@ Every gap in `GAP_HISTORY.md` that introduced a silent-failure mode (or near-mis
 | G213 | `test_train_step::test_nan_returns_none_states`, `test_nan_injection::test_nmm_state_nan` | §6, §13 |
 | G214 | `test_ddp_gradient_accumulation::test_partial_cycle_skip_step` | §11 |
 | G215 | `test_scan_dispatcher::test_has_assoc_scan_path_resolution` | §7 |
-| G216 | `test_weight_loading::test_hf_model_name_from_n_embd` | §4 |
+| G216 | `test_weight_loading::test_hf_model_name_from_n_embd_table`, `::test_load_pretrained_rejects_unsupported_n_embd`, `::test_load_pretrained_factory_overrides_route_to_correct_hf_name` | §4 |
 | G217 | `test_nan_injection::test_accumulation_block_reset_nmm` | §13 |
 | G219 | `test_checkpoint::test_resume_without_optimizer_key` | §6 |
 | G220 | `test_attention::test_n_head_value_error_under_O` | §4 |
@@ -614,6 +614,16 @@ Every gap in `GAP_HISTORY.md` that introduced a silent-failure mode (or near-mis
 | G249 | `test_decode_parity::test_prepare_decode_chunked_short_prompt_matches_prepare_decode`, `::test_prepare_decode_chunked_long_prompt_threads_nmm_state_across_prefix`, `::test_prepare_decode_chunked_rejects_train_mode` | §8 |
 | G250 | (dead branch removed — existing `test_full_model::test_apply_gpt2_init_*` defend the init invariants) | §4 |
 | G251 | `test_needle_smoke::test_sweep_default_grid_returns_expected_structure`, `::test_sweep_per_position_per_secret_aggregation_correct`, `::test_sweep_explicit_secrets_and_positions_override_defaults`, `::test_sweep_seed_determinism`, `::test_sweep_different_seed_produces_different_secrets`, `::test_sweep_one_secret_one_position_runs_one_pair` | §10 |
+| G252 (T1) | `test_weight_loading::test_load_pretrained_transposes_c_attn_into_q_k_v_correctly`, `::test_load_pretrained_transposes_c_proj_correctly`, `::test_load_pretrained_copies_layernorms_without_transpose`, `::test_load_pretrained_copies_embeddings`, `::test_load_pretrained_does_not_touch_nmm_params`, `::test_load_pretrained_n_layer_mismatch_raises`, `::test_load_pretrained_n_head_mismatch_raises` | §4 |
+| G252 (T2) | `test_train_loop::test_resume_matches_uninterrupted_training_in_param_space`, `::test_resume_advances_params_and_loads_optimizer_state`, `::test_resume_after_nan_skip_does_not_crash` | §8 |
+| G252 (T3) | `test_full_model::test_doc_boundaries_all_true_isolates_positions_from_earlier_input_changes`, `::test_doc_boundaries_no_reset_path_DOES_propagate_position_zero_changes`, `::test_doc_boundaries_all_true_state_differs_from_no_reset_path` | §4 |
+| G252 (T4) | `test_train_step::test_overfit_batch_drives_loss_near_zero` (slow) | §6 |
+| G252 (T5) | `test_train_step::test_run_training_accumulation_cycle_resets_nmm_states_on_nan`, `::test_run_training_continues_after_nan_skip_recovers` | §6 |
+| G252 (T6) | `test_full_model::test_multi_block_stack_forward_and_gradient_flow_to_every_param` | §4 |
+| G252 (T7) | `test_train_main_structure::test_init_process_group_called_before_ddp_wrap`, `::test_model_to_device_called_before_ddp_wrap`, `::test_ddp_wrap_before_optimizer_construction`, `::test_per_rank_seed_set_after_model_construction`, `::test_init_destroy_process_group_pair_present` | §6 |
+| G252 (T8) | `test_perf_smoke::test_train_step_throughput_is_non_degenerate`, `::test_train_step_does_not_leak_memory_across_steps`, `::test_generate_per_token_latency_does_not_grow_with_output_length`, `::test_generate_completes_within_reasonable_wall_time` | §12 |
+| G252 (T9) | `test_config::test_fuzzed_invalid_config_raises_value_error_with_informative_message` (40 parametrized) | §13 |
+| G252 (T10) | `test_tokenizer::test_encode_corpus_whole_file_pattern_produces_one_document` | §5 |
 
 Gaps in `GAP_HISTORY.md` not appearing here are structural (documentation reorganization, comment additions, file renames) and are not separately testable. See `GAP_HISTORY.md` for full per-gap context.
 

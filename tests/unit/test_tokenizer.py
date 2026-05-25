@@ -98,3 +98,40 @@ def test_encode_corpus_does_not_warn_on_generator_of_strings():
         _w.simplefilter("error")
         out = tok.encode_corpus(docs)
     assert (out == tok.eot_token).sum().item() == 3
+
+
+# ---------------------------------------------------------------------------
+# T10 — whole-file-as-one-document positive case (TEST_PLAN §5 test_tokenizer.py)
+# ---------------------------------------------------------------------------
+
+def test_encode_corpus_whole_file_pattern_produces_one_document(tmp_path):
+    """The G210 warning recommends `encode_corpus([f.read()])` as the
+    correct whole-file-as-one-document pattern. The negative test
+    `test_encode_corpus_warns_on_file_handle` covers the WRONG case;
+    this is the POSITIVE invariant: when wrapped in a list around
+    f.read(), the file's full content is treated as exactly ONE document
+    (a single trailing EOT, no per-line boundaries)."""
+    path = tmp_path / "corpus.txt"
+    path.write_text(
+        "first line of the document\n"
+        "second line\n"
+        "third\n"
+    )
+    tok = Tokenizer()
+    with open(path, "r", encoding="utf-8") as f:
+        ids = tok.encode_corpus([f.read()])
+
+    # Exactly one EOT (the one appended after the single document).
+    assert (ids == tok.eot_token).sum().item() == 1, (
+        f"whole-file pattern produced {(ids == tok.eot_token).sum().item()} "
+        f"EOTs; expected 1 (one document)."
+    )
+    # The EOT is at the END (not embedded mid-stream).
+    assert ids[-1].item() == tok.eot_token
+
+    # Content survives the round-trip: decode without the trailing EOT
+    # should match the source file's text (modulo BPE normalization).
+    decoded = tok.decode(ids[:-1].tolist())
+    assert "first line" in decoded
+    assert "second line" in decoded
+    assert "third" in decoded

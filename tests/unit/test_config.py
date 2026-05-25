@@ -186,3 +186,67 @@ def test_validation_fires_under_python_O():
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "ValueError" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# T9 — fuzzed invalid-config rejection (TEST_PLAN §13 test_invalid_configs.py)
+# ---------------------------------------------------------------------------
+
+import random
+import pytest
+
+
+def _invalid_config_kwargs(rng):
+    """Generate ONE invalid TitansConfig kwarg combination. Each branch
+    violates a distinct __post_init__ check; the function chooses one at
+    random so the fuzz test covers different rejection paths."""
+    choice = rng.choice(["chunk_gt_block", "div", "n_persistent_neg",
+                         "expansion_lt1", "swa_window"])
+    if choice == "chunk_gt_block":
+        return {
+            "chunk_size": rng.randint(1025, 2048),
+            "block_size": rng.randint(64, 1024),
+            "n_layer": 1, "n_head": 2, "n_embd": 16,
+            "vocab_size": 32, "nmm_expansion": 2,
+        }, "chunk_size"
+    if choice == "div":
+        # n_embd not divisible by n_head.
+        return {
+            "n_layer": 1, "n_head": 3, "n_embd": 16,  # 16 % 3 != 0
+            "vocab_size": 32, "block_size": 64, "chunk_size": 8,
+            "nmm_expansion": 2,
+        }, "divisible"
+    if choice == "n_persistent_neg":
+        return {
+            "n_layer": 1, "n_head": 2, "n_embd": 16, "vocab_size": 32,
+            "block_size": 64, "chunk_size": 8, "nmm_expansion": 2,
+            "nmm_n_persistent": -rng.randint(1, 100),
+        }, "nmm_n_persistent"
+    if choice == "expansion_lt1":
+        return {
+            "n_layer": 1, "n_head": 2, "n_embd": 16, "vocab_size": 32,
+            "block_size": 64, "chunk_size": 8,
+            "nmm_expansion": rng.choice([0, -1, -5]),
+        }, "nmm_expansion"
+    if choice == "swa_window":
+        return {
+            "n_layer": 1, "n_head": 2, "n_embd": 16, "vocab_size": 32,
+            "block_size": 64, "chunk_size": 8, "nmm_expansion": 2,
+            "use_swa": True, "swa_window": rng.choice([0, -1, -10]),
+        }, "swa_window"
+
+
+@pytest.mark.parametrize("seed", list(range(40)))
+def test_fuzzed_invalid_config_raises_value_error_with_informative_message(seed):
+    """T9 — 40 random invalid-config combinations across 5 rejection paths.
+    Each must raise ValueError, and the message must name the offending
+    field so a user can fix it without reading the source."""
+    rng = random.Random(seed)
+    kwargs, expected_substring = _invalid_config_kwargs(rng)
+    with pytest.raises(ValueError) as excinfo:
+        TitansConfig(**kwargs)
+    msg = str(excinfo.value).lower()
+    assert expected_substring.lower() in msg, (
+        f"ValueError message {msg!r} does not mention the offending field "
+        f"{expected_substring!r}; kwargs={kwargs}"
+    )

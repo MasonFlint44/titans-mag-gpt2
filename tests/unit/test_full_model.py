@@ -215,3 +215,197 @@ def test_two_chunk_forward_threads_nmm_state():
         logits_continued, _ = model(idx2, nmm_states=states_after_1)
         logits_fresh, _ = model(idx2, nmm_states=None)
     assert not torch.allclose(logits_continued, logits_fresh, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# T3 — doc_boundaries=all_true reset equivalence (TEST_PLAN §8 test_model_forward.py)
+#
+# The strict "doc_boundaries=all_true => per-position output == per-token
+# fresh-state forwards" interpretation doesn't hold at the LOGITS level —
+# attention sees different context in chunked vs single-token forwards
+# even when NMM state is perfectly reset. So we test the NMM STATE
+# equivalence instead, which IS the actual invariant reset_state defends:
+# after T tokens with all-boundaries-true, the returned (M, S) reflects
+# exactly "one update step from init_M on the last token", because reset
+# fires before each token's update including the last.
+# ---------------------------------------------------------------------------
+
+def test_doc_boundaries_all_true_isolates_positions_from_earlier_input_changes():
+    """T3 — the OBSERVABLE consequence of "state resets every position":
+    with doc_boundaries=all_true, the NMM state at position T-1 depends
+    only on the position-T-1 input — earlier-token changes don't propagate
+    through the (reset) state.
+
+    Swap test: change idx[0]. With all-true boundaries, the returned state
+    at the end of the chunk should be UNCHANGED (since position 0's update
+    is reset away before position 1's update fires, etc.). With no
+    boundaries (default first-token-only), changing idx[0] propagates
+    through the state and changes the final state.
+
+    Use nmm_conv_kernel=1 so the conv has no temporal mixing — changing
+    idx[0] only affects position 0's projection, not later positions'
+    projections. (With kernel > 1, idx[0]'s linear projection would still
+    be in the conv buffer at positions 1..k-1, contaminating their k_hat/
+    v through the conv even with state-reset.)
+    """
+    torch.manual_seed(0)
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=8, vocab_size=32,
+        block_size=64, chunk_size=4, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=0,
+        nmm_conv_kernel=1,
+        finetune_mode=False,
+    )
+    model = TitansMAGGPT2(cfg)
+    model.eval()
+    T = 3
+    idx_a = torch.randint(0, cfg.vocab_size, (1, T))
+    idx_b = idx_a.clone()
+    idx_b[0, 0] = (idx_a[0, 0] + 1) % cfg.vocab_size  # change ONLY position 0
+
+    db_all_true = torch.ones(1, T, dtype=torch.bool)
+
+    with torch.no_grad():
+        _, states_a = model(idx_a, nmm_states=None, doc_boundaries=db_all_true)
+        _, states_b = model(idx_b, nmm_states=None, doc_boundaries=db_all_true)
+
+    # Returned NMM state for idx_a and idx_b must match (position 0's
+    # contribution was reset away before position 1's update). Note: this
+    # holds only for the NMM STATE — attention still sees both versions
+    # of position 0 differently, so the model's LOGITS would differ.
+    for (M_a, S_a), (M_b, S_b) in zip(states_a, states_b):
+        for key in M_a:
+            md = (M_a[key] - M_b[key]).abs().max().item()
+            sd = (S_a[key] - S_b[key]).abs().max().item()
+            assert md < 1e-5, (
+                f"M[{key}] differed across position-0 swap: {md:.3e} — "
+                f"earlier-input change propagated through the reset state"
+            )
+            assert sd < 1e-5, f"S[{key}] differed: {sd:.3e}"
+
+
+def test_doc_boundaries_no_reset_path_DOES_propagate_position_zero_changes():
+    """Counterpart sanity check: WITHOUT resets, a position-0 swap MUST
+    propagate to the final state. If this fails, the swap test above is
+    passing vacuously."""
+    torch.manual_seed(0)
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=8, vocab_size=32,
+        block_size=64, chunk_size=4, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=0,
+        nmm_conv_kernel=1,
+        finetune_mode=False,
+    )
+    model = TitansMAGGPT2(cfg)
+    model.eval()
+    T = 3
+    idx_a = torch.randint(0, cfg.vocab_size, (1, T))
+    idx_b = idx_a.clone()
+    idx_b[0, 0] = (idx_a[0, 0] + 1) % cfg.vocab_size
+
+    db_first_only = torch.zeros(1, T, dtype=torch.bool)
+    db_first_only[:, 0] = True  # standard boundary at start of stream
+
+    with torch.no_grad():
+        _, states_a = model(idx_a, nmm_states=None, doc_boundaries=db_first_only)
+        _, states_b = model(idx_b, nmm_states=None, doc_boundaries=db_first_only)
+
+    # SOMETHING must differ.
+    differs = False
+    for (M_a, _), (M_b, _) in zip(states_a, states_b):
+        for key in M_a:
+            if (M_a[key] - M_b[key]).abs().max().item() > 1e-6:
+                differs = True
+                break
+        if differs:
+            break
+    assert differs, (
+        "M state was identical across position-0 swap WITHOUT resets — "
+        "either propagation is broken or the test isn't exercising it."
+    )
+
+
+def test_doc_boundaries_all_true_state_differs_from_no_reset_path():
+    """Sanity check: the same T-token forward WITHOUT resets produces a
+    DIFFERENT (M, S) than the all-reset path. Otherwise the reset test
+    above could pass trivially if state never changed."""
+    torch.manual_seed(0)
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=8, vocab_size=32,
+        block_size=64, chunk_size=4, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=0,
+        nmm_conv_kernel=1,
+        finetune_mode=False,
+    )
+    model = TitansMAGGPT2(cfg)
+    model.eval()
+    T = 3
+    idx = torch.randint(0, cfg.vocab_size, (1, T))
+    db_all_true = torch.ones(1, T, dtype=torch.bool)
+    db_none = torch.zeros(1, T, dtype=torch.bool)
+    db_none[:, 0] = True  # mandatory first-position boundary
+
+    with torch.no_grad():
+        _, states_reset = model(idx, nmm_states=None, doc_boundaries=db_all_true)
+        _, states_no_reset = model(idx, nmm_states=None, doc_boundaries=db_none)
+
+    # At least one M entry must differ — otherwise resets had no effect.
+    differs = False
+    for (M_r, _), (M_n, _) in zip(states_reset, states_no_reset):
+        for key in M_r:
+            if (M_r[key] - M_n[key]).abs().max().item() > 1e-6:
+                differs = True
+                break
+        if differs:
+            break
+    assert differs, (
+        "M state was identical with vs without per-token resets; either "
+        "reset_state is a no-op or the test inputs aren't exercising it."
+    )
+
+
+# ---------------------------------------------------------------------------
+# T6 — Multi-block stack gradient flow (TEST_PLAN §8 test_block_forward.py)
+# ---------------------------------------------------------------------------
+
+def test_multi_block_stack_forward_and_gradient_flow_to_every_param():
+    """T6 — 3-block model: forward + backward; every named parameter must
+    have a non-None grad. Catches dead-branch / detached-tensor regressions
+    that would silently freeze part of the model during training.
+
+    Single-block tests in test_block.py cover one block; this exercises
+    the stack-wise gradient flow (output of block i goes to block i+1's
+    input, residual stream survives, ln_f is in the path, lm_head ties
+    back to wte, etc.).
+    """
+    torch.manual_seed(0)
+    cfg = TitansConfig(
+        n_layer=3, n_head=2, n_embd=8, vocab_size=32,
+        block_size=64, chunk_size=4, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=2,
+        finetune_mode=False,
+    )
+    model = TitansMAGGPT2(cfg)
+    model.train()
+    idx = torch.randint(0, cfg.vocab_size, (2, 4))
+    logits, _ = model(idx, nmm_states=None, doc_boundaries=None)
+    assert logits.shape == (2, 4, cfg.vocab_size)
+
+    # Cross-entropy loss against next-token targets.
+    loss = torch.nn.functional.cross_entropy(
+        logits[:, :-1].reshape(-1, logits.size(-1)),
+        idx[:, 1:].reshape(-1),
+    )
+    loss.backward()
+
+    # Every named parameter must have a grad.
+    no_grad_params = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.grad is None:
+            no_grad_params.append(name)
+    assert not no_grad_params, (
+        f"{len(no_grad_params)} params have grad=None after backward through "
+        f"3-block stack: {no_grad_params[:5]}{'...' if len(no_grad_params) > 5 else ''}"
+    )
