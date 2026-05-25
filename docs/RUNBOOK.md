@@ -219,6 +219,22 @@ cfg = TitansConfig.gpt2_small(
     nmm_state_dtype="bf16",
     nmm_cpu_offload_segments=True,
 )
+
+# 5. Alternative to #4: block-level checkpointing. Wraps each
+#    TitansMAGBlock.forward in a recompute boundary so only block I/O
+#    lives across the stack. Comparable VRAM win to cpu_offload at the
+#    same step-time scale (~5-10x slower than no checkpointing). Choose
+#    block_ckpt over cpu_offload if you don't have fast CPU-GPU
+#    bandwidth (e.g. PCIe 3.0) or if you also want the same per-block
+#    isolation in the autograd graph for analysis tools. They can
+#    compose — block_ckpt + cpu_offload may push max-T a little higher
+#    on hardware that can pay for both.
+cfg = TitansConfig.gpt2_small(
+    chunk_size=T, block_size=T,
+    nmm_grad_checkpoint=True, nmm_grad_checkpoint_segment_len=32,
+    nmm_state_dtype="bf16",
+    nmm_block_grad_checkpoint=True,  # block recompute on backward
+)
 ```
 
 ---

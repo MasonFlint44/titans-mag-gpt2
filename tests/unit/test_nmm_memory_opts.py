@@ -532,3 +532,229 @@ def test_cpu_offload_plus_bf16_state_runs():
     for n, p in block.nmm.memory_mlp.named_parameters():
         assert p.grad is not None
         assert torch.isfinite(p.grad).all(), f"{n} non-finite grad"
+
+
+# ---------------------------------------------------------------------------
+# Block-level grad checkpoint (G260) — flatten/unflatten, equivalence,
+# composition with segment checkpoint, multi-head support.
+# ---------------------------------------------------------------------------
+
+
+def _cfg_block_ckpt(*, block_ckpt, seg_ckpt=True, seg_len=3, n_heads=1):
+    return TitansConfig(
+        n_layer=1, n_head=2, n_embd=8, vocab_size=16,
+        block_size=64, chunk_size=8, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=0,
+        finetune_mode=False,
+        nmm_grad_checkpoint=seg_ckpt,
+        nmm_grad_checkpoint_segment_len=seg_len,
+        nmm_block_grad_checkpoint=block_ckpt,
+        nmm_n_heads=n_heads,
+    )
+
+
+def test_block_checkpoint_default_off():
+    """The flag must default to False so existing models don't silently
+    pay 2x backward cost without the user knowing."""
+    cfg = TitansConfig()
+    assert cfg.nmm_block_grad_checkpoint is False
+
+
+def test_block_checkpoint_forward_matches_uncheckpointed():
+    """Block-level checkpoint must produce bitwise-identical output to
+    the uncheckpointed block under no_grad — the flag is a backward-only
+    optimization; forward semantics must not change."""
+    torch.manual_seed(0)
+    block_a = TitansMAGBlock(_cfg_block_ckpt(block_ckpt=False))
+    block_b = TitansMAGBlock(_cfg_block_ckpt(block_ckpt=True))
+    block_b.load_state_dict(block_a.state_dict())
+
+    x = torch.randn(2, 8, 8)
+    s_a = block_a.nmm.init_state(B=2, device=torch.device("cpu"))
+    s_b = block_b.nmm.init_state(B=2, device=torch.device("cpu"))
+    with torch.no_grad():
+        y_a, ns_a = block_a(x, s_a, doc_boundaries=None)
+        y_b, ns_b = block_b(x, s_b, doc_boundaries=None)
+    assert torch.equal(y_a, y_b)
+    # NMM state outputs also match (single-head: (M, S) dicts).
+    M_a, S_a = ns_a; M_b, S_b = ns_b
+    for k in M_a:
+        assert torch.equal(M_a[k], M_b[k])
+        assert torch.equal(S_a[k], S_b[k])
+
+
+def test_block_checkpoint_backward_matches_uncheckpointed():
+    """Memory-mlp gradients through block-checkpointed forward must match
+    uncheckpointed within float rounding. Combines block + segment
+    checkpoint — the recommended composition (block alone would re-run a
+    full NMM forward per block, which OOMs at long T)."""
+    torch.manual_seed(0)
+    block_a = TitansMAGBlock(_cfg_block_ckpt(block_ckpt=False, seg_ckpt=True))
+    block_b = TitansMAGBlock(_cfg_block_ckpt(block_ckpt=True, seg_ckpt=True))
+    block_b.load_state_dict(block_a.state_dict())
+
+    x_a = torch.randn(2, 8, 8, requires_grad=True)
+    x_b = x_a.detach().clone().requires_grad_(True)
+    s_a = block_a.nmm.init_state(B=2, device=torch.device("cpu"))
+    s_b = block_b.nmm.init_state(B=2, device=torch.device("cpu"))
+
+    y_a, _ = block_a(x_a, s_a)
+    y_b, _ = block_b(x_b, s_b)
+    y_a.sum().backward()
+    y_b.sum().backward()
+
+    for (n_a, p_a), (n_b, p_b) in zip(
+        block_a.nmm.memory_mlp.named_parameters(),
+        block_b.nmm.memory_mlp.named_parameters(),
+    ):
+        assert n_a == n_b
+        diff = (p_a.grad - p_b.grad).abs().max().item()
+        assert diff < 1e-4, (
+            f"block_checkpoint diverged on {n_a}: max grad diff {diff:.3e}"
+        )
+
+    # Also check that the input grad propagates (block is differentiable
+    # w.r.t. its input through the checkpoint).
+    assert x_a.grad is not None and x_b.grad is not None
+    diff_x = (x_a.grad - x_b.grad).abs().max().item()
+    assert diff_x < 1e-4
+
+
+def test_block_checkpoint_handles_doc_boundary():
+    """doc_boundaries is captured via closure (checkpoint doesn't pass
+    kwargs). Mid-chunk reset must still fire on the recompute path."""
+    torch.manual_seed(0)
+    block = TitansMAGBlock(_cfg_block_ckpt(block_ckpt=True, seg_ckpt=True))
+    state = block.nmm.init_state(B=2, device=torch.device("cpu"))
+    x = torch.randn(2, 8, 8, requires_grad=True)
+    db = torch.zeros(2, 8, dtype=torch.bool)
+    db[:, 4] = True
+
+    y, _ = block(x, state, doc_boundaries=db)
+    y.sum().backward()
+    for p in block.nmm.memory_mlp.parameters():
+        assert p.grad is not None
+        assert torch.isfinite(p.grad).all()
+
+
+def test_block_checkpoint_works_with_multi_head_nmm():
+    """Multi-head state is a `list[(M, S)]`. The flatten helper handles
+    both shapes; this test confirms multi-head end-to-end."""
+    torch.manual_seed(0)
+    cfg = _cfg_block_ckpt(block_ckpt=True, seg_ckpt=True, n_heads=2)
+    block_a = TitansMAGBlock(_cfg_block_ckpt(block_ckpt=False, n_heads=2))
+    block_b = TitansMAGBlock(cfg)
+    block_b.load_state_dict(block_a.state_dict())
+
+    x_a = torch.randn(2, 8, 8, requires_grad=True)
+    x_b = x_a.detach().clone().requires_grad_(True)
+    s_a = block_a.nmm.init_state(B=2, device=torch.device("cpu"))
+    s_b = block_b.nmm.init_state(B=2, device=torch.device("cpu"))
+
+    y_a, _ = block_a(x_a, s_a)
+    y_b, _ = block_b(x_b, s_b)
+    y_a.sum().backward()
+    y_b.sum().backward()
+
+    # Compare per-head memory_mlp gradients via the heads list.
+    for h_a, h_b in zip(block_a.nmm.heads, block_b.nmm.heads):
+        for (na, pa), (nb, pb) in zip(
+            h_a.memory_mlp.named_parameters(),
+            h_b.memory_mlp.named_parameters(),
+        ):
+            assert na == nb
+            diff = (pa.grad - pb.grad).abs().max().item()
+            assert diff < 1e-4, (
+                f"multi-head block_ckpt diverged on {na}: {diff:.3e}"
+            )
+
+
+def test_block_checkpoint_composes_with_bf16_state():
+    """All four NMM memory knobs on at once via block + segment + bf16 +
+    cpu_offload. End-to-end finite gradients only — bf16 already drifts
+    from fp32 so we don't compare exact values."""
+    torch.manual_seed(0)
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=8, vocab_size=16,
+        block_size=64, chunk_size=8, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=0,
+        finetune_mode=False,
+        nmm_state_dtype="bf16",
+        nmm_grad_checkpoint=True,
+        nmm_grad_checkpoint_segment_len=3,
+        nmm_cpu_offload_segments=True,
+        nmm_block_grad_checkpoint=True,
+    )
+    block = TitansMAGBlock(cfg)
+    state = block.nmm.init_state(B=2, device=torch.device("cpu"))
+    x = torch.randn(2, 8, 8, requires_grad=True)
+    y, _ = block(x, state)
+    y.sum().backward()
+    for n, p in block.nmm.memory_mlp.named_parameters():
+        assert p.grad is not None
+        assert torch.isfinite(p.grad).all(), f"{n} non-finite grad"
+
+
+def test_block_checkpoint_through_full_model_propagates_grads():
+    """End-to-end: block-checkpointed TitansMAGGPT2 must produce finite
+    gradients across all layers. Verifies the persistent + lm_head + ln_f
+    + multi-block stack all play nicely with the per-block checkpoint."""
+    from model.titans_gpt2 import TitansMAGGPT2
+
+    torch.manual_seed(0)
+    cfg = TitansConfig(
+        n_layer=2, n_head=2, n_embd=8, vocab_size=16,
+        block_size=32, chunk_size=8, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=2,
+        finetune_mode=False,
+        nmm_grad_checkpoint=True,
+        nmm_grad_checkpoint_segment_len=4,
+        nmm_block_grad_checkpoint=True,
+    )
+    model = TitansMAGGPT2(cfg)
+    ids = torch.randint(0, cfg.vocab_size, (2, 8))
+    db = torch.zeros(2, 8, dtype=torch.bool); db[:, 0] = True
+    logits, _ = model(ids, None, db)
+    loss = logits.float().mean()
+    loss.backward()
+    # Every requires_grad param must have a finite grad. Embedding params
+    # come last in the graph and are a sensitive canary for "did backward
+    # actually traverse the whole stack."
+    for n, p in model.named_parameters():
+        if p.requires_grad:
+            assert p.grad is not None, f"{n} has no grad — block_ckpt may have broken backward"
+            assert torch.isfinite(p.grad).all(), f"{n} non-finite grad"
+
+
+def test_state_flatten_unflatten_single_head_round_trip():
+    """Sanity check for _state_to_flat / _flat_to_state on single-head."""
+    from model.block import _state_to_flat, _flat_to_state
+    M = {"W1.weight": torch.randn(2, 4, 8),
+         "W_gate.weight": torch.randn(2, 4, 8),
+         "W2.weight": torch.randn(2, 8, 4)}
+    S = {k: torch.zeros_like(v) for k, v in M.items()}
+    flat, desc = _state_to_flat((M, S))
+    M2, S2 = _flat_to_state(flat, desc)
+    for k in M:
+        assert torch.equal(M[k], M2[k])
+        assert torch.equal(S[k], S2[k])
+
+
+def test_state_flatten_unflatten_multi_head_round_trip():
+    """Same round-trip for multi-head `[(M, S), ...]`."""
+    from model.block import _state_to_flat, _flat_to_state
+    states = []
+    for _ in range(3):
+        M = {"W1.weight": torch.randn(2, 4, 8),
+             "W_gate.weight": torch.randn(2, 4, 8),
+             "W2.weight": torch.randn(2, 8, 4)}
+        S = {k: torch.zeros_like(v) for k, v in M.items()}
+        states.append((M, S))
+    flat, desc = _state_to_flat(states)
+    out = _flat_to_state(flat, desc)
+    assert isinstance(out, list) and len(out) == 3
+    for orig, restored in zip(states, out):
+        M_o, S_o = orig; M_r, S_r = restored
+        for k in M_o:
+            assert torch.equal(M_o[k], M_r[k])
+            assert torch.equal(S_o[k], S_r[k])

@@ -76,6 +76,7 @@ properties are preserved.
 | `nmm_grad_checkpoint_segment_len` | `int` | 64 | Segment size when grad-checkpointing is on (no effect otherwise). Smaller = less peak memory + more recompute; larger = more peak memory + less recompute. Tuning guidance: start at `64`; drop to `32` or `16` if OOM persists. |
 | `nmm_cpu_offload_segments` | `bool` | `False` | Requires `nmm_grad_checkpoint=True`. Replaces the GPU checkpoint with a CPU-offload variant: saved segment-boundary `(M, S)` tensors are stashed on CPU between forward and backward, and pulled back to GPU for recompute one segment at a time. Removes the `n_blocks × n_segments × per_segment` VRAM ceiling that bounds the GPU checkpoint at long `T`. **Trade:** PCIe transfer cost (~16 GiB/s on PCIe 4.0 x16) added to every backward — expect a 1.5–3× step-time slowdown depending on `T` and `seg_len`. Uses a custom `autograd.Function` (not `save_on_cpu`, which uses `saved_tensors_hooks` rejected by `torch.func.grad`). |
 | `nmm_compile_scan_training` | `bool` | `False` | Sets `_allow_scan_training=True` on every block's NMM at construction so the dispatcher in `forward_chunk` takes the associative-scan path **even with autograd enabled**. **You still need to wrap the model in `torch.compile(model)` yourself** — without compile, `associative_scan` has no autograd and silently zeros NMM gradients (G164 / G180). **This is a COMPUTE optimization (parallelism), NOT memory** — the scan path allocates `[T, B, h, d]` gradient tensors upfront, which at T=1024 is *larger* than the sequential path's per-token graph. Useful when paired with `cpu_offload` to fit T=1024 *and* run it faster. **Caveat:** scan is an APPROXIMATION — per-token gradients are computed against chunk-start `M_0`, not paper-faithful `M_{t-1}` — so training loss curves will differ from sequential. |
+| `nmm_block_grad_checkpoint` | `bool` | `False` | Wraps each `TitansMAGBlock.forward` in `torch.utils.checkpoint.checkpoint(use_reentrant=True)`. The whole block (attention + NMM forward_chunk + MAG gate + MLP) is recomputed on backward; only block-input/output tensors and the NMM `(M, S)` I/O dicts live in the autograd graph between blocks. Removes the `n_blocks × n_segments × per_segment` boundary term that dominates GPU memory at long T. **Combine with `nmm_grad_checkpoint=True`** — block checkpoint alone would re-build the full per-token NMM graph during a block's backward recompute (≈ 50 GiB at T=1024 gpt2_small), OOMing immediately. The segment checkpoint bounds the in-block transient during recompute. Cost: each block's forward runs twice (forward + backward recompute), ~2× step time on top of inner-segment recompute. Handles both single-head `(M, S)` and multi-head `[(M, S), ...]` states via the `_state_to_flat` / `_flat_to_state` helpers in `model/block.py`. |
 
 **Why `use_reentrant=True`** is *required* (not just convenient):
 `use_reentrant=False` calls `disable_saved_tensors_hooks`, and
@@ -98,19 +99,32 @@ end-to-end `train_step` with backward + Adam):
 | `B=1, T=512`, bf16 + ckpt seg=16 | 12.8 GiB | — | OOM |
 | `B=1, T=1024`, bf16 + ckpt seg ∈ {8..64} | ~13 GiB | — | OOM at every seg |
 | `B=1, T=256`, bf16 + ckpt seg=32 + cpu_offload | 10.8 GiB | 103 s | OK (slow) |
-| `B=1, T=1024`, bf16 + ckpt seg=32 + cpu_offload | **11.1 GiB** | **405 s** | OK ← **T=1024 finally fits** |
+| `B=1, T=1024`, bf16 + ckpt seg=32 + cpu_offload | **11.1 GiB** | **405 s** | OK ← **T=1024 via cpu_offload** |
 | `B=2, T=256`, bf16 + ckpt seg=32 + cpu_offload | 13.8 GiB | — | OOM (in-segment grows with B) |
+| `B=1, T=256`, bf16 + ckpt seg=32 + block_ckpt | 11.0 GiB | 127 s | OK |
+| `B=1, T=512`, bf16 + ckpt seg=32 + block_ckpt | **11.3 GiB** | 250 s | OK ← **T=512 via block_ckpt** |
+| `B=1, T=1024`, bf16 + ckpt seg=32 + block_ckpt | 11.8 GiB | 497 s | OK |
+| `B=1, T=1024`, bf16 + ckpt seg=32 + block_ckpt + cpu_offload | 11.0 GiB | 463 s | OK (combined, no big win) |
+| `B=2+`, T=512/1024 + block_ckpt + (optional) cpu_offload | ~13.8 GiB | — | OOM (in-segment transient scales with B) |
 
 **Findings:**
 
-- Gradient checkpointing is the dominant unlock for `T ≥ 64`.
-- `bf16` state stacks on top, ~2× headroom.
-- **`cpu_offload` is what lets T=1024 fit on a 16 GiB card** — but at a
-  ~5–10× step-time cost (PCIe transfer + extra recompute per segment).
-  Useful for correctness verification at long context; **not practical
-  for production training** on this hardware.
-- All optimizations capped at `B=1` on this card. The in-segment forward
-  memory grows linearly with B and CPU-offload can't help with it.
+- Gradient checkpointing (`nmm_grad_checkpoint`) is the dominant unlock
+  for `T ≥ 64`. Required as a baseline for any further memory work.
+- `bf16` state (`nmm_state_dtype="bf16"`) stacks on top, ~2× headroom.
+- **`cpu_offload` lets T=1024 fit on a 16 GiB card** at ~5–10× step-
+  time cost (PCIe + extra recompute). Correctness work, not production.
+- **`block_grad_checkpoint` also lets T=1024 fit**, and lets T=512 fit
+  (where it didn't before). Comparable step-time penalty to
+  `cpu_offload`. Choose one or the other; combining them gives no
+  meaningful additional win at T=1024.
+- **All optimizations cap at `B=1`** on this 16 GiB card. The in-segment
+  per-block transient (~`seg_len × B × per_step_state`) scales with B
+  and is *not* reduced by either `cpu_offload` (which only offloads
+  saved-input boundaries) or `block_grad_checkpoint` (which only
+  reduces cross-block boundary storage). To get B>1 at long T you need
+  either a smaller backbone, `nmm_expansion=1`, or hardware with more
+  VRAM.
 
 **Recommended configs by goal:**
 
@@ -123,13 +137,25 @@ TitansConfig.gpt2_small(
     nmm_grad_checkpoint_segment_len=16,
 )
 
-# Long-but-slow: T=1024 fits, but 5+ minutes per step.
+# Long-but-slow: T=1024 fits, but 5+ minutes per step (cpu_offload path).
 TitansConfig.gpt2_small(
     chunk_size=1024, block_size=1024,
     nmm_state_dtype="bf16",
     nmm_grad_checkpoint=True,
     nmm_grad_checkpoint_segment_len=32,
     nmm_cpu_offload_segments=True,
+)
+
+# Alternative for T=512 / T=1024: block-level checkpoint instead of
+# cpu_offload. Comparable VRAM win, comparable step-time slowdown.
+# Pick this if you don't want CPU↔GPU transfers (e.g. PCIe 3.0
+# bottleneck) and want full-GPU semantics.
+TitansConfig.gpt2_small(
+    chunk_size=512, block_size=512,
+    nmm_state_dtype="bf16",
+    nmm_grad_checkpoint=True,
+    nmm_grad_checkpoint_segment_len=32,
+    nmm_block_grad_checkpoint=True,
 )
 
 # Faster-but-approximate: scan path under torch.compile.

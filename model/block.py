@@ -3,9 +3,55 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as _checkpoint
 from torch import cat
 
 from model.nmm import MultiHeadNMM, NeuralMemoryModule
+
+
+# Tensor key ordering inside each (M, S) dict. Used by the block-level
+# checkpoint flatten/unflatten helpers below. Fixed order across all
+# code paths so `_flat_to_state` reliably maps positions back to keys.
+_M_S_KEYS = ("W1.weight", "W_gate.weight", "W2.weight")
+
+
+def _state_to_flat(nmm_state) -> tuple:
+    """Flatten an NMM state into a flat tuple of tensors + a structure
+    descriptor. Supports single-head `(M, S)` and multi-head
+    `[(M_h, S_h), ...]`. Used to thread NMM state through
+    `torch.utils.checkpoint.checkpoint`, which expects tensor-only
+    positional args."""
+    if isinstance(nmm_state, list):
+        # Multi-head: list[n_heads] of (M_dict, S_dict)
+        n_heads = len(nmm_state)
+        flat = []
+        for M, S in nmm_state:
+            for k in _M_S_KEYS:
+                flat.append(M[k])
+            for k in _M_S_KEYS:
+                flat.append(S[k])
+        return tuple(flat), ("multi", n_heads)
+    M, S = nmm_state
+    flat = [M[k] for k in _M_S_KEYS] + [S[k] for k in _M_S_KEYS]
+    return tuple(flat), ("single",)
+
+
+def _flat_to_state(flat, descriptor):
+    """Inverse of `_state_to_flat`. `flat` is an iterable of tensors;
+    `descriptor` is the structure tag returned alongside the flat tuple."""
+    if descriptor[0] == "multi":
+        n_heads = descriptor[1]
+        per_head = 2 * len(_M_S_KEYS)  # M keys + S keys
+        states = []
+        for h in range(n_heads):
+            base = h * per_head
+            M = {k: flat[base + i] for i, k in enumerate(_M_S_KEYS)}
+            S = {k: flat[base + len(_M_S_KEYS) + i] for i, k in enumerate(_M_S_KEYS)}
+            states.append((M, S))
+        return states
+    M = {k: flat[i] for i, k in enumerate(_M_S_KEYS)}
+    S = {k: flat[len(_M_S_KEYS) + i] for i, k in enumerate(_M_S_KEYS)}
+    return (M, S)
 
 
 class CausalSelfAttention(nn.Module):
@@ -174,6 +220,12 @@ class TitansMAGBlock(nn.Module):
         # Default False (our lucidrains-flavored choice): NMM sees only real
         # tokens. True = paper-strict.
         self.feed_persistent_to_nmm = config.feed_persistent_to_nmm
+        # G260: when True, wrap the whole block forward in checkpoint so
+        # in-block intermediates (attn outputs, per-token NMM graph, MLP
+        # internals) are dropped after the block returns and recomputed on
+        # backward. Combine with nmm_grad_checkpoint=True so the recompute
+        # path's transient in-block NMM graph is also bounded.
+        self.block_grad_checkpoint = config.nmm_block_grad_checkpoint
 
         # Small init like GPT-2 wte; learned, no weight decay (routed in §4.1).
         self.persistent_mem = nn.Parameter(
@@ -242,7 +294,9 @@ class TitansMAGBlock(nn.Module):
         mask[self.N_p :, self.N_p :] = causal
         return mask
 
-    def forward(self, x: torch.Tensor, nmm_state, doc_boundaries=None):
+    def _forward_impl(self, x: torch.Tensor, nmm_state, doc_boundaries):
+        """Block forward body — separated from `forward` so it can be
+        re-entered cleanly via `torch.utils.checkpoint.checkpoint`."""
         B, T, _ = x.shape
         x_aug = cat([self.persistent_mem.expand(B, -1, -1), x], dim=1)
         y_attn = self.attn(
@@ -284,6 +338,43 @@ class TitansMAGBlock(nn.Module):
         x = x + o
         x = x + self.mlp(self.ln_2(x))
         return x, nmm_state
+
+    def forward(self, x: torch.Tensor, nmm_state, doc_boundaries=None):
+        # Fast path: no block-level checkpoint, or grad disabled (no graph
+        # to checkpoint anyway).
+        if not (self.block_grad_checkpoint and torch.is_grad_enabled()):
+            return self._forward_impl(x, nmm_state, doc_boundaries)
+
+        # Block-level grad checkpoint (G260). Recompute the entire block
+        # forward on backward instead of storing in-block intermediates.
+        # Strategy: flatten the NMM state to a tuple of tensors, pass them
+        # + x as positional args to `checkpoint`, rebuild the state inside
+        # the wrapped callable. `doc_boundaries` is captured via closure
+        # — checkpoint doesn't pass kwargs in either reentrant variant.
+        #
+        # use_reentrant=True is REQUIRED for the same reason as the inner
+        # nmm checkpoint: torch.func.grad (used inside per_sample_grad_fn
+        # during recompute) rejects saved_tensors_hooks, which is what
+        # use_reentrant=False enables.
+        state_flat, state_desc = _state_to_flat(nmm_state)
+        n_state_tensors = len(state_flat)
+
+        def _wrapped(x_in, *state_in_flat):
+            state_in = _flat_to_state(state_in_flat, state_desc)
+            x_out, new_state = self._forward_impl(x_in, state_in, doc_boundaries)
+            new_flat, _ = _state_to_flat(new_state)
+            # Checkpoint requires tensor-only outputs; structure is
+            # rebuilt by the caller below using the captured descriptor.
+            return (x_out,) + new_flat
+
+        outputs = _checkpoint.checkpoint(
+            _wrapped, x, *state_flat,
+            use_reentrant=True,
+        )
+        x_out = outputs[0]
+        new_flat = outputs[1 : 1 + n_state_tensors]
+        new_state = _flat_to_state(new_flat, state_desc)
+        return x_out, new_state
 
     def init_decode_cache(self, x_prompt: torch.Tensor, nmm_state: tuple) -> tuple:
         """Seed the per-block decode caches from a warm-up prompt.

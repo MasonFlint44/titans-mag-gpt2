@@ -117,6 +117,32 @@ class TitansConfig:
     nmm_compile_scan_training: bool = False
     nmm_cpu_offload_segments: bool = False
 
+    # nmm_block_grad_checkpoint (G260): wrap each `TitansMAGBlock.forward`
+    # in `torch.utils.checkpoint.checkpoint(use_reentrant=True)`. The entire
+    # block (attn + NMM forward_chunk + MAG gate + MLP) is recomputed on
+    # backward; only block-input/output tensors live in the autograd graph
+    # between blocks. Removes the
+    # `n_blocks × n_segments × per_segment` term from the GPU checkpoint's
+    # memory ceiling that bounded the inner `nmm_grad_checkpoint` mode at
+    # long T. At gpt2_small T=1024 this saves ~10 GiB.
+    #
+    # COMPOSITION: this flag is intended to combine WITH
+    # `nmm_grad_checkpoint=True`. Block-level checkpointing alone (without
+    # inner segment checkpointing) re-builds the FULL per-token NMM graph
+    # for one block at a time during backward recompute — at T=1024 that's
+    # still ~50 GiB of transient NMM state for the one block in flight, so
+    # backward will OOM. The combination "block checkpoint + segment
+    # checkpoint" is the intended configuration; segment checkpoint
+    # bounds the transient in-block graph during recompute. We do NOT
+    # automatically enable nmm_grad_checkpoint when this flag is set —
+    # users may explicitly want both off for the sequential code path, or
+    # explicitly want only segment-level for short T.
+    #
+    # Cost: each block's forward runs twice (once on forward, once on
+    # backward recompute). At gpt2_small that's roughly 2x step time on
+    # top of any segment-level recompute overhead.
+    nmm_block_grad_checkpoint: bool = False
+
     def __post_init__(self):
         # raise ValueError (never assert): `python -O` strips asserts, which
         # would let invalid configs ship silently in production.
