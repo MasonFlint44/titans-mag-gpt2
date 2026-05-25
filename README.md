@@ -18,6 +18,7 @@ test time — that's the whole point.
 
 | Doc | What it is |
 |---|---|
+| [`SPEC.md`](SPEC.md) | **Authoritative implementation spec** — what the code actually does |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Design decisions, equations, block diagram |
 | [`ROADMAP.md`](ROADMAP.md) | Phase-by-phase implementation guide (start here) |
 | [`PLAN.md`](PLAN.md) | Full code sketches and every gap-driven safeguard |
@@ -26,7 +27,7 @@ test time — that's the whole point.
 | [`RUNBOOK.md`](RUNBOOK.md) | What to do when training breaks |
 | [`GLOSSARY.md`](GLOSSARY.md) | TITANS terminology |
 | [`EXPERIMENTS.md`](EXPERIMENTS.md) | Ablation plan and success criteria |
-| [`GAP_HISTORY.md`](GAP_HISTORY.md) | 227-entry audit log (background reading) |
+| [`GAP_HISTORY.md`](GAP_HISTORY.md) | Audit log (background reading) |
 | [`diagrams/`](diagrams/) | Mermaid diagrams (architecture, sequences, lifecycle, DDP) |
 
 ## What you get
@@ -39,11 +40,17 @@ test time — that's the whole point.
 - **Newton-Schulz 5-step spectral normalization** of the inner gradient, in fp32
   with autocast disabled (otherwise bf16 silently undoes the cast).
 - **Persistent memory tokens** (`N_p=4`) prepended to each block's input.
+- **Paper-strict defaults**: `retrieval_from_M_prev=True` (Eq. 15, read-then-write)
+  and `feed_persistent_to_nmm=True` (Eq. 28). Flip to `False` for lucidrains-flavored
+  ablations.
 - **TBPTT** with chunked forward + state detach between chunks.
 - **DDP**: 4-group optimizer, gradient accumulation via `model.no_sync()`,
   try/finally NCCL teardown.
 - **HF GPT-2 weight loading**: identical logits to HF GPT-2 when NMM is zeroed
   (max diff < 1e-4).
+- **Cached decoding** (`prepare_decode` + `forward_step`): KV cache for attention,
+  conv buffer for the NMM, so each decoded token gets exactly one NMM update with
+  full k-token conv context.
 - **Optional fast-inference path** via `torch.associative_scan` (~10× speedup,
   <5% relative error).
 
@@ -63,7 +70,7 @@ gradient). PyTorch ≥ 2.8 required for the optional Phase 6 associative scan.
 
 ```bash
 python scripts/finetune.py \
-    --config gpt2_small \
+    --size small \
     --data /path/to/corpus.txt \
     --chunk-size 512 \
     --batch-size 4 \
@@ -80,17 +87,18 @@ memory contribution ramps up.
 
 ```bash
 torchrun --nproc_per_node=4 train.py \
-    --config gpt2_small \
-    --data /path/to/shards/ \
+    --size small \
+    --data /path/to/corpus.txt \
     --chunk-size 1024 \
     --batch-size 8 \
     --grad-accum 2 \
-    --max-steps 100000 \
-    --finetune-mode false
+    --max-steps 100000
 ```
 
-Sets `finetune_mode=False` so the paper's pure-multiplicative MAG gate is used
-(`o = silu(γ_a·y_attn) · silu(γ_m·y_mem)`) and `out_scale` initializes to ones.
+`train.py` hard-codes `finetune_mode=False` so the paper's pure-multiplicative
+MAG gate is used (`o = silu(γ_a·y_attn) · silu(γ_m·y_mem)`) and `out_scale`
+initializes to ones. `block_size` is set equal to `chunk_size` so every wpe row
+sees training (G163).
 
 ## Generate
 
