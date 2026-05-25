@@ -95,11 +95,13 @@ Per paper §3.2 ("functions of tokens"). All three are scalars `[B, T]` (not per
 
 ## Inference
 
-**Conv buffer.** Stateless — NOT part of `(M, S)`. At training time the chunk forward sees a full `kernel_size`-token window; at T=1 step it sees only 1 token. Mitigated at inference by maintaining a rolling conv window externally (`diagrams/inference_sequence.mmd`).
+**Conv buffer.** Per-block rolling buffer of the last `kernel_size - 1` projected Q/K/V tokens. NOT part of `(M, S)` — it's a separate first-class cache used by `NMM.step_with_conv` at decode time so the depthwise conv sees a full `kernel_size`-token window (matching training-time chunk forward) instead of the 1-token zero-padded window the legacy `NMM.step` saw. Seeded by `NMM.init_conv_buffer_from_prompt` during `prepare_decode`'s warm-up and rolled forward by `step_with_conv` (drop oldest, append new linear projection).
 
-**KV cache.** Standard attention key/value cache for autoregressive generation. Separate from NMM state.
+**KV cache.** Standard attention key/value cache for autoregressive generation. Captured by `CausalSelfAttention.project_kv` during warm-up (length `N_p + T_prompt`, includes persistent prefix); extended one token at a time by `forward_with_kv_cache`. Separate from NMM state.
 
-**Sliding window context strategy.** For generation past `block_size`, slide the attention window but keep the NMM state continuous. The NMM provides the long-range memory; attention covers local context.
+**Cached decode (Option B).** The Phase 7 generation pipeline: `model.prepare_decode(prompt)` warms up + captures `(k_cache, v_cache, nmm_conv_buffer)` per block; `model.forward_step(token, cache)` per decoded token gets exactly one NMM update via `step_with_conv` and one attention pass via KV cache. Replaces the v1 sliding-window pattern that re-fed the entire `block_size` window through the NMM at every decoded token (compounding state updates ~`block_size`× per token). See `eval.py:needle_in_haystack`, `generate.py`.
+
+**Sliding window context strategy.** For generation past `block_size`, slide the attention window but keep the NMM state continuous. The NMM provides the long-range memory; attention covers local context. In v2 with Option B, `generate.py`'s long-prompt path chunks the prefix through `forward()` (NMM state threads) and calls `prepare_decode(tail, initial_nmm_states=...)` on the last `block_size` tokens.
 
 ---
 

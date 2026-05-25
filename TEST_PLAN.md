@@ -592,6 +592,24 @@ Every gap in `GAP_HISTORY.md` that introduced a silent-failure mode (or near-mis
 | G225 | `test_ddp_cleanup::test_destroy_on_exception` | §11 |
 | G226 | `test_newton_schulz::test_explicit_autocast_disable` | §3 |
 | G227 | `test_ddp_cleanup::test_try_block_indentation` | §11 |
+| G228 | (documentation drift — no defending test; see `tests/unit/test_config.py::test_factory_accepts_chunk_size_override` for override behavior) | §2 |
+| G229 | (documentation drift — field intentionally absent from config per YAGNI; no test) | — |
+| G230 | `test_newton_schulz::test_spectral_norm_bound_for_any_shape` (loosened bound `(0.80, 1.25)`) | §3 |
+| G231 | `test_hf_logit_parity` shape sweep `[(1, 2), (2, 4)]` (CPU-affordable) | §9 |
+| G232 | `test_scan_dispatcher::test_scan_implementation_matches_M0_approx_sequential_exactly`, `test_scan_vs_sequential_trained::test_scan_sequential_gap_increases_with_chunk_size` | §7, §10 |
+| G233 | `test_train_loop::test_run_training_restarts_loader_on_exhaustion_to_reach_max_steps` | §8 |
+| G234 | `test_hf_logit_parity_gpu::test_logit_parity_at_realistic_size` (scaled tolerance) | §9 |
+| G235 | `test_needle_smoke::test_needle_in_haystack_uses_cached_decode_path` | §10 |
+| G236 | `test_generate::test_generate_at_prompt_len_equals_block_size_returns_one_token`, `::test_generate_short_prompt_respects_new_cap` | §6 |
+| G237 | `test_cached_generate_parity::test_cached_decode_long_prompt_uses_full_context` (rewritten to logit-level invariant) | §10 |
+| G238 | `test_attention_kv_cache::test_cached_forward_swa_masks_far_past_real_positions`, `::test_cached_forward_swa_with_window_geq_real_positions_is_noop`, `::test_cached_forward_swa_persistent_prefix_always_visible`, `test_decode_parity::test_cached_decode_matches_full_forward_with_swa` | §4, §8 |
+| G239 | (dead code removed — no defending test; existing parity tests use a local `_zero_conv_buffer` helper) | — |
+| G240 | `test_decode_parity::test_prepare_decode_rejects_wrong_length_initial_nmm_states` | §8 |
+| G241 | `test_decode_parity::test_cached_decode_matches_full_forward_multi_step_batched` | §8 |
+| G242 | `test_needle_smoke::test_needle_in_haystack_long_prompt_uses_cached_decode_path` | §10 |
+| G243 | `test_decode_parity::test_prepare_decode_rejects_train_mode`, `::test_forward_step_rejects_train_mode` | §8 |
+| G244 | `test_decode_parity::test_prepare_decode_rejects_wrong_batch_dim_initial_nmm_states` | §8 |
+| G245 / G246 / G247 / G248 | (documentation patches — no defending tests) | — |
 
 Gaps in `GAP_HISTORY.md` not appearing here are structural (documentation reorganization, comment additions, file renames) and are not separately testable. See `GAP_HISTORY.md` for full per-gap context.
 

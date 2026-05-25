@@ -115,7 +115,7 @@ These are passed to `train.py` / `apply_lr` directly, not stored on the config o
 | `BASE_LR_NMM` | `9e-4` | LR for `nmm_decay` / `nmm_no_decay` groups (3× GPT-2 per paper) |
 | `WEIGHT_DECAY` | `0.1` | Applied only to `_decay` groups |
 | `BETAS` | `(0.9, 0.95)` | AdamW betas |
-| `WARMUP_STEPS` | `2000` | Thread explicitly into `apply_lr`, don't rely on defaults (G175) |
+| `WARMUP_STEPS` | `2000` (recommended for production) | Thread explicitly into `apply_lr` — no module-level constant in `train.py`; `apply_lr` requires it positional (G175). CLI defaults are smaller for quick local runs: `train.py --warmup-steps` defaults to `1000`, `scripts/finetune.py --warmup-steps` defaults to `500`. For real training runs override with `--warmup-steps 2000`. |
 | `MAX_STEPS` | run-specific | Thread explicitly into `apply_lr` (G175) |
 | `LR_MIN_RATIO` | `0.1` | Cosine schedule floor as fraction of peak |
 | `GRAD_CLIP` | `1.0` | Applied in fp32 even under bf16 autocast (G159) |

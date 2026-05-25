@@ -257,3 +257,40 @@ def test_prepare_decode_rejects_wrong_length_initial_nmm_states():
     truncated = full_states[:-1]
     with pytest.raises(ValueError, match="initial_nmm_states length"):
         model.prepare_decode(prompt, initial_nmm_states=truncated)
+
+
+def test_prepare_decode_rejects_wrong_batch_dim_initial_nmm_states():
+    """G244 — state built for B=1 passed to a prompt of B=2 must fail at
+    prepare_decode, not silently produce a shape-mismatch deep in the NMM."""
+    cfg, model = _tiny_model()
+    prompt = torch.randint(0, cfg.vocab_size, (2, 4))  # B=2
+    # Build states for B=1 — wrong batch dim.
+    wrong_b_states = [block.nmm.init_state(1, prompt.device) for block in model.blocks]
+    with pytest.raises(ValueError, match="initial_nmm_states batch dim"):
+        model.prepare_decode(prompt, initial_nmm_states=wrong_b_states)
+
+
+def test_prepare_decode_rejects_train_mode():
+    """G243 — train mode + dropout would silently break the decode-vs-full-forward
+    parity invariant because init_decode_cache and block.forward apply different
+    dropout patterns. Fail loudly so direct callers don't ship the bug."""
+    cfg, model = _tiny_model()
+    model.train()
+    prompt = torch.randint(0, cfg.vocab_size, (1, 4))
+    with pytest.raises(RuntimeError, match="prepare_decode requires model.eval"):
+        model.prepare_decode(prompt)
+
+
+def test_forward_step_rejects_train_mode():
+    """G243 — symmetric guard on forward_step. A caller could call
+    prepare_decode in eval, then flip the model to train and forward_step;
+    the silent divergence would still bite."""
+    cfg, model = _tiny_model()
+    model.eval()
+    prompt = torch.randint(0, cfg.vocab_size, (1, 4))
+    with torch.no_grad():
+        cache = model.prepare_decode(prompt)
+    model.train()
+    next_tok = torch.tensor([[0]], dtype=torch.long)
+    with pytest.raises(RuntimeError, match="forward_step requires model.eval"):
+        model.forward_step(next_tok, cache)

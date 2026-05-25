@@ -135,6 +135,26 @@ class TitansMAGGPT2(nn.Module):
           position:     int — position index of the next decoded token
                         (= prompt length P)
         """
+        # Eval-mode is part of the contract. In train mode with dropout > 0,
+        # init_decode_cache captures K, V from project_kv (no dropout), but
+        # subsequent forward_step's `forward_with_kv_cache` hardcodes
+        # `dropout_p=0` and skips resid_dropout — while the warm-up block
+        # forward DOES apply both dropouts. The two paths' attention outputs
+        # then differ, and any decode-vs-full-forward parity invariant breaks
+        # silently. (mlp.dropout also still fires at decode but not at the
+        # K, V capture, compounding the divergence.) Forcing eval here keeps
+        # the "decode matches a single full forward" invariant a hard guarantee
+        # rather than a hidden precondition.
+        if self.training:
+            raise RuntimeError(
+                "prepare_decode requires model.eval() mode. In train mode "
+                "with dropout > 0 the cached path's attention output differs "
+                "from a full forward's (decode skips resid_dropout / SDPA "
+                "dropout while warm-up applies them), silently breaking the "
+                "decode-vs-full-forward parity invariant. Call model.eval() "
+                "first, or use generate()/needle_in_haystack() which manage "
+                "the mode for you (G243)."
+            )
         B, P = prompt_idx.shape
         if P > self.config.block_size:
             raise ValueError(
@@ -162,6 +182,21 @@ class TitansMAGGPT2(nn.Module):
                     f"match model n_layer {len(self.blocks)}. Each block "
                     f"needs its own (M, S) pair; pass the full per-layer "
                     f"list returned by an earlier forward() / prepare_decode()."
+                )
+            # Same eager-failure rationale (G244): a mismatched B between the
+            # passed nmm_states and the prompt produces a deep, confusing
+            # shape error inside the first block's NMM forward. Check the
+            # first per-layer state's first M entry — all per-layer/per-key
+            # tensors share the same B by construction in init_state.
+            first_layer_M = nmm_states[0][0]
+            any_W = next(iter(first_layer_M.values()))
+            if any_W.shape[0] != B:
+                raise ValueError(
+                    f"initial_nmm_states batch dim {any_W.shape[0]} does not "
+                    f"match prompt batch dim {B}. The state's B must equal "
+                    f"the prompt's leading dim; rebuild the state with "
+                    f"nmm.init_state(B={B}, ...) or pass a prompt whose "
+                    f"leading dim matches the state's."
                 )
         kv_caches = []
         nmm_conv_buffers = []
@@ -197,6 +232,17 @@ class TitansMAGGPT2(nn.Module):
         position bounded by block_size — wpe lookup goes OOB past that.
         Caller should respect that bound.
         """
+        # Same eval-mode contract as prepare_decode (see G243). The two
+        # methods share the cache structure; if forward_step were allowed
+        # in train mode while prepare_decode required eval, a caller could
+        # silently combine an eval-mode cache with train-mode decode steps
+        # and hit the same parity divergence.
+        if self.training:
+            raise RuntimeError(
+                "forward_step requires model.eval() mode (G243). Call "
+                "model.eval() first, or use generate()/needle_in_haystack() "
+                "which manage the mode for you."
+            )
         B, T_new = token_id.shape
         assert T_new == 1, f"forward_step expects single token, got T={T_new}"
         pos_idx = cache["position"]

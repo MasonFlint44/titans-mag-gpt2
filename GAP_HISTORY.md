@@ -3657,3 +3657,57 @@ Gaps discovered during the code-writing phase. Format per `IMPLEMENTATION_PROMPT
 **Fix:** Added `test_needle_in_haystack_long_prompt_uses_cached_decode_path` — constructs a haystack of ~400 chars to push the encoded prompt past `block_size=64`, asserts (1) `model.forward()` fired between 1 and `(full_len // block_size) + 1` times (the warm-up chunks; a reintroduced sliding-window pattern would balloon this), (2) `model.prepare_decode()` fired exactly once, (3) `model.forward_step()` fired exactly 0 times (long-prompt branch caps decode at one sample from `last_logits`).
 **Test:** `tests/integration/test_needle_smoke.py::test_needle_in_haystack_long_prompt_uses_cached_decode_path`.
 **Affects:** `tests/integration/test_needle_smoke.py`.
+
+### G243 — `prepare_decode` / `forward_step` silently produced inconsistent results in train mode
+
+**Found:** Post-Phase-7 audit (third pass)
+**Symptom:** Both methods were documented as eval-only but nothing enforced it. In train mode with `dropout > 0`, the warm-up `block.forward` applies SDPA-internal dropout + `resid_dropout` on the attention proj output + `mlp.dropout`; the cached `forward_with_kv_cache` hardcodes `dropout_p=0.0` AND skips `resid_dropout` (the comment said "p=0 at eval, no-op") while the block's MLP at decode time still applies `mlp.dropout`. The result: the cached decode path's per-token output silently diverged from a full forward at the same position whenever called in train mode with non-zero dropout. The "decode matches a single full forward" parity invariant — the entire point of Option B — was only a guarantee in eval mode. `generate()` and `needle_in_haystack()` force eval and were safe, but any direct caller of `prepare_decode` / `forward_step` (e.g., custom inference loops) hit the divergence with no error message.
+**Root cause:** Phase 7.3 wrote `forward_with_kv_cache` for "decode time = inference time = no dropout" without making that assumption a runtime contract.
+**Fix:** Added explicit guards at the top of `prepare_decode` and `forward_step` that raise `RuntimeError` if `self.training` is True. The error message explains the parity-divergence rationale and points the user at `generate()` / `needle_in_haystack()` (which manage the mode for them). The two guards have parallel messages — `forward_step` covers the case where a caller calls `prepare_decode` in eval and then flips the model to train before `forward_step`.
+**Test:** `tests/integration/test_decode_parity.py::test_prepare_decode_rejects_train_mode` and `::test_forward_step_rejects_train_mode` — both call the method in train mode and assert the RuntimeError fires with the expected message.
+**Affects:** `model/titans_gpt2.py:TitansMAGGPT2.prepare_decode` and `:TitansMAGGPT2.forward_step` (new guards).
+
+### G244 — `prepare_decode` didn't validate batch dim of `initial_nmm_states`
+
+**Found:** Post-Phase-7 audit (third pass)
+**Symptom:** G240 added a length check on `initial_nmm_states` (`len(...) == n_layer`) but not a BATCH-dim check. If a caller passed states whose per-layer `(M, S)` tensors had `B` different from the prompt's `B`, the failure manifested deep inside the first block's NMM forward as a shape mismatch — same "deep, confusing error" UX problem G240 fixed for the length case.
+**Root cause:** G240's check only validated the OUTER list dimension; the inner tensor shapes (notably `B`) weren't checked at all.
+**Fix:** Extended G240's validation block to also inspect the first per-layer M-dict's first entry: `if any_W.shape[0] != B: raise ValueError(...)`. By the construction of `init_state` every tensor in the state graph shares the same B, so checking one is enough.
+**Test:** `tests/integration/test_decode_parity.py::test_prepare_decode_rejects_wrong_batch_dim_initial_nmm_states` — build states for B=1, pass them with a B=2 prompt, assert ValueError matches "initial_nmm_states batch dim".
+**Affects:** `model/titans_gpt2.py:TitansMAGGPT2.prepare_decode`.
+
+### G245 — `GLOSSARY.md` "Conv buffer" entry described pre-Phase-7 state
+
+**Found:** Post-Phase-7 audit (third pass)
+**Symptom:** The entry read "Conv buffer. Stateless — NOT part of `(M, S)`. … Mitigated at inference by maintaining a rolling conv window externally". Accurate before Phase 7, but Phase 7.1 added `NMM.step_with_conv` + `NMM.init_conv_buffer_from_prompt` — the conv buffer is now an explicit first-class API. The "externally" phrasing was actively misleading: a reader looking for "how does the project handle the conv-window train/inference discrepancy?" would not have learned about the actual solution from the glossary.
+**Root cause:** Phase 7 added the API but didn't update the glossary to describe it.
+**Fix:** Rewrote the "Conv buffer" entry to mention `step_with_conv` and `init_conv_buffer_from_prompt`, what they do (seed from warm-up, roll forward at each decode step), and what they replace (the v1 sliding-window pattern). Also added a new "Cached decode (Option B)" entry that names the whole pipeline so future readers can find it from any entry point. Updated the "KV cache" entry to mention `project_kv` and `forward_with_kv_cache`. Updated "Sliding window context strategy" to describe the v2 long-prompt path.
+**Test:** Documentation; no test.
+**Affects:** `GLOSSARY.md`.
+
+### G246 — `ARCHITECTURE.md` "Conv buffer in state" design-decision row described pre-Phase-7 state
+
+**Found:** Post-Phase-7 audit (third pass)
+**Symptom:** The row read "Not included; stateless conv | … Known train/inference discrepancy; mitigated by sliding-window context strategy in generate.py". The first half (not in (M, S)) is still true and correctly justified by Newton-Schulz needing 2D matrices. The second half (mitigation = sliding-window in generate.py) was wrong as of Phase 7 — generate.py now uses `step_with_conv` + an explicit conv buffer, NOT sliding-window.
+**Root cause:** Same as G245 — Phase 7 changed the inference path but the design-decisions table wasn't updated.
+**Fix:** Rewrote the row to (a) keep the "not in (M, S)" justification (Newton-Schulz 2D requirement), (b) explain the legacy `step()` discrepancy, (c) describe the Phase 7 `step_with_conv` + per-block conv buffer mitigation, (d) note that `step()` is now tests-only.
+**Test:** Documentation; no test.
+**Affects:** `ARCHITECTURE.md` Key Design Decisions table.
+
+### G247 — `CONFIG_REFERENCE.md` `WARMUP_STEPS` default didn't match any code default
+
+**Found:** Post-Phase-7 audit (third pass)
+**Symptom:** The CONFIG_REFERENCE optimizer constants table listed `WARMUP_STEPS = 2000` as if it were a module-level constant in `train.py`. It is not — `train.py` has no `WARMUP_STEPS` symbol; `apply_lr` requires `warmup_steps` as a positional arg per G175. The two CLI scripts have different defaults (`train.py --warmup-steps` defaults to 1000; `scripts/finetune.py --warmup-steps` defaults to 500), and `get_lr_multiplier`'s default of 1000 is unreachable since `apply_lr` always passes it explicitly. So "WARMUP_STEPS = 2000" was a documentation claim with no code referent — a user reading the table and looking for `WARMUP_STEPS` in `train.py` would not find it.
+**Root cause:** CONFIG_REFERENCE was written aspirationally — 2000 is a recommended value for production training but isn't enforced anywhere in code.
+**Fix:** Edited the row to mark 2000 as "recommended for production", note that there is no module-level constant (per G175 the arg is positional), and list the CLI defaults explicitly so the reader can map the documentation to the actual runtime behavior. Less invasive than aligning all defaults to 2000.
+**Test:** Documentation; no test.
+**Affects:** `CONFIG_REFERENCE.md` Optimizer constants table.
+
+### G248 — `TEST_PLAN.md` §14 regression coverage matrix stopped at G227
+
+**Found:** Post-Phase-7 audit (third pass)
+**Symptom:** The matrix mapped every gap from G1 through G227 to its defending test, but the 15 implementation-phase and post-implementation gaps (G228–G242) were absent. Every one of them DOES have a defending test (added alongside the fix), but a future contributor reading `TEST_PLAN.md` to find "which test defends G237?" would have to grep elsewhere. The matrix's "every gap with a silent-failure mode has a defending test" promise was technically still true but no longer self-evident from the document.
+**Root cause:** No process / hook updates `TEST_PLAN.md` when gaps are added; each batch added entries to `GAP_HISTORY.md` and the tests but didn't propagate to the matrix.
+**Fix:** Appended 15 rows to the matrix covering G228–G242. Each row names the defending test(s) using the same convention as the existing rows. Documentation-only patch; no behavior change.
+**Test:** Documentation; no test.
+**Affects:** `TEST_PLAN.md` §14 regression coverage matrix.
