@@ -3,6 +3,7 @@
 import dataclasses
 import os
 import tempfile
+from pathlib import Path
 
 import pytest
 import torch
@@ -12,11 +13,15 @@ from model.titans_gpt2 import TitansMAGGPT2
 from train import (
     BASE_LR_GPT2,
     BASE_LR_NMM,
+    LATEST_CKPT_NAME,
     base_lrs_from_constants,
     build_optimizer,
     compute_nmm_norm,
+    list_step_checkpoints,
     load_checkpoint,
+    prune_old_checkpoints,
     save_checkpoint,
+    save_checkpoint_rotating,
     train_step,
 )
 
@@ -179,3 +184,184 @@ def test_compute_nmm_norm_increases_when_M_is_larger():
     norms2 = compute_nmm_norm(states)
     for n1, n2 in zip(norms1, norms2):
         assert abs(n2 / n1 - 2.0) < 1e-5
+
+
+# ---------------------------------------------------------------------------
+# save_checkpoint_rotating + prune_old_checkpoints
+# ---------------------------------------------------------------------------
+
+
+def _save(tmp_path, step, cfg=None, model=None, opt=None, keep_last_n=3):
+    """Save one rotated checkpoint with the tiny setup. Returns the
+    `(saved_path, save_dir)` pair so tests don't have to recompute paths."""
+    if cfg is None:
+        cfg, model, opt = _tiny_setup()
+    saved = save_checkpoint_rotating(
+        tmp_path, model, opt, step=step, config=cfg, keep_last_n=keep_last_n,
+    )
+    return saved, Path(tmp_path)
+
+
+def test_save_rotating_creates_step_file_with_padded_name(tmp_path):
+    """Step filename is zero-padded to 7 digits so lex order == numeric
+    order even when steps span 6 -> 7 digit widths (cf. 9 vs 10 sorting
+    as '10' < '9' in lex)."""
+    saved, _ = _save(tmp_path, step=42)
+    assert saved.name == "step_0000042.pt"
+    assert saved.exists()
+
+
+def test_save_rotating_writes_latest_pt_as_copy_of_step(tmp_path):
+    """latest.pt must be a real file (not a symlink — Windows / cross-FS
+    safety) and identical content to the just-saved step file."""
+    saved, save_dir = _save(tmp_path, step=5)
+    latest = save_dir / LATEST_CKPT_NAME
+    assert latest.exists() and latest.is_file()
+    assert not latest.is_symlink()
+    assert latest.read_bytes() == saved.read_bytes()
+
+
+def test_save_rotating_latest_pt_tracks_most_recent_step(tmp_path):
+    """After saves at steps {1, 2, 3}, latest.pt's `step` field must be 3."""
+    cfg, model, opt = _tiny_setup()
+    for s in (1, 2, 3):
+        save_checkpoint_rotating(
+            tmp_path, model, opt, step=s, config=cfg, keep_last_n=10,
+        )
+    ckpt = load_checkpoint(tmp_path / LATEST_CKPT_NAME, torch.device("cpu"))
+    assert ckpt["step"] == 3
+
+
+def test_save_rotating_prunes_oldest_beyond_keep_last_n(tmp_path):
+    """keep_last_n=2 + 5 saves -> only the last 2 step files remain."""
+    cfg, model, opt = _tiny_setup()
+    for s in range(5):
+        save_checkpoint_rotating(
+            tmp_path, model, opt, step=s, config=cfg, keep_last_n=2,
+        )
+    step_files = list_step_checkpoints(tmp_path)
+    steps = [s for s, _p in step_files]
+    assert steps == [3, 4], (
+        f"expected step_0000003.pt + step_0000004.pt only; got {steps}"
+    )
+    # latest.pt still present and unaffected by pruning.
+    assert (tmp_path / LATEST_CKPT_NAME).exists()
+
+
+def test_save_rotating_keep_last_n_none_disables_pruning(tmp_path):
+    """keep_last_n=None: every save sticks around. This is the explicit
+    opt-out for users who want full step history (e.g., to plot loss
+    curves from intermediate ckpts)."""
+    cfg, model, opt = _tiny_setup()
+    for s in range(4):
+        save_checkpoint_rotating(
+            tmp_path, model, opt, step=s, config=cfg, keep_last_n=None,
+        )
+    steps = [s for s, _p in list_step_checkpoints(tmp_path)]
+    assert steps == [0, 1, 2, 3]
+
+
+def test_save_rotating_keep_last_n_zero_also_disables_pruning(tmp_path):
+    """`<= 0` is the same as None — convenient for users passing
+    `--keep-last-n 0` on the CLI."""
+    cfg, model, opt = _tiny_setup()
+    for s in range(4):
+        save_checkpoint_rotating(
+            tmp_path, model, opt, step=s, config=cfg, keep_last_n=0,
+        )
+    assert len(list_step_checkpoints(tmp_path)) == 4
+
+
+def test_save_rotating_does_not_touch_unrelated_files(tmp_path):
+    """Pruning only deletes files matching the `step_NNNNNNN.pt` pattern.
+    User-placed files (notes, configs, logs) and `latest.pt` are left
+    alone even when keep_last_n=1 triggers aggressive pruning."""
+    cfg, model, opt = _tiny_setup()
+    # Drop a user file BEFORE any saves.
+    user_note = tmp_path / "README.txt"
+    user_note.write_text("don't touch me")
+    # A masquerading file that LOOKS like a step ckpt but isn't (wrong digit
+    # width) — must not be touched either (regex anchors are strict).
+    masquerade = tmp_path / "step_42.pt"  # 2 digits, not 7
+    masquerade.write_text("not really a step ckpt")
+
+    for s in range(3):
+        save_checkpoint_rotating(
+            tmp_path, model, opt, step=s, config=cfg, keep_last_n=1,
+        )
+    # Pruning to 1 keeps step_0000002.pt only.
+    steps = [s for s, _p in list_step_checkpoints(tmp_path)]
+    assert steps == [2]
+    assert user_note.exists() and user_note.read_text() == "don't touch me"
+    assert masquerade.exists()
+    assert (tmp_path / LATEST_CKPT_NAME).exists()
+
+
+def test_save_rotating_creates_save_dir_if_missing(tmp_path):
+    """Auto-mkdir so the CLI default `ckpts/finetune` works in fresh repos
+    without the user having to `mkdir -p ckpts/finetune` first."""
+    target = tmp_path / "fresh" / "deep" / "ckpts"
+    assert not target.exists()
+    cfg, model, opt = _tiny_setup()
+    save_checkpoint_rotating(target, model, opt, step=0, config=cfg)
+    assert target.is_dir()
+    assert (target / "step_0000000.pt").exists()
+
+
+def test_save_rotating_step_files_round_trip_with_load_checkpoint(tmp_path):
+    """A rotated step file must load through `load_checkpoint` just like
+    a regular `save_checkpoint` file would — same dict layout."""
+    cfg, model, opt = _tiny_setup()
+    save_checkpoint_rotating(tmp_path, model, opt, step=7, config=cfg)
+    ckpt = load_checkpoint(tmp_path / "step_0000007.pt", torch.device("cpu"))
+    assert ckpt["step"] == 7
+    assert set(ckpt["state_dict"].keys()) == set(model.state_dict().keys())
+
+
+def test_list_step_checkpoints_returns_sorted_ascending(tmp_path):
+    """Out-of-order saves still come back sorted by numeric step.
+    Important for `prune_old_checkpoints` to identify the truly oldest."""
+    cfg, model, opt = _tiny_setup()
+    for s in (5, 1, 10, 3):
+        save_checkpoint_rotating(
+            tmp_path, model, opt, step=s, config=cfg, keep_last_n=None,
+        )
+    steps = [s for s, _p in list_step_checkpoints(tmp_path)]
+    assert steps == [1, 3, 5, 10]
+
+
+def test_list_step_checkpoints_empty_dir_returns_empty_list(tmp_path):
+    assert list_step_checkpoints(tmp_path) == []
+
+
+def test_list_step_checkpoints_missing_dir_returns_empty_list(tmp_path):
+    """Defensive: passing a path that doesn't exist (e.g., during a
+    pre-flight check before the first save) returns [], not raises."""
+    assert list_step_checkpoints(tmp_path / "does-not-exist") == []
+
+
+def test_prune_old_checkpoints_returns_paths_it_deleted(tmp_path):
+    """The function's return value is contractual — tests + the CLI rely
+    on it to log what was removed."""
+    cfg, model, opt = _tiny_setup()
+    for s in range(4):
+        save_checkpoint_rotating(
+            tmp_path, model, opt, step=s, config=cfg, keep_last_n=None,
+        )
+    deleted = prune_old_checkpoints(tmp_path, keep_last_n=2)
+    deleted_names = sorted(p.name for p in deleted)
+    assert deleted_names == ["step_0000000.pt", "step_0000001.pt"]
+    # The kept files are still present.
+    remaining = [s for s, _p in list_step_checkpoints(tmp_path)]
+    assert remaining == [2, 3]
+
+
+def test_save_rotating_overwrite_same_step_does_not_duplicate(tmp_path):
+    """Re-saving step N (e.g., a retry after a NaN-skip cycle in
+    run_training) overwrites the existing step_N file rather than
+    creating a duplicate. The file count stays the same; latest.pt
+    refreshes."""
+    cfg, model, opt = _tiny_setup()
+    save_checkpoint_rotating(tmp_path, model, opt, step=1, config=cfg)
+    save_checkpoint_rotating(tmp_path, model, opt, step=1, config=cfg)
+    assert len(list_step_checkpoints(tmp_path)) == 1

@@ -2,11 +2,17 @@
 
 import dataclasses
 import math
+import os
+import re
+import shutil
+import time
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
+from tqdm.auto import tqdm
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +311,103 @@ def load_checkpoint(path, device: torch.device) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint rotation
+# ---------------------------------------------------------------------------
+
+# Step checkpoints are named `step_{N:07d}.pt`. The fixed width keeps lex
+# order == numeric order so callers can `sorted(dir.glob("step_*.pt"))` if
+# they want to skip our helpers. 7 digits comfortably covers any realistic
+# training run (up to 10M steps).
+_STEP_CKPT_RE = re.compile(r"^step_(\d{7})\.pt$")
+LATEST_CKPT_NAME = "latest.pt"
+
+
+def list_step_checkpoints(save_dir) -> list:
+    """Return `[(step, Path)]` for all rotated checkpoints in `save_dir`,
+    sorted by step ascending. Files that don't match `step_NNNNNNN.pt`
+    (including `latest.pt` and any user-placed files) are ignored.
+    """
+    p = Path(save_dir)
+    if not p.is_dir():
+        return []
+    out = []
+    for entry in p.iterdir():
+        m = _STEP_CKPT_RE.match(entry.name)
+        if m and entry.is_file():
+            out.append((int(m.group(1)), entry))
+    out.sort(key=lambda t: t[0])
+    return out
+
+
+def prune_old_checkpoints(save_dir, keep_last_n) -> list:
+    """Delete oldest `step_*.pt` files until at most `keep_last_n` remain.
+
+    Returns the list of `Path`s that were deleted (useful for tests and
+    logging). `keep_last_n=None` or `<= 0` means unbounded — nothing is
+    pruned. `latest.pt` and any non-matching files are never touched.
+    """
+    if keep_last_n is None or keep_last_n <= 0:
+        return []
+    existing = list_step_checkpoints(save_dir)
+    if len(existing) <= keep_last_n:
+        return []
+    to_delete = existing[: len(existing) - keep_last_n]
+    deleted = []
+    for _step, path in to_delete:
+        try:
+            path.unlink()
+            deleted.append(path)
+        except FileNotFoundError:
+            # Another process beat us to it; not an error worth crashing for.
+            pass
+    return deleted
+
+
+def save_checkpoint_rotating(
+    save_dir,
+    model: nn.Module,
+    optimizer: AdamW,
+    step: int,
+    config,
+    keep_last_n: int = 3,
+) -> Path:
+    """Save a step checkpoint into `save_dir` and prune oldest beyond `keep_last_n`.
+
+    Writes two files:
+      - `step_{N:07d}.pt` — the rotated, immutable per-step checkpoint
+      - `latest.pt`       — a COPY (not symlink) of the most recent step,
+                            so consumers don't need to know the step number
+                            and the file works on Windows
+
+    Why copy and not symlink: symlinks are cross-filesystem-fragile on some
+    Linux setups and outright unsupported on Windows. A copy costs one
+    extra fsync per save (negligible compared to the model write) and Just
+    Works everywhere.
+
+    `keep_last_n=None` or `<= 0` keeps every checkpoint (no pruning).
+    Default `3` is a reasonable balance — enough to recover from a bad
+    save or an OOM-truncated last write, small enough to bound disk.
+
+    Returns the `Path` to the rotated step file.
+    """
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    step_path = save_dir / f"step_{step:07d}.pt"
+    save_checkpoint(step_path, model, optimizer, step, config)
+
+    # Mirror to latest.pt. Atomic replace (write to .tmp then rename) so a
+    # mid-save crash never leaves latest.pt half-written.
+    latest_path = save_dir / LATEST_CKPT_NAME
+    tmp_path = save_dir / f"{LATEST_CKPT_NAME}.tmp"
+    shutil.copyfile(step_path, tmp_path)
+    os.replace(tmp_path, latest_path)
+
+    prune_old_checkpoints(save_dir, keep_last_n)
+    return step_path
+
+
+# ---------------------------------------------------------------------------
 # 4.5 — Training loop helpers
 # ---------------------------------------------------------------------------
 
@@ -342,11 +445,13 @@ def run_training(
     accum_steps: int = 1,
     log_every: int = 50,
     save_every: int = None,
-    save_path: str = None,
+    save_dir: str = None,
+    keep_last_n: int = 3,
     config=None,
     autocast_dtype: torch.dtype = None,
     rank: int = 0,
     is_distributed: bool = False,
+    show_progress: bool = True,
 ) -> None:
     """Top-level training loop covering both Phase 4.4 (fine-tune) and 4.5
     (from-scratch). One optimizer.step per accumulation cycle of `accum_steps`
@@ -379,6 +484,18 @@ def run_training(
     accumulated grads and end training — re-iterating mid-cycle would
     re-process the same micro-batches across ranks asymmetrically and
     drift them.
+
+    Checkpointing: when both `save_every` and `save_dir` are set, every
+    `save_every` completed cycles (and on the final step) write a rotated
+    checkpoint via `save_checkpoint_rotating` into `save_dir`. Files are
+    named `step_{N:07d}.pt` plus a `latest.pt` copy of the most recent;
+    only the most recent `keep_last_n` step files are retained (default 3).
+    Pass `keep_last_n=None` to disable pruning.
+
+    Progress: when `show_progress=True` and `rank == 0`, a `tqdm` bar with
+    per-step `loss`, `grad_norm`, `lr`, `tok/s`, and mean `nmm` norm is
+    drawn to stderr. `log_every` periodic dumps are emitted via
+    `tqdm.write` so they don't tear the bar.
     """
     import contextlib
 
@@ -386,62 +503,85 @@ def run_training(
     model.train()
     nmm_states = None
 
+    # Progress bar — only on rank 0, never under explicit show_progress=False.
+    bar = tqdm(
+        total=max_steps,
+        desc="train",
+        unit="step",
+        disable=not (show_progress and rank == 0),
+        dynamic_ncols=True,
+        leave=True,
+    )
+
     step = 0
     micro_batches = iter(loader)
-    while step < max_steps:
-        cycle_ran_any_microbatch = False
-        cycle_completed = True
+    tokens_since_last_step = 0
+    step_t0 = time.perf_counter()
+    last_lr_mul = 0.0
+    try:
+        while step < max_steps:
+            cycle_ran_any_microbatch = False
+            cycle_completed = True
 
-        for accum_i in range(accum_steps):
-            try:
-                batch = next(micro_batches)
-            except StopIteration:
-                batch = None
-
-            if batch is None and accum_i == 0:
-                # Loader exhausted exactly at cycle boundary. If we still
-                # have steps left, restart the iterator (next epoch); reset
-                # nmm_states since the new pass through the corpus is a
-                # fresh context. Returning here would be the silent-early-
-                # stop bug.
-                micro_batches = iter(loader)
-                nmm_states = None
+            for accum_i in range(accum_steps):
                 try:
                     batch = next(micro_batches)
                 except StopIteration:
-                    # Empty loader — nothing to do; stop.
-                    return
+                    batch = None
 
-            if is_partial_cycle(batch, accum_i):
-                # G214/G222: under DDP, this cycle's micro-batches ran with
-                # no_sync; per-rank .grad never AllReduce'd. Stepping would
-                # diverge ranks permanently. Discard + stop.
-                if is_distributed:
-                    optimizer.zero_grad(set_to_none=True)
-                    nmm_states = None  # G217 — match NaN-skip semantics
-                    return
-                # Single-GPU: partial is safe (no AllReduce). Treat as complete.
-                cycle_completed = False
-                break
+                if batch is None and accum_i == 0:
+                    # Loader exhausted exactly at cycle boundary. If we still
+                    # have steps left, restart the iterator (next epoch); reset
+                    # nmm_states since the new pass through the corpus is a
+                    # fresh context. Returning here would be the silent-early-
+                    # stop bug.
+                    micro_batches = iter(loader)
+                    nmm_states = None
+                    try:
+                        batch = next(micro_batches)
+                    except StopIteration:
+                        # Empty loader — nothing to do; stop.
+                        return
 
-            input_ids, doc_boundaries = batch
-            input_ids = input_ids.to(device, non_blocking=True)
-            doc_boundaries = doc_boundaries.to(device, non_blocking=True)
-            nmm_states = _detach_states(nmm_states)
+                if is_partial_cycle(batch, accum_i):
+                    # G214/G222: under DDP, this cycle's micro-batches ran with
+                    # no_sync; per-rank .grad never AllReduce'd. Stepping would
+                    # diverge ranks permanently. Discard + stop.
+                    if is_distributed:
+                        optimizer.zero_grad(set_to_none=True)
+                        nmm_states = None  # G217 — match NaN-skip semantics
+                        return
+                    # Single-GPU: partial is safe (no AllReduce). Treat as complete.
+                    cycle_completed = False
+                    break
 
-            is_last_accum = (accum_i == accum_steps - 1)
-            sync_ctx = (
-                model.no_sync()
-                if (is_distributed and not is_last_accum
-                    and hasattr(model, "no_sync"))
-                else contextlib.nullcontext()
-            )
+                input_ids, doc_boundaries = batch
+                input_ids = input_ids.to(device, non_blocking=True)
+                doc_boundaries = doc_boundaries.to(device, non_blocking=True)
+                nmm_states = _detach_states(nmm_states)
+                tokens_since_last_step += input_ids.numel()
 
-            with sync_ctx:
-                if autocast_dtype is not None:
-                    with torch.autocast(
-                        device_type=device.type, dtype=autocast_dtype
-                    ):
+                is_last_accum = (accum_i == accum_steps - 1)
+                sync_ctx = (
+                    model.no_sync()
+                    if (is_distributed and not is_last_accum
+                        and hasattr(model, "no_sync"))
+                    else contextlib.nullcontext()
+                )
+
+                with sync_ctx:
+                    if autocast_dtype is not None:
+                        with torch.autocast(
+                            device_type=device.type, dtype=autocast_dtype
+                        ):
+                            logits, nmm_states = model(
+                                input_ids, nmm_states, doc_boundaries
+                            )
+                            loss = F.cross_entropy(
+                                logits[:, :-1].reshape(-1, logits.size(-1)),
+                                input_ids[:, 1:].reshape(-1),
+                            ) / accum_steps
+                    else:
                         logits, nmm_states = model(
                             input_ids, nmm_states, doc_boundaries
                         )
@@ -449,61 +589,96 @@ def run_training(
                             logits[:, :-1].reshape(-1, logits.size(-1)),
                             input_ids[:, 1:].reshape(-1),
                         ) / accum_steps
-                else:
-                    logits, nmm_states = model(
-                        input_ids, nmm_states, doc_boundaries
-                    )
-                    loss = F.cross_entropy(
-                        logits[:, :-1].reshape(-1, logits.size(-1)),
-                        input_ids[:, 1:].reshape(-1),
-                    ) / accum_steps
-                loss.backward()
-            cycle_ran_any_microbatch = True
+                    loss.backward()
+                cycle_ran_any_microbatch = True
 
-        if not cycle_ran_any_microbatch:
-            break
+            if not cycle_ran_any_microbatch:
+                break
 
-        # One optimizer.step per completed accumulation cycle.
-        apply_lr(
-            optimizer, base_lrs, step,
-            warmup_steps=warmup_steps, max_steps=max_steps,
-        )
-        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-        if torch.isfinite(grad_norm):
-            optimizer.step()
-        else:
-            # G217 — match the train_step NaN-skip pattern.
-            nmm_states = None
-        optimizer.zero_grad(set_to_none=True)
-
-        if rank == 0 and step % log_every == 0:
-            nmm_norms = compute_nmm_norm(nmm_states)
-            print(
-                f"step={step} loss={loss.item() * accum_steps:.4f} "
-                f"grad_norm={grad_norm.item():.4f} nmm_norms={nmm_norms}"
+            # One optimizer.step per completed accumulation cycle.
+            last_lr_mul = apply_lr(
+                optimizer, base_lrs, step,
+                warmup_steps=warmup_steps, max_steps=max_steps,
             )
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            if torch.isfinite(grad_norm):
+                optimizer.step()
+            else:
+                # G217 — match the train_step NaN-skip pattern.
+                nmm_states = None
+            optimizer.zero_grad(set_to_none=True)
 
-        if (
-            save_every is not None
-            and save_path is not None
-            and step > 0
-            and step % save_every == 0
-        ):
-            # G199: rank 0 owns the write; all ranks barrier afterwards so
-            # the non-rank-0 processes don't race into the next iteration
-            # while rank 0 is still flushing to disk. Without the barrier,
-            # rank 0 falls behind on the next all-reduce and the timeout
-            # eventually fires on large checkpoints (1.5B-XL ~ 6 GB).
+            # Per-step metrics. `loss * accum_steps` undoes the per-microbatch
+            # division so reported loss is comparable across accum_steps choices.
+            step_dt = max(time.perf_counter() - step_t0, 1e-9)
+            tok_per_sec = tokens_since_last_step / step_dt
+            loss_full = loss.item() * accum_steps
+            grad_norm_v = grad_norm.item()
+            nmm_norms = compute_nmm_norm(nmm_states)
+            nmm_mean = (
+                sum(nmm_norms) / len(nmm_norms) if nmm_norms else float("nan")
+            )
+            cur_lr = optimizer.param_groups[0]["lr"]  # gpt2_decay group
+
             if rank == 0:
-                save_checkpoint(save_path, model, optimizer, step, config)
-            if is_distributed:
-                import torch.distributed as dist
-                dist.barrier()
+                bar.update(1)
+                bar.set_postfix(
+                    loss=f"{loss_full:.3f}",
+                    gn=f"{grad_norm_v:.2f}",
+                    lr=f"{cur_lr:.2e}",
+                    toks_s=f"{tok_per_sec:.0f}",
+                    nmm=f"{nmm_mean:.2f}" if nmm_norms else "nan",
+                    refresh=False,
+                )
+                if step % log_every == 0:
+                    # tqdm.write goes around the bar instead of through it.
+                    tqdm.write(
+                        f"step={step} loss={loss_full:.4f} "
+                        f"grad_norm={grad_norm_v:.4f} lr={cur_lr:.3e} "
+                        f"tok/s={tok_per_sec:.0f} "
+                        f"nmm_norms={nmm_norms}"
+                    )
 
-        step += 1
-        if not cycle_completed:
-            # Single-GPU partial cycle exhausted the loader; stop.
-            break
+            # Reset per-step accumulators.
+            tokens_since_last_step = 0
+            step_t0 = time.perf_counter()
+
+            # Periodic save + final-step save. `step > 0` skips the spurious
+            # save_every=N firing at step 0. The final-step save guarantees
+            # the last training state is on disk even when max_steps isn't a
+            # multiple of save_every.
+            is_final_step = (step + 1 >= max_steps)
+            save_due = (
+                save_every is not None
+                and save_dir is not None
+                and (
+                    (step > 0 and step % save_every == 0)
+                    or (is_final_step and config is not None)
+                )
+            )
+            if save_due:
+                # G199: rank 0 owns the write; all ranks barrier afterwards so
+                # the non-rank-0 processes don't race into the next iteration
+                # while rank 0 is still flushing to disk. Without the barrier,
+                # rank 0 falls behind on the next all-reduce and the timeout
+                # eventually fires on large checkpoints (1.5B-XL ~ 6 GB).
+                if rank == 0:
+                    saved_path = save_checkpoint_rotating(
+                        save_dir, model, optimizer, step, config,
+                        keep_last_n=keep_last_n,
+                    )
+                    if show_progress:
+                        tqdm.write(f"  saved {saved_path}")
+                if is_distributed:
+                    import torch.distributed as dist
+                    dist.barrier()
+
+            step += 1
+            if not cycle_completed:
+                # Single-GPU partial cycle exhausted the loader; stop.
+                break
+    finally:
+        bar.close()
 
 
 def _detach_states(states):
@@ -540,7 +715,18 @@ def main():
     parser.add_argument("--warmup-steps", type=int, default=1000)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--save-every", type=int, default=1000)
-    parser.add_argument("--save-path", default="ckpts/from_scratch.pt")
+    parser.add_argument(
+        "--save-dir",
+        default="ckpts/from_scratch",
+        help="Directory for rotated checkpoints (step_NNNNNNN.pt + latest.pt).",
+    )
+    parser.add_argument(
+        "--keep-last-n",
+        type=int,
+        default=3,
+        help="Retain the most recent N step checkpoints; older ones are deleted. "
+             "Pass 0 or a negative value to disable pruning.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -617,7 +803,8 @@ def main():
             accum_steps=args.grad_accum,
             log_every=args.log_every,
             save_every=args.save_every,
-            save_path=args.save_path,
+            save_dir=args.save_dir,
+            keep_last_n=args.keep_last_n,
             config=config,
             autocast_dtype=autocast_dtype,
             rank=rank,

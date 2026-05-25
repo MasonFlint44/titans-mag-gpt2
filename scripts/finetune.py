@@ -43,7 +43,18 @@ def main():
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--save-every", type=int, default=1000)
-    parser.add_argument("--save-path", default="ckpts/finetune.pt")
+    parser.add_argument(
+        "--save-dir",
+        default="ckpts/finetune",
+        help="Directory for rotated checkpoints (step_NNNNNNN.pt + latest.pt).",
+    )
+    parser.add_argument(
+        "--keep-last-n",
+        type=int,
+        default=3,
+        help="Retain the most recent N step checkpoints; older ones are deleted. "
+             "Pass 0 or a negative value to disable pruning.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -82,7 +93,8 @@ def main():
         accum_steps=args.grad_accum,
         log_every=args.log_every,
         save_every=args.save_every,
-        save_path=args.save_path,
+        save_dir=args.save_dir,
+        keep_last_n=args.keep_last_n,
         config=config,
         autocast_dtype=autocast_dtype,
     )

@@ -79,6 +79,7 @@ def test_run_training_executes_full_loop():
         device=torch.device("cpu"),
         max_steps=10, warmup_steps=2,
         log_every=100,  # silence
+        show_progress=False,
     )
     # If no exception, the loop completed.
 
@@ -91,6 +92,7 @@ def test_run_training_with_grad_accum_single_gpu():
         device=torch.device("cpu"),
         max_steps=5, warmup_steps=2, accum_steps=2,
         log_every=100,
+        show_progress=False,
     )
 
 
@@ -133,6 +135,7 @@ def test_run_training_restarts_loader_on_exhaustion_to_reach_max_steps():
         device=torch.device("cpu"),
         max_steps=10, warmup_steps=2,
         log_every=1000,  # silence
+        show_progress=False,
     )
     assert call_count["n"] == 10, (
         f"expected 10 forward calls (max_steps), got {call_count['n']} — "
@@ -149,6 +152,7 @@ def test_run_training_advances_params():
         device=torch.device("cpu"),
         max_steps=5, warmup_steps=2,
         log_every=100,
+        show_progress=False,
     )
     changed = sum(
         1 for n, p in model.named_parameters()
@@ -383,4 +387,5 @@ def test_run_training_reduces_loss_over_overfit():
         device=torch.device("cpu"),
         max_steps=20, warmup_steps=2,
         log_every=10,
+        show_progress=False,
     )
