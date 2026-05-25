@@ -194,10 +194,13 @@ Look for "Active memory" — if it's much larger than "Allocated memory" expecta
 
 3. **From-scratch model with `chunk_size < block_size`.** Untrained wpe rows beyond `chunk_size` silently degrade long-context generation. The config emits a `warnings.warn` for this case — check the run logs.
 
+4. **NMM sliding-window reprocessing during generation.** `generate.py` re-feeds the entire `block_size` window through the NMM at every decoded token. State updates compound by ~`block_size` per generated token, drifting M far from its trained regime. The longer the generation, the worse the drift. The correct architecture is KV-cache attention + single-token `step()` for the NMM; this repo's v1 does not have it. See the LOUD WARNING comment in `generate.py:generate`.
+
 ### Fix
 - Implement (or verify) the conv-window mitigation in `generate.step()`.
 - Chunk long prompts through the model — never feed >`block_size` tokens in one forward.
 - For from-scratch runs intended for long context, set `chunk_size = block_size`.
+- For #4, mitigations a user can apply WITHOUT a code change: cap `max_new_tokens`, or keep `out_scale` small so the NMM contribution stays bounded even when M has drifted. The proper fix is a KV cache + `step()`-based NMM update.
 
 ---
 

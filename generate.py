@@ -73,10 +73,22 @@ def generate(
 
             context_ids = torch.cat([context_ids, next_token], dim=1)
             window = context_ids[:, -block_size:]
-            # Sliding-window reprocessing: the NMM sees the window's old
-            # tokens again, which double-counts their updates. Acknowledged
-            # approximation — proper fix is a KV cache + step() for the new
-            # token only.
+            # !!! KNOWN LIMITATION: sliding-window NMM reprocessing !!!
+            # Every decoded token re-feeds the ENTIRE window through the
+            # NMM, which compounds state updates by ~block_size per
+            # generated token. After N generated tokens, M has absorbed
+            # ~N*block_size token-worth of updates instead of N+prompt_len.
+            # State magnitude drifts away from the train-time regime fast
+            # — generation quality (especially the NMM's contribution)
+            # degrades.
+            #
+            # The correct architecture is a KV cache for attention + a
+            # single-token step() for the NMM each decode iter. This
+            # repo's v1 does NOT have that. Mitigations a user can apply:
+            #   - cap max_new_tokens
+            #   - set out_scale near 0 (or finetune_mode=True) so NMM
+            #     contribution stays small even with drifted M
+            #   - implement KV cache (substantial change to attn forward)
             logits, nmm_states = model(window, nmm_states, None)
             next_logits = logits[:, -1, :]
 
