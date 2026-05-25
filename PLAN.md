@@ -3669,6 +3669,14 @@ Report accuracy vs. context length at {2K, 4K, 8K, 16K} tokens.
 Same eval-mode requirement as 5.1/5.2 — wrap in `@torch.no_grad()` and call
 `model.eval()` before the harness loop (G156).
 
+**Decode path**: same Option B cached pipeline as `generate.py` (§5.1).
+The decode loop uses `prepare_decode` + `forward_step` so each sampled
+token gets exactly one NMM update. Earlier versions re-fed the trailing
+`block_size` window through the NMM at every decoded token (the same
+sliding-window NMM-reprocess pattern Phase 7 fixed in `generate.py`);
+`tests/integration/test_needle_smoke.py::test_needle_in_haystack_uses_cached_decode_path`
+locks the cached path in via call counting.
+
 **Done:** harness runs and produces a result table for untrained model (random accuracy baseline).
 
 ---

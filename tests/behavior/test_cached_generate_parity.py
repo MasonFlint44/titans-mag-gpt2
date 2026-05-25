@@ -76,37 +76,58 @@ def test_cached_argmax_decode_matches_reset_and_replay_reference():
 def test_cached_decode_long_prompt_uses_full_context():
     """For a prompt longer than block_size, the cached decode warms up via
     chunked forward() over the prefix + prepare_decode on the tail. The
-    output should depend on tokens BEYOND the last block_size — i.e., two
+    output MUST depend on tokens beyond the last block_size — i.e., two
     long prompts that differ only in the prefix should produce different
-    cache.last_logits."""
+    cache["last_logits"].
+
+    Asserting at the LOGITS level (not the argmax token) is the strong
+    form of the test: the prefix-only delta would otherwise have to vanish
+    through every block's NMM update to leave logits identical. At
+    untrained random init that's vanishingly unlikely if the prefix
+    actually reached the NMM. Argmax token equality is not a useful
+    invariant — at untrained init the same token can win both vocab
+    distributions even when they differ by ~0.01.
+    """
     torch.manual_seed(0)
     cfg, model = _tiny_model_real_vocab()
     tok = Tokenizer()
 
     base_tail = "the lazy dog ran around the park very fast in circles "
-    # block_size=32; aim for >40-token prompts.
-    long_prompt_a = ("prefix A: " + "filler text content " * 8) + base_tail
-    long_prompt_b = ("prefix B: " + "filler text content " * 8) + base_tail
+    # block_size=32; aim for >40-token prompts whose LAST block_size tokens
+    # are identical so any logit difference comes from the prefix.
+    prefix_a = "prefix A is short. "
+    prefix_b = "prefix B differs substantially from prefix A in content. "
+    long_prompt_a = (prefix_a + "filler text content " * 8) + base_tail
+    long_prompt_b = (prefix_b + "filler text content " * 8) + base_tail
 
     # Confirm both prompts > block_size.
-    a_len = len(tok.encode(long_prompt_a))
-    b_len = len(tok.encode(long_prompt_b))
-    assert a_len > cfg.block_size
-    assert b_len > cfg.block_size
+    a_ids = tok.encode(long_prompt_a)
+    b_ids = tok.encode(long_prompt_b)
+    assert len(a_ids) > cfg.block_size
+    assert len(b_ids) > cfg.block_size
 
-    out_a = generate(
-        model, long_prompt_a, max_new_tokens=1,
-        temperature=0, top_k=None, tokenizer=tok,
+    # Run the same chunked-warm-up + prepare_decode path that generate uses,
+    # and compare last_logits directly.
+    def _last_logits_for(ids_list):
+        torch.manual_seed(0)  # model is deterministic; only random source
+        ids = torch.tensor(ids_list, dtype=torch.long).unsqueeze(0)
+        prompt_len = ids.size(1)
+        tail_start = prompt_len - cfg.block_size
+        nmm_states = None
+        with torch.no_grad():
+            for start in range(0, tail_start, cfg.block_size):
+                end = min(start + cfg.block_size, tail_start)
+                _, nmm_states = model(ids[:, start:end], nmm_states, None)
+            tail = ids[:, tail_start:]
+            cache = model.prepare_decode(tail, initial_nmm_states=nmm_states)
+        return cache["last_logits"].squeeze()  # [V]
+
+    logits_a = _last_logits_for(a_ids)
+    logits_b = _last_logits_for(b_ids)
+
+    diff = (logits_a - logits_b).abs().max().item()
+    assert diff > 1e-3, (
+        f"prefix difference produced ≈identical last_logits (max diff = "
+        f"{diff:.3e}); the prefix did not reach the NMM through the "
+        f"chunked-warm-up path"
     )
-    out_b = generate(
-        model, long_prompt_b, max_new_tokens=1,
-        temperature=0, top_k=None, tokenizer=tok,
-    )
-    # The first decoded token may or may not differ depending on the model's
-    # sensitivity to the prefix; the strict invariant we CAN guarantee is
-    # that NEITHER prompt crashed and the prefix went through the NMM
-    # (verified by the call-counting test test_generate_chunks_long_prompts_through_NMM).
-    # If outputs ARE different, that's also evidence the prefix reached the model.
-    # Here, just assert no crash and outputs are strings (smoke).
-    assert isinstance(out_a, str)
-    assert isinstance(out_b, str)

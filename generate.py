@@ -41,10 +41,12 @@ def generate(
 
     Mode is captured-and-restored via try/finally (G161).
 
-    max_new_tokens is capped to `block_size - prompt_len` because the
+    max_new_tokens is capped to `block_size - prompt_len + 1` because the
     KV-cache decode path uses absolute positions for wpe and would go OOB
-    past block_size. For longer generation you'd need RoPE or extrapolation
-    (not implemented).
+    past block_size. The +1 accounts for the first sampled token coming
+    from `cache["last_logits"]` (which needs no `forward_step` call and
+    therefore no wpe lookup at the new position). For longer generation
+    you'd need RoPE or extrapolation (not implemented).
     """
     was_training = model.training
     model.eval()
@@ -83,7 +85,15 @@ def generate(
         else:
             # Single-shot warm-up.
             cache = model.prepare_decode(context_ids)
-            max_new = min(max_new_tokens, block_size - prompt_len)
+            # +1 because the FIRST sampled token comes from cache["last_logits"]
+            # — it doesn't require a forward_step (and thus no wpe lookup at a
+            # new position). Only the remaining (max_new - 1) tokens hit
+            # forward_step, which needs `cache["position"] + k < block_size`
+            # for k = 0..max_new-2. The highest position used is therefore
+            # prompt_len + max_new - 2, giving max_new <= block_size - prompt_len + 1.
+            # At prompt_len == block_size, this yields max_new == 1 — the user can
+            # still sample one token from the last_logits without going OOB.
+            max_new = min(max_new_tokens, block_size - prompt_len + 1)
         next_logits = cache["last_logits"].squeeze(1)  # [B, vocab]
 
         generated = []

@@ -151,6 +151,78 @@ def test_generate_returns_string():
 
 
 # ---------------------------------------------------------------------------
+# Boundary: cap on max_new (off-by-one defended)
+# ---------------------------------------------------------------------------
+
+def _prompt_with_encoded_length(tok, n_tokens):
+    """Build a string whose `tok.encode(...)` length is exactly n_tokens.
+    Token ids 100..100+n_tokens-1 are deep in the BPE-merged range; decoding
+    them to a string and re-encoding round-trips losslessly in practice for
+    tiktoken's gpt2 encoding (verified by the assert below)."""
+    ids = list(range(100, 100 + n_tokens))
+    s = tok.decode(ids)
+    re_encoded = tok.encode(s)
+    # Round-trip can vary in length; trim from the END until it matches.
+    while len(re_encoded) > n_tokens:
+        ids = ids[:-1]
+        s = tok.decode(ids)
+        re_encoded = tok.encode(s)
+    while len(re_encoded) < n_tokens:
+        # Add a known-singleton-ASCII byte and re-check.
+        ids = ids + [ord("A")]
+        s = tok.decode(ids)
+        re_encoded = tok.encode(s)
+    assert len(re_encoded) == n_tokens, (
+        f"could not build prompt of exactly {n_tokens} tokens; got {len(re_encoded)}"
+    )
+    return s
+
+
+def test_generate_at_prompt_len_equals_block_size_returns_one_token():
+    """Prompt fills block_size exactly. The cap allows ONE sampled token
+    (from cache["last_logits"]) without any forward_step call — no wpe
+    OOB. The earlier `min(max_new, block_size - prompt_len)` cap was
+    off-by-one and returned an empty string here, silently dropping a
+    legitimately-available token."""
+    cfg, model = _tiny_model_real_vocab()
+    model.eval()
+    tok = Tokenizer()
+    prompt = _prompt_with_encoded_length(tok, cfg.block_size)
+    out = generate(
+        model, prompt, max_new_tokens=10,
+        temperature=0, top_k=None, tokenizer=tok,
+    )
+    n_out = len(tok.encode(out))
+    assert n_out == 1, (
+        f"expected exactly 1 sampled token at prompt_len == block_size, "
+        f"got {n_out}"
+    )
+
+
+def test_generate_short_prompt_respects_new_cap():
+    """For prompt_len < block_size, the new cap allows block_size - prompt_len + 1
+    tokens (one more than the old cap). Verify exactly that many tokens are
+    sampled when the user asks for more, and no crash on the runtime
+    block_size guard inside forward_step."""
+    cfg, model = _tiny_model_real_vocab()
+    model.eval()
+    tok = Tokenizer()
+    target_prompt_len = cfg.block_size - 5  # leave room for 6 decoded tokens
+    prompt = _prompt_with_encoded_length(tok, target_prompt_len)
+    expected_cap = cfg.block_size - target_prompt_len + 1  # = 6
+    out = generate(
+        model, prompt, max_new_tokens=expected_cap + 5,  # ask for too many
+        temperature=0, top_k=None, tokenizer=tok,
+    )
+    n_out = len(tok.encode(out))
+    # Cap should clip to exactly expected_cap (EOT short-circuit absent at
+    # this seed with the tiny model).
+    assert n_out <= expected_cap, (
+        f"output {n_out} tokens exceeds cap {expected_cap}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Perplexity contract + G161 mode restore
 # ---------------------------------------------------------------------------
 
