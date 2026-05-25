@@ -366,6 +366,115 @@ class NeuralMemoryModule(nn.Module):
         y_t = self.out_scale * self._batched_retrieve(M_t, q_hat)
         return y_t, (M_t, S_t)
 
+    def init_conv_buffer_from_prompt(self, x_chunk: torch.Tensor) -> dict:
+        """Seed conv buffers from the last (k-1) tokens of a warm-up prompt.
+
+        At decode time, step_with_conv needs the last (k-1) Linear-projected
+        values for each of q/k/v so the conv can see a full k-token window
+        (instead of T=1 step()'s zero-padded 1-token window). This helper
+        re-projects the prompt's tail; cheaper than threading buffer capture
+        through forward_chunk's batched projection path.
+
+        x_chunk: [B, T, d] — post-ln_nmm prompt input.
+        Returns dict {'q', 'k', 'v'} each [B, k-1, d]. Left-padded with
+        zeros if T < k-1.
+        """
+        k = self.k_proj.conv.kernel_size
+        pad_size = k - 1
+        B, T, d = x_chunk.shape
+        if T >= pad_size:
+            last = x_chunk[:, -pad_size:, :]
+        else:
+            zero_pad = torch.zeros(
+                B, pad_size - T, d,
+                device=x_chunk.device, dtype=x_chunk.dtype,
+            )
+            last = torch.cat([zero_pad, x_chunk], dim=1)
+        return {
+            "q": self.q_proj.linear(last),
+            "k": self.k_proj.linear(last),
+            "v": self.v_proj.linear(last),
+        }
+
+    def init_empty_conv_buffer(self, B: int, device, dtype=None) -> dict:
+        """Zero-initialized conv buffer — for decode with no warm-up prompt.
+        step_with_conv on the very first token with this buffer reduces to
+        the same computation as step() (zero left-pad, only the last kernel
+        weight active)."""
+        k = self.k_proj.conv.kernel_size
+        pad_size = k - 1
+        if dtype is None:
+            dtype = self.memory_mlp.W1.weight.dtype
+        zeros = torch.zeros(B, pad_size, self.n_embd, device=device, dtype=dtype)
+        return {"q": zeros.clone(), "k": zeros.clone(), "v": zeros.clone()}
+
+    def step_with_conv(
+        self,
+        x_t: torch.Tensor,
+        state: tuple,
+        conv_buffer: dict,
+    ) -> tuple:
+        """Decode-path single-token step that uses a conv buffer so the
+        depthwise conv sees a full k-token window (vs. step()'s T=1 with
+        zero-padding which silently disables 3 of 4 kernel weights).
+
+        x_t: [B, d]; state: (M_prev, S_prev); conv_buffer: dict {q, k, v}
+        each [B, k-1, d] of prior Linear projections.
+
+        Returns (y_t [B, d], new_state, new_conv_buffer).
+        """
+        if self.nmm_spectral_norm != self._spectral_norm_at_init:
+            raise RuntimeError(
+                "nmm_spectral_norm was mutated after construction "
+                f"(init={self._spectral_norm_at_init}, "
+                f"now={self.nmm_spectral_norm})."
+            )
+
+        M_prev, S_prev = state
+        x_unsq = x_t.unsqueeze(1)  # [B, 1, d]
+
+        # Linear projection only (no conv yet, no activation).
+        q_lin = self.q_proj.linear(x_unsq)  # [B, 1, d]
+        k_lin = self.k_proj.linear(x_unsq)
+        v_lin = self.v_proj.linear(x_unsq)
+
+        # Concat with buffer (last k-1 prior linear projections) -> length-k
+        # input. Run conv; take the LAST position (conv at that position uses
+        # the full [buffer | new] context).
+        q_input = torch.cat([conv_buffer["q"], q_lin], dim=1)  # [B, k, d]
+        k_input = torch.cat([conv_buffer["k"], k_lin], dim=1)
+        v_input = torch.cat([conv_buffer["v"], v_lin], dim=1)
+        q_conv = self.q_proj.conv(q_input)[:, -1, :]  # [B, d]
+        k_conv = self.k_proj.conv(k_input)[:, -1, :]
+        v_conv = self.v_proj.conv(v_input)[:, -1, :]
+
+        # Call-site SiLU + L2 (same as step()).
+        k_hat = F.normalize(F.silu(k_conv), dim=-1)
+        q_hat = F.normalize(F.silu(q_conv), dim=-1)
+        v = F.silu(v_conv)
+
+        theta_t = torch.sigmoid(self.W_theta(x_t)).squeeze(-1)
+        eta_t = torch.sigmoid(self.W_eta(x_t)).squeeze(-1)
+        alpha_t = torch.sigmoid(self.W_alpha(x_t)).squeeze(-1)
+
+        g_t = self.per_sample_grad_fn(M_prev, k_hat, v)
+        if self.nmm_spectral_norm:
+            g_tilde = {key: newton_schulz5(g) for key, g in g_t.items()}
+        else:
+            g_tilde = g_t
+
+        S_t = _dict_sub(_scale(eta_t, S_prev), _scale(theta_t, g_tilde))
+        M_t = _dict_add(_scale(1.0 - alpha_t, M_prev), S_t)
+        y_t = self.out_scale * self._batched_retrieve(M_t, q_hat)
+
+        # Update conv buffer: drop oldest, append the new linear projection.
+        new_buffer = {
+            "q": torch.cat([conv_buffer["q"][:, 1:, :], q_lin], dim=1),
+            "k": torch.cat([conv_buffer["k"][:, 1:, :], k_lin], dim=1),
+            "v": torch.cat([conv_buffer["v"][:, 1:, :], v_lin], dim=1),
+        }
+        return y_t, (M_t, S_t), new_buffer
+
     def _forward_chunk_sequential(
         self,
         x_chunk: torch.Tensor,
