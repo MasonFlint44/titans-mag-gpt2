@@ -531,68 +531,68 @@ Every gap in `GAP_HISTORY.md` that introduced a silent-failure mode (or near-mis
 
 | Gap | Defending test(s) | Section |
 |---|---|---|
-| G117 | `test_optimizer::test_exactly_4_groups`, `::test_no_param_in_two_groups` | §6 |
-| G123 | `test_memory_mlp::test_out_scale_zero_init_finetune`, `test_mag_gate::test_additive_at_out_scale_zero`, `test_step::test_out_scale_zero` | §3, §4 |
-| G134 | `test_checkpoint::test_round_trip` | §6 |
-| G136 | `test_block::test_swa_banded_mask` | §4 |
-| G143 | `test_config::test_factory_dims` | §2 |
-| G147 | `test_state_mgmt::test_build_init_m_helper` | §3 |
-| G149 | `test_state_mgmt::test_reset_state_byte_identical`, `::test_detach_states_none_safe` | §3 |
-| G150 | `test_config::test_factory_accepts_overrides` | §2 |
-| G151 | `test_dataloader::test_rank_sharding` | §5 |
-| G152 | `test_tokenizer::test_literal_endoftext_bpe_encoded` | §5 |
-| G153 | `test_optimizer::test_routing_correctness`, `test_checkpoint::test_round_trip` | §6 |
-| G154 | `test_forward_chunk::test_conv_sees_full_chunk` | §3 |
-| G155 | `test_full_model::test_apply_gpt2_init_stds` | §4 |
-| G156 | `test_hf_perplexity_parity::test_within_5_percent`, `test_generate::test_eval_mode` | §9, §6 |
-| G157 | `test_lr_schedule::test_scales_all_four_groups` | §6 |
-| G158 | `test_train_step::test_nan_does_not_corrupt`, `::test_returns_3_tuple` | §6 |
-| G159 | `test_train_step::test_bf16_backward_clip_step_fp32` | §6 |
-| G160 | `test_grad_fn::test_reduction_switch` | §3 |
-| G161 | `test_generate::test_model_training_restored`, `::test_restored_on_exception` | §6 |
-| G162 | `test_lr_schedule::test_base_lrs_survive_deflation` | §6 |
-| G163 | `test_config::test_from_scratch_warning` | §2 |
-| G164 | `test_scan_dispatcher::test_gates_on_grad_enabled` | §7 |
-| G166 | `test_config::test_swa_window_zero_rejected` | §2 |
-| G167 | `test_train_step::test_cpu_batch_to_gpu` | §6 |
-| G168 | `test_checkpoint::test_weights_only_false_succeeds` | §6 |
-| G172 | `test_checkpoint::test_compute_nmm_norm_none` | §6 |
-| G173 | `test_generate::test_temp_topk_softmax_order` | §6 |
-| G175 | `test_lr_schedule::test_respects_user_max_steps` | §6 |
-| G176 | `test_generate::test_long_prompt_chunked` | §6 |
-| G180 | `test_scan_dispatcher::test_allow_scan_training_all_blocks` | §7 |
+| G117 | `test_optimizer::test_exactly_four_param_groups`, `::test_no_parameter_appears_in_two_groups`, `::test_every_trainable_param_is_in_some_group` | §6 |
+| G123 | `test_memory_mlp::test_out_scale_init_zeros_in_finetune_mode`, `test_mag_gate::test_finetune_additive_gate_at_init_equals_y_attn_exactly`, `test_step::test_step_at_finetune_init_returns_zero_y` | §3, §4 |
+| G134 | `test_checkpoint::test_save_load_roundtrip_preserves_state_dict`, `::test_save_load_optimizer_state_populated_after_step` | §6 |
+| G136 | `test_persistent_mask::test_swa_banded_mask_attends_only_to_window` | §4 |
+| G143 | `test_config::test_gpt2_small_factory_dims`, `::test_gpt2_medium_factory_dims`, `::test_gpt2_large_factory_dims`, `::test_gpt2_xl_factory_dims` | §2 |
+| G147 | `test_memory_mlp::test_init_state_returns_M_and_zero_S`, `::test_init_state_shapes_match_build_init_M` | §3 |
+| G149 | `test_state_mgmt::test_reset_state_unmasked_entries_byte_identical`, `::test_detach_states_passes_None_through` | §3 |
+| G150 | `test_config::test_factory_accepts_dim_override`, `::test_factory_accepts_chunk_size_override`, `::test_factory_accepts_dropout_override` | §2 |
+| G151 | `test_dataloader::test_position_i_streams_are_contiguous_across_batches`, `::test_ddp_rank_partition_gives_disjoint_segments` | §5 |
+| G152 | `test_tokenizer::test_encode_corpus_literal_endoftext_is_BPE_not_special_id` | §5 |
+| G153 | `test_optimizer::test_layernorm_params_routed_to_no_decay`, `::test_out_scale_routed_to_nmm_no_decay`, `::test_gamma_mem_routed_to_nmm_no_decay`, `::test_persistent_mem_routed_to_nmm_no_decay`, `test_checkpoint::test_save_load_roundtrip_preserves_state_dict` | §6 |
+| G154 | `test_forward_chunk::test_forward_chunk_NOT_equal_to_T_many_step_calls` | §3 |
+| G155 | `test_full_model::test_wte_init_std_is_002_not_default_1`, `::test_wpe_init_std_is_002`, `::test_attn_output_projection_has_residual_scaling`, `::test_mlp_c_proj_has_residual_scaling`, `::test_attn_qkv_projections_use_unscaled_std` | §4 |
+| G156 | `test_hf_perplexity_parity` (`@pytest.mark.slow`), `test_generate::test_generate_keeps_eval_mode_if_caller_was_in_eval`, `test_perplexity_restores_training_mode` | §9, §6 |
+| G157 | `test_lr_schedule::test_apply_lr_scales_all_four_groups_proportionally`, `::test_apply_lr_preserves_3x_nmm_ratio` | §6 |
+| G158 | `test_train_step::test_nan_gradient_does_not_corrupt_parameters`, `::test_train_step_returns_three_values` | §6 |
+| G159 | `test_bf16_autocast_gpu` (gpu-tier) | §6 |
+| G160 | `test_grad_fn::test_reduction_switch_scales_gradient_by_inverse_d` | §3 |
+| G161 | `test_generate::test_generate_restores_training_mode_when_called_in_train_mode`, `::test_generate_keeps_eval_mode_if_caller_was_in_eval`, `test_perplexity_restores_training_mode` | §6 |
+| G162 | `test_lr_schedule::test_base_lrs_from_constants_does_not_read_optimizer_state` | §6 |
+| G163 | `test_config::test_from_scratch_short_chunk_warns`, `::test_finetune_short_chunk_does_not_warn`, `::test_from_scratch_equal_chunk_does_not_warn` | §2 |
+| G164 | `test_scan_dispatcher::test_dispatcher_uses_sequential_when_grad_enabled`, `::test_dispatcher_uses_scan_under_no_grad_when_no_boundaries` | §7 |
+| G166 | `test_config::test_swa_zero_window_rejected`, `::test_swa_negative_window_rejected` | §2 |
+| G167 | `test_train_step::test_train_step_handles_cpu_batch_via_to_device_transfer` | §6 |
+| G168 | `test_checkpoint::test_load_works_under_weights_only_false` | §6 |
+| G172 | `test_checkpoint::test_compute_nmm_norm_returns_None_when_states_is_None`, `::test_compute_nmm_norm_returns_one_float_per_layer` | §6 |
+| G173 | `test_generate::test_temperature_zero_is_deterministic_argmax`, `::test_top_k_actually_filters_to_top_k_tokens` | §6 |
+| G175 | `test_lr_schedule::test_apply_lr_respects_user_max_and_warmup_steps` | §6 |
+| G176 | `test_generate::test_generate_chunks_long_prompts_through_NMM` | §6 |
+| G180 | `test_scan_dispatcher::test_allow_scan_training_propagates_to_every_nmm`, `::test_top_level_model_attr_set_does_NOT_enable_scan` | §7 |
 | G181 | (structural — this whole document) | — |
-| G184 | `test_checkpoint::test_unwrap_compile_state_dict` | §6 |
-| G189 | `test_train_loop::test_documents_resource_managed` | §8 |
-| G190 | `test_config::test_validation_survives_O_flag` | §2 |
-| G198 | `test_newton_schulz::test_fp32_under_bf16_autocast` | §3 |
-| G199 | `test_checkpoint::test_ddp_save_rank_zero_only`, `test_ddp_setup::test_barrier_after_save` | §6, §11 |
-| G200 | `test_ddp_gradient_accumulation::test_no_sync_for_non_final` | §11 |
-| G201 | `test_ddp_setup::test_wrap_order`, `::test_init_destroy_pairing` | §11 |
-| G202 | `test_forward_chunk::test_boundary_mask_cpu_precomputed` | §3 |
-| G203 | `test_full_model::test_apply_gpt2_init_skips_nmm_by_id` | §4 |
-| G204 | `test_ddp_setup::test_per_rank_seed_diverges` | §11 |
-| G205 | `test_train_loop::test_config_before_loader` | §8 |
-| G206 | `test_config::test_chunk_size_gt_block_size_rejected` | §2 |
-| G207 | `test_state_mgmt::test_build_init_m_device_ordering` | §3 |
-| G208 | `test_generate::test_caller_supplied_tokenizer_reused` | §6 |
-| G209 | `test_checkpoint::test_resume_order` | §6 |
-| G210 | `test_tokenizer::test_encode_corpus_file_handle_warns` | §5 |
-| G211 | `test_forward_chunk::test_lazy_init_m` | §3 |
-| G213 | `test_train_step::test_nan_returns_none_states`, `test_nan_injection::test_nmm_state_nan` | §6, §13 |
-| G214 | `test_ddp_gradient_accumulation::test_partial_cycle_skip_step` | §11 |
-| G215 | `test_scan_dispatcher::test_has_assoc_scan_path_resolution` | §7 |
+| G184 | `test_compile_save_load_gpu` (gpu-tier; covers `_unwrap` round-trip) | §6 |
+| G189 | `test_resource_leak::test_finetune_opens_corpus_in_with_block`, `::test_train_main_opens_corpus_in_with_block` | §13 |
+| G190 | `test_config::test_validation_fires_under_python_O` | §2 |
+| G198 | `test_newton_schulz::test_internal_matmul_runs_fp32_under_bf16_autocast`, `::test_spectral_norm_bound_holds_under_bf16_autocast` | §3 |
+| G199 | `test_ddp_save_barrier` (covers rank-0 save + dist.barrier afterwards) | §6, §11 |
+| G200 | `test_ddp_gradient_accumulation` (ddp-tier, requires torchrun) | §11 |
+| G201 | `test_train_main_structure::test_init_process_group_called_before_ddp_wrap`, `::test_model_to_device_called_before_ddp_wrap`, `::test_ddp_wrap_before_optimizer_construction`, `::test_init_destroy_process_group_pair_present` (AST-level structural) | §11 |
+| G202 | `test_forward_chunk::test_boundary_mask_cpu_precomputed_not_per_token_indexed`, `::test_boundary_precomputation_does_not_fire_for_none_boundaries` | §3 |
+| G203 | `test_full_model::test_nmm_internal_inits_preserved_after_apply_gpt2_init`, `::test_renaming_self_nmm_does_not_break_id_skip_pattern` | §4 |
+| G204 | `test_train_main_structure::test_per_rank_seed_set_after_model_construction` (AST-level) | §11 |
+| G205 | `test_train_loop::test_run_training_executes_full_loop` (verifies config-before-loader ordering implicitly via run completion) | §8 |
+| G206 | `test_config::test_chunk_size_exceeds_block_size_rejected` | §2 |
+| G207 | `test_memory_mlp::test_build_init_M_is_cloned_not_a_view` (covers the clone part; the `.to().clone()` vs `.clone().to()` ordering is structural — no per-call test) | §3 |
+| G208 | `test_generate::test_generate_accepts_caller_supplied_tokenizer` | §6 |
+| G209 | `test_checkpoint::test_resume_with_no_optimizer_key_does_not_raise`, `test_train_loop::test_resume_advances_params_and_loads_optimizer_state` | §6 |
+| G210 | `test_tokenizer::test_encode_corpus_warns_on_file_handle`, `::test_encode_corpus_does_not_warn_on_list_of_documents`, `::test_encode_corpus_does_not_warn_on_generator_of_strings` | §5 |
+| G211 | `test_forward_chunk::test_forward_chunk_no_boundaries_does_not_build_init_M`, `::test_forward_chunk_builds_init_M_only_once_per_chunk_with_boundaries` | §3 |
+| G213 | `test_train_step::test_nan_skip_returns_None_nmm_states` | §6, §13 |
+| G214 | `test_ddp_gradient_accumulation` (ddp-tier) | §11 |
+| G215 | `test_scan_dispatcher::test_associative_scan_resolution_is_consistent` | §7 |
 | G216 | `test_weight_loading::test_hf_model_name_from_n_embd_table`, `::test_load_pretrained_rejects_unsupported_n_embd`, `::test_load_pretrained_factory_overrides_route_to_correct_hf_name` | §4 |
-| G217 | `test_nan_injection::test_accumulation_block_reset_nmm` | §13 |
-| G219 | `test_checkpoint::test_resume_without_optimizer_key` | §6 |
-| G220 | `test_attention::test_n_head_value_error_under_O` | §4 |
-| G221 | `test_checkpoint::test_resume_ends_with_train_mode` | §6 |
-| G222 | `test_ddp_gradient_accumulation::test_partial_cycle_off_by_one` | §11 |
-| G223 | `test_config::test_n_embd_n_head_divisibility_at_config_time` | §2 |
-| G224 | `test_full_model::test_apply_gpt2_init_relative_import` | §4 |
-| G225 | `test_ddp_cleanup::test_destroy_on_exception` | §11 |
-| G226 | `test_newton_schulz::test_explicit_autocast_disable` | §3 |
-| G227 | `test_ddp_cleanup::test_try_block_indentation` | §11 |
+| G217 | `test_train_step::test_run_training_accumulation_cycle_resets_nmm_states_on_nan`, `::test_run_training_continues_after_nan_skip_recovers` | §13 |
+| G219 | `test_checkpoint::test_resume_with_no_optimizer_key_does_not_raise` | §6 |
+| G220 | `test_attention::test_rejects_n_head_not_dividing_n_embd_via_ValueError`, `::test_attention_validation_survives_python_O` | §4 |
+| G221 | `test_checkpoint::test_resume_ends_with_model_train_mode` | §6 |
+| G222 | `test_train_loop::test_is_partial_cycle_at_K_minus_one`, `::test_is_partial_cycle_mid_cycle`, `::test_is_partial_cycle_at_cycle_start` (pure-function tests; ddp runtime in `test_ddp_gradient_accumulation`) | §11 |
+| G223 | `test_config::test_n_embd_not_divisible_by_n_head_rejected`, `::test_n_embd_divisibility_error_quotes_values` | §2 |
+| G224 | `test_full_model::test_apply_gpt2_init_uses_relative_import` | §4 |
+| G225 | `test_train_main_structure::test_main_wraps_training_in_try_finally`, `::test_destroy_process_group_called_in_finally` | §11 |
+| G226 | `test_newton_schulz::test_internal_matmul_runs_fp32_under_bf16_autocast` | §3 |
+| G227 | `test_train_main_structure::test_try_body_uses_consistent_4_space_indentation` | §11 |
 | G228 | (documentation drift — no defending test; see `tests/unit/test_config.py::test_factory_accepts_chunk_size_override` for override behavior) | §2 |
 | G229 | (documentation drift — field intentionally absent from config per YAGNI; no test) | — |
 | G230 | `test_newton_schulz::test_spectral_norm_bound_for_any_shape` (loosened bound `(0.80, 1.25)`) | §3 |

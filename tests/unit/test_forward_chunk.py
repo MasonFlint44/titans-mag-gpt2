@@ -139,6 +139,81 @@ def test_forward_chunk_resets_state_at_boundary():
 # Autograd
 # ---------------------------------------------------------------------------
 
+def test_boundary_mask_cpu_precomputed_not_per_token_indexed():
+    """T11 / G202 — the per-position 'any boundary?' mask must be computed
+    ONCE on CPU before the T-token loop, not via per-token GPU indexing
+    inside the loop. A regression to `doc_boundaries[:, t].any()` inside
+    the loop would create T implicit GPU->CPU syncs per chunk, killing
+    throughput silently (no functional change, just orders-of-magnitude
+    slower).
+
+    The defended pattern: `doc_boundaries.any(dim=0).cpu().tolist()` once
+    before the loop, then `any_boundary_per_t[t]` (pure Python list index)
+    inside. Verify by counting `.cpu()` calls during the forward — exactly
+    one .cpu() should fire (the precomputation), not T.
+    """
+    nmm = NeuralMemoryModule(n_embd=8, expansion=2, finetune_mode=False)
+    state = nmm.init_state(B=2, device=torch.device("cpu"))
+    T = 6
+    x = torch.randn(2, T, 8)
+    db = torch.zeros(2, T, dtype=torch.bool)
+    db[0, 2] = True
+    db[1, 4] = True
+
+    # Patch torch.Tensor.cpu to count calls. Subclass-aware via __torch_function__
+    # is overkill — just patch the method on the class.
+    original_cpu = torch.Tensor.cpu
+    cpu_call_count = {"n": 0}
+
+    def counting_cpu(self, *args, **kwargs):
+        cpu_call_count["n"] += 1
+        return original_cpu(self, *args, **kwargs)
+
+    torch.Tensor.cpu = counting_cpu
+    try:
+        _ = nmm.forward_chunk(x, state, doc_boundaries=db)
+    finally:
+        torch.Tensor.cpu = original_cpu
+
+    # The per-position boundary mask precomputation should call .cpu() once.
+    # T per-token GPU indexings would push this count toward T+1 (= 7) or
+    # higher. We allow some headroom for other transient .cpu() calls but
+    # bound it well below T.
+    assert cpu_call_count["n"] <= 2, (
+        f"`.cpu()` called {cpu_call_count['n']} times during forward_chunk "
+        f"on T={T}-token input — expected ~1 (the per-position boundary "
+        f"mask precomputation). A per-token GPU->CPU sync regression "
+        f"would push this toward T or higher (G202)."
+    )
+
+
+def test_boundary_precomputation_does_not_fire_for_none_boundaries():
+    """No doc_boundaries -> no .cpu() call at all (the precomputation
+    branch is skipped entirely). Defends G202's lazy-when-None
+    optimization."""
+    nmm = NeuralMemoryModule(n_embd=8, expansion=2, finetune_mode=False)
+    state = nmm.init_state(B=2, device=torch.device("cpu"))
+    x = torch.randn(2, 4, 8)
+
+    original_cpu = torch.Tensor.cpu
+    cpu_call_count = {"n": 0}
+
+    def counting_cpu(self, *args, **kwargs):
+        cpu_call_count["n"] += 1
+        return original_cpu(self, *args, **kwargs)
+
+    torch.Tensor.cpu = counting_cpu
+    try:
+        _ = nmm.forward_chunk(x, state, doc_boundaries=None)
+    finally:
+        torch.Tensor.cpu = original_cpu
+
+    assert cpu_call_count["n"] == 0, (
+        f"`.cpu()` fired {cpu_call_count['n']} times with doc_boundaries=None "
+        f"— the None-branch should skip the precomputation entirely."
+    )
+
+
 def test_forward_chunk_is_differentiable():
     """Backward through forward_chunk must produce gradients on the projection
     and update params."""

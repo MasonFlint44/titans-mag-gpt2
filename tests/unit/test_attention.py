@@ -102,3 +102,67 @@ def test_qkv_are_split_not_fused():
     assert attn.k_proj is not attn.v_proj
     # Independent weights at init.
     assert not torch.equal(attn.q_proj.weight, attn.k_proj.weight)
+
+
+# ---------------------------------------------------------------------------
+# T15 — determinism at dropout=0 (TEST_PLAN §4 spec)
+# ---------------------------------------------------------------------------
+
+def test_attention_output_deterministic_at_dropout_zero():
+    """T15 — `CausalSelfAttention(..., dropout=0.0)` must produce
+    bit-identical outputs for the same input across two forward calls.
+    No hidden RNG source should leak into the attention path when
+    dropout is disabled.
+
+    Catches: a refactor that accidentally introduces randomness (e.g.,
+    via a stochastic attention variant, a randomized k/v shuffle, or
+    a misconfigured nn.Dropout with p > 0)."""
+    attn = CausalSelfAttention(n_embd=16, n_head=2, dropout=0.0)
+    attn.eval()
+    x = torch.randn(2, 8, 16)
+    with torch.no_grad():
+        y1 = attn(x, mask=None)
+        y2 = attn(x, mask=None)
+    assert torch.equal(y1, y2), (
+        "attention output differs across identical calls at dropout=0.0 "
+        "with model.eval() — some RNG source is leaking in."
+    )
+
+
+def test_attention_output_deterministic_at_dropout_zero_with_causal_mask():
+    """T15 — same as above but with an explicit causal mask. The mask
+    path goes through a different SDPA codepath and could have its own
+    RNG bug."""
+    attn = CausalSelfAttention(n_embd=16, n_head=2, dropout=0.0)
+    attn.eval()
+    T = 8
+    causal = torch.triu(torch.full((T, T), float("-inf")), diagonal=1)
+    x = torch.randn(2, T, 16)
+    with torch.no_grad():
+        y1 = attn(x, mask=causal)
+        y2 = attn(x, mask=causal)
+    assert torch.equal(y1, y2), (
+        "attention output differs across identical calls at dropout=0.0 "
+        "with an explicit causal mask."
+    )
+
+
+def test_attention_output_deterministic_in_train_mode_at_dropout_zero():
+    """T15 — even in TRAIN mode, dropout=0.0 means no stochastic op
+    should fire. Verify that `.train()` doesn't accidentally enable
+    randomness when the rate is exactly 0.
+
+    The internal `self.resid_dropout.p if self.training else 0.0`
+    branch in CausalSelfAttention.forward picks up self.resid_dropout.p
+    in train mode; with that p=0 we should still get identical outputs.
+    """
+    attn = CausalSelfAttention(n_embd=16, n_head=2, dropout=0.0)
+    attn.train()  # train mode is the typical place dropout fires
+    x = torch.randn(1, 8, 16)
+    with torch.no_grad():
+        y1 = attn(x, mask=None)
+        y2 = attn(x, mask=None)
+    assert torch.equal(y1, y2), (
+        "attention in train mode at dropout=0.0 is not deterministic — "
+        "the p=0 fast path is broken."
+    )

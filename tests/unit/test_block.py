@@ -102,3 +102,111 @@ def test_block_works_with_swa_enabled():
     x = torch.randn(1, 8, 8)
     y, _ = block(x, nmm_state=state)
     assert y.shape == x.shape and torch.isfinite(y).all()
+
+
+# ---------------------------------------------------------------------------
+# T12 / T13 — NMM input contract (TEST_PLAN §4 test_block.py spec)
+# ---------------------------------------------------------------------------
+
+def _capture_nmm_forward_chunk_args(block):
+    """Wrap block.nmm.forward_chunk to capture (args, kwargs) of each call."""
+    captured = []
+    orig = block.nmm.forward_chunk
+
+    def capturing(*args, **kwargs):
+        captured.append((args, kwargs))
+        return orig(*args, **kwargs)
+
+    block.nmm.forward_chunk = capturing
+    return captured
+
+
+def test_nmm_receives_only_real_tokens_not_persistent_augmented():
+    """T12 — block.forward(x) where x has T real tokens must call
+    nmm.forward_chunk with a [B, T, d] tensor — NOT [B, T+N_p, d].
+    A refactor that accidentally passes x_aug (with persistent prefix
+    concatenated) would silently train the NMM on persistent-prefix-
+    augmented inputs, contaminating the meta-learned init.
+
+    Spec from TEST_PLAN.md §4: "patch nmm.forward_chunk to record
+    x.shape[1]; verify T (real tokens), not T + N_p".
+    """
+    cfg = _cfg(N_p=4, T=6)  # N_p=4 persistent, T=6 real
+    block = TitansMAGBlock(cfg)
+    captured = _capture_nmm_forward_chunk_args(block)
+    state = block.nmm.init_state(B=2, device=torch.device("cpu"))
+    x = torch.randn(2, 6, 8)  # B=2, T=6, d=8
+
+    _ = block(x, nmm_state=state)
+
+    assert len(captured) == 1, f"expected exactly 1 forward_chunk call, got {len(captured)}"
+    args, kwargs = captured[0]
+    # First positional arg is the input tensor.
+    x_to_nmm = args[0]
+    assert x_to_nmm.shape == (2, 6, 8), (
+        f"nmm.forward_chunk received shape {tuple(x_to_nmm.shape)}, expected "
+        f"(2, 6, 8). If shape[1] == 10 (= T + N_p = 6 + 4), the block is "
+        f"passing the persistent-augmented x_aug instead of x."
+    )
+
+
+def test_nmm_forward_chunk_called_with_doc_boundaries_arg():
+    """T13 — block.forward(x, nmm_state, doc_boundaries=db) must pass
+    `db` through to nmm.forward_chunk as its third argument. A regression
+    that drops the doc_boundaries arg (`forward_chunk(x_norm, state)`
+    instead of 3 args) would silently disable within-chunk state resets.
+
+    Spec from TEST_PLAN.md §4: "NMM called with 3 args — `forward_chunk(
+    x_norm, state, doc_boundaries)`, not 2".
+    """
+    cfg = _cfg(N_p=2, T=6)
+    block = TitansMAGBlock(cfg)
+    captured = _capture_nmm_forward_chunk_args(block)
+    state = block.nmm.init_state(B=2, device=torch.device("cpu"))
+    x = torch.randn(2, 6, 8)
+    db = torch.zeros(2, 6, dtype=torch.bool)
+    db[0, 0] = True
+    db[1, 3] = True  # mid-chunk boundary — would be ignored if dropped
+
+    _ = block(x, nmm_state=state, doc_boundaries=db)
+
+    assert len(captured) == 1
+    args, kwargs = captured[0]
+    # forward_chunk's signature: (x_chunk, state_in, doc_boundaries). The
+    # block could pass these as positional OR mix; check that doc_boundaries
+    # reaches the call by reconstructing the value.
+    all_call_values = list(args) + list(kwargs.values())
+    db_seen = any(
+        isinstance(v, torch.Tensor) and v.dtype == torch.bool
+        and v.shape == (2, 6) and torch.equal(v, db)
+        for v in all_call_values
+    )
+    assert db_seen, (
+        f"nmm.forward_chunk was NOT called with the doc_boundaries tensor "
+        f"the caller passed. Args seen: {[type(a).__name__ for a in args]}, "
+        f"kwargs: {list(kwargs.keys())}. The block must thread doc_boundaries "
+        f"through to nmm.forward_chunk."
+    )
+
+
+def test_nmm_forward_chunk_called_with_none_when_doc_boundaries_none():
+    """Complementary to T13: when block.forward is called WITHOUT
+    doc_boundaries (default None), nmm.forward_chunk must receive None,
+    not a fabricated all-zeros tensor or a missing arg that would default
+    elsewhere."""
+    cfg = _cfg(N_p=2, T=4)
+    block = TitansMAGBlock(cfg)
+    captured = _capture_nmm_forward_chunk_args(block)
+    state = block.nmm.init_state(B=1, device=torch.device("cpu"))
+    x = torch.randn(1, 4, 8)
+
+    _ = block(x, nmm_state=state)  # no doc_boundaries arg
+
+    assert len(captured) == 1
+    args, kwargs = captured[0]
+    all_call_values = list(args) + list(kwargs.values())
+    none_seen = any(v is None for v in all_call_values)
+    assert none_seen, (
+        f"nmm.forward_chunk received no None value — expected one of "
+        f"(x, state, doc_boundaries=None). Args: {args}, kwargs: {kwargs}."
+    )

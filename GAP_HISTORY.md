@@ -3759,3 +3759,20 @@ Gaps discovered during the code-writing phase. Format per `IMPLEMENTATION_PROMPT
 Total: 70 new tests (test count: 324 → 394 non-gpu/non-ddp).
 **Test:** All listed above pass under the existing `pytest -m "not gpu and not ddp"` suite.
 **Affects:** 7 test files (1 new: `test_weight_loading.py`; 6 extended: `test_train_loop.py`, `test_full_model.py`, `test_train_step.py`, `test_train_main_structure.py`, `test_config.py`, `test_tokenizer.py`); new `tests/performance/` directory with `test_perf_smoke.py`.
+
+### G253 — Five spec'd assertions missing + 60+ regression matrix entries pointing at non-existent test names
+
+**Found:** Audit pass — walked the regression matrix entries in `TEST_PLAN.md` §14 and grep-verified each ref resolves to an actual `def test_...` in the suite.
+**Symptom:** Two-part gap. (a) Five spec'd-in-TEST_PLAN test invariants had no corresponding test: G202 boundary-mask-CPU precomputation (matrix pointed at a name with no defender), "NMM receives real tokens only" (block.py spec line, no test), "NMM called with 3 args (doc_boundaries)" (block.py spec line, no test), "no fully-`-inf` row in aug_mask" (persistent_mask softmax-NaN guard, no test), and "attention output deterministic at dropout=0" (attention.py spec line, no test). (b) ~60 of the §14 regression matrix entries referenced tests by names that didn't actually exist — e.g. `test_optimizer::test_exactly_4_groups` (actual: `test_exactly_four_param_groups`), `test_checkpoint::test_round_trip` (actual: `test_save_load_roundtrip_preserves_state_dict`), `test_generate::test_eval_mode` (actual: `test_generate_keeps_eval_mode_if_caller_was_in_eval`). The tests EXISTED in most cases — but a reader using the matrix to find "which test defends G117" would have grepped for the matrix-named test and found nothing. Same class of bug as G216 (matrix claimed a defender that didn't exist), now systemically wrong across the matrix.
+**Root cause:** The matrix was hand-written from the spec'd test NAMES (which used short descriptive forms) rather than from the actual test function names that ended up in code. Each subsequent gap fix added its row, but no one walked the entire matrix to verify the references resolved.
+**Fix:** Two-part.
+  (a) Added 5 missing test groups (T11–T15):
+   - **T11**: `tests/unit/test_forward_chunk.py` got `test_boundary_mask_cpu_precomputed_not_per_token_indexed` (patches `torch.Tensor.cpu` to count calls; asserts ≤2 calls during a T=6 forward) + `test_boundary_precomputation_does_not_fire_for_none_boundaries`. Defends G202.
+   - **T12**: `tests/unit/test_block.py` got `test_nmm_receives_only_real_tokens_not_persistent_augmented` — patches `nmm.forward_chunk` to capture the input shape and asserts T (not T+N_p).
+   - **T13**: `tests/unit/test_block.py` got `test_nmm_forward_chunk_called_with_doc_boundaries_arg` (passes a recognizable boundary tensor, asserts it reaches forward_chunk) + `test_nmm_forward_chunk_called_with_none_when_doc_boundaries_none`.
+   - **T14**: `tests/unit/test_persistent_mask.py` got `test_aug_mask_no_row_is_fully_inf_standard_causal`, `::test_aug_mask_no_row_is_fully_inf_with_swa_at_edge_window` (swa_window=1, tightest case), and `::test_aug_mask_softmax_produces_no_nan_in_attention_forward` (end-to-end SDPA fed-mask sanity).
+   - **T15**: `tests/unit/test_attention.py` got 3 determinism tests (eval, with causal mask, in train mode with dropout=0).
+  (b) Updated 30+ rows in `TEST_PLAN.md` §14 to point at the ACTUAL test function names. Final check: every `test_*::test_*` reference in §14 grep-resolves to a real `def test_...` in `tests/` (verified via shell loop over extracted refs).
+**Test:** 11 new tests added (test count: 394 → 405). Verified all matrix refs resolve via:
+  `grep -oE 'test_[a-z_0-9]+::[a-z_0-9_A-Z]+' TEST_PLAN.md | sort -u | xargs -I{} grep -rq "def $(echo {} | cut -d: -f3)\b" tests/`
+**Affects:** 5 test files extended (`test_forward_chunk.py`, `test_block.py`, `test_persistent_mask.py`, `test_attention.py`, plus T11's accompanying changes); `TEST_PLAN.md` §14 regression matrix rebuilt from actual test names.
