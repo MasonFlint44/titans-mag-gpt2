@@ -175,6 +175,39 @@ mismatched shape (different `n_embd`, `nmm_low_rank`, etc.) — fails loud
 rather than silently producing garbage. Typical file size at `gpt2_small`
 full-rank bf16: ~336 MiB.
 
+### Interactive REPL
+
+For ad-hoc chatting with a trained checkpoint, add `--interactive`. The
+loop reads multi-line prompts from stdin (empty line sends), prints the
+completion, and **automatically threads the NMM state across turns** so
+the model remembers everything within the session — no `--nmm-state-file`
+juggling needed.
+
+```bash
+uv run python generate.py \
+    --checkpoint ckpts/latest.pt \
+    --interactive \
+    --temperature 0 --max-new-tokens 15
+```
+
+Inside the REPL:
+
+| Input | Effect |
+|---|---|
+| any text, ending with a blank line | Send the prompt to the model |
+| `/reset` | Clear the running NMM state (start a fresh session) |
+| `/help` | List commands |
+| `/quit` or Ctrl-D | Exit |
+
+Combine with `--nmm-state-file path.pt` to **load** a previously saved
+session on entry and **save** the final state on exit — useful for
+multi-session continuity. `--nmm-state-readonly` works the same as in
+the one-shot path. The `--prompt` flag is ignored in interactive mode.
+
+`--temperature 0` gives deterministic greedy decoding (good for
+sanity-checking recall); bump it to `0.7–0.9` with `--top-k 40` for
+sampling variety.
+
 ## Test
 
 ```bash
