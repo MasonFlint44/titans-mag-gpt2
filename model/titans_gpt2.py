@@ -128,6 +128,7 @@ class TitansMAGGPT2(nn.Module):
         self,
         prompt_idx: torch.Tensor,
         initial_nmm_states=None,
+        int8_kv_cache: bool = False,
     ) -> dict:
         """Warm up on a prompt, return the full DecodeCache for forward_step.
 
@@ -227,7 +228,9 @@ class TitansMAGGPT2(nn.Module):
         for block, nmm_state in zip(self.blocks, nmm_states):
             # Capture decode caches BEFORE the block mutates x — they're
             # functions of the block's INPUT, not its output.
-            k_cache, v_cache, conv_buf = block.init_decode_cache(x, nmm_state)
+            k_cache, v_cache, conv_buf = block.init_decode_cache(
+                x, nmm_state, int8_kv_cache=int8_kv_cache,
+            )
             kv_caches.append((k_cache, v_cache))
             nmm_conv_buffers.append(conv_buf)
             x, nmm_state = block(x, nmm_state, None)
@@ -244,7 +247,9 @@ class TitansMAGGPT2(nn.Module):
             "position": P,
         }
 
-    def prepare_decode_chunked(self, prompt_idx: torch.Tensor) -> dict:
+    def prepare_decode_chunked(
+        self, prompt_idx: torch.Tensor, int8_kv_cache: bool = False,
+    ) -> dict:
         """Prepare a decode cache for ANY prompt length (short or long).
 
         Encapsulates the chunked-warm-up + tail-prepare_decode pipeline that
@@ -278,7 +283,7 @@ class TitansMAGGPT2(nn.Module):
         block_size = self.config.block_size
         prompt_len = prompt_idx.size(1)
         if prompt_len <= block_size:
-            return self.prepare_decode(prompt_idx)
+            return self.prepare_decode(prompt_idx, int8_kv_cache=int8_kv_cache)
 
         # Long-prompt path: chunk prefix through forward() so the NMM sees
         # every token; then prepare_decode on the trailing block_size tokens.
@@ -289,7 +294,9 @@ class TitansMAGGPT2(nn.Module):
             chunk = prompt_idx[:, start:end]
             _, nmm_states = self(chunk, nmm_states, None)
         tail = prompt_idx[:, tail_start:]
-        return self.prepare_decode(tail, initial_nmm_states=nmm_states)
+        return self.prepare_decode(
+            tail, initial_nmm_states=nmm_states, int8_kv_cache=int8_kv_cache,
+        )
 
     def forward_step(self, token_id: torch.Tensor, cache: dict) -> tuple:
         """Single-token decode forward.

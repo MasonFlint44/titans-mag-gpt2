@@ -266,3 +266,106 @@ def test_cached_forward_swa_persistent_prefix_always_visible():
         f"persistent prefix V=100 was masked out by SWA — |y|.max = "
         f"{y.abs().max().item():.3e} (expected > 1 if persistent visible)."
     )
+
+
+# ---------------------------------------------------------------------------
+# G279: int8 KV cache for decode
+# ---------------------------------------------------------------------------
+
+
+def test_kv_cache_int8_class_round_trip():
+    from model.block import KVCacheInt8
+    torch.manual_seed(0)
+    x = torch.randn(2, 4, 16, 8) * 0.5
+    cache = KVCacheInt8.from_dense(x)
+    assert cache.int8.dtype == torch.int8
+    assert cache.scale.dtype == torch.float16
+    assert cache.shape == x.shape
+    # Round-trip should preserve up to ~1/127 of the per-row max.
+    deq = cache.dense(dtype=torch.float32)
+    per_row_max = x.abs().amax(dim=-1, keepdim=True)
+    max_err_per_row = (x - deq).abs().amax(dim=-1, keepdim=True)
+    rel = max_err_per_row / per_row_max.clamp(min=1e-6)
+    assert (rel < 0.02).all(), f"int8 round-trip error too large: {rel.max().item():.3f}"
+
+
+def test_kv_cache_int8_append():
+    from model.block import KVCacheInt8
+    torch.manual_seed(0)
+    x_prefix = torch.randn(2, 4, 8, 8) * 0.5
+    x_new = torch.randn(2, 4, 1, 8) * 0.5
+    cache = KVCacheInt8.from_dense(x_prefix)
+    cache2 = cache.append(x_new)
+    assert cache2.shape == (2, 4, 9, 8)
+    # The appended token's dequantized values should be ~x_new.
+    full = cache2.dense(dtype=torch.float32)
+    # Last token in cache2 corresponds to x_new (which has T=1).
+    last_token = full[:, :, -1:, :]
+    assert torch.allclose(last_token, x_new, atol=0.05)
+
+
+def test_prepare_decode_int8_cache_returns_KVCacheInt8():
+    from config import TitansConfig
+    from model.titans_gpt2 import TitansMAGGPT2
+    from model.block import KVCacheInt8
+
+    cfg = TitansConfig(
+        n_layer=2, n_head=4, n_embd=16, vocab_size=64,
+        block_size=32, chunk_size=32, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=2, nmm_conv_kernel=2,
+    )
+    model = TitansMAGGPT2(cfg).eval()
+    prompt = torch.randint(0, 64, (1, 8))
+    cache = model.prepare_decode(prompt, int8_kv_cache=True)
+    for k_cache, v_cache in cache["kv_caches"]:
+        assert isinstance(k_cache, KVCacheInt8)
+        assert isinstance(v_cache, KVCacheInt8)
+
+
+def test_int8_kv_cache_decode_close_to_dense():
+    """End-to-end: a few decoded tokens with int8 KV cache should produce
+    logits close to the dense path. Allow generous tolerance — int8
+    quantization adds noise per token, but the per-head per-token scaling
+    keeps absolute logit drift bounded for short decode runs."""
+    from config import TitansConfig
+    from model.titans_gpt2 import TitansMAGGPT2
+
+    torch.manual_seed(0)
+    cfg = TitansConfig(
+        n_layer=2, n_head=4, n_embd=16, vocab_size=64,
+        block_size=32, chunk_size=32, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=2, nmm_conv_kernel=2,
+    )
+    model = TitansMAGGPT2(cfg).eval()
+    prompt = torch.randint(0, 64, (1, 8))
+
+    cache_dense = model.prepare_decode(prompt)
+    cache_int8 = model.prepare_decode(prompt, int8_kv_cache=True)
+
+    # Decode 4 tokens.
+    for _ in range(4):
+        token = torch.tensor([[7]])
+        logits_dense, cache_dense = model.forward_step(token, cache_dense)
+        logits_int8, cache_int8 = model.forward_step(token, cache_int8)
+        assert torch.isfinite(logits_int8).all()
+        # Per-step drift bounded — int8 + per-row scaling is high-resolution.
+        max_diff = (logits_dense - logits_int8).abs().max().item()
+        max_dense = logits_dense.abs().max().item()
+        rel = max_diff / max(max_dense, 1e-6)
+        assert rel < 0.05, f"int8 decode rel drift too large: {rel:.3f}"
+
+
+def test_int8_kv_cache_memory_smaller_than_bf16():
+    """int8 cache holds ~half the bytes of a bf16 dense cache for the
+    same shape (modulo the per-(B, head, T) scale companion)."""
+    from model.block import KVCacheInt8
+    x_bf16 = torch.randn(1, 12, 64, 64, dtype=torch.bfloat16)
+    bf16_bytes = x_bf16.element_size() * x_bf16.numel()
+    cache = KVCacheInt8.from_dense(x_bf16)
+    int8_bytes = (
+        cache.int8.element_size() * cache.int8.numel()
+        + cache.scale.element_size() * cache.scale.numel()
+    )
+    assert int8_bytes < bf16_bytes, (
+        f"int8 cache ({int8_bytes} B) should be smaller than bf16 ({bf16_bytes} B)"
+    )

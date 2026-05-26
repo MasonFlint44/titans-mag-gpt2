@@ -54,14 +54,22 @@ def build_optimizer(
     weight_decay: float = WEIGHT_DECAY,
     betas: tuple = BETAS,
     eps: float = ADAM_EPS,
-) -> AdamW:
-    """Build the 4-group AdamW.
+    use_8bit: bool = False,
+):
+    """Build the 4-group AdamW (G278: optional 8-bit variant).
 
     Groups: (gpt2_decay, gpt2_no_decay, nmm_decay, nmm_no_decay).
     NMM groups get a higher LR (paper uses 3x); no_decay groups have wd=0.
 
     Every param must land in exactly one group. Verified by checking sum-of-
     group-sizes equals the model's total param count.
+
+    When `use_8bit=True`, the returned optimizer is `bnb.optim.AdamW8bit`
+    instead of `torch.optim.AdamW`. Optimizer state (m, v moments)
+    quantizes to 8-bit per-block — roughly 4x smaller than fp32. The
+    fp32 master weights are unaffected. Compatible with the existing
+    4-group layout. Requires `bitsandbytes` installed; falls back with a
+    clear error if missing.
     """
     gpt2_decay, gpt2_no_decay, nmm_decay, nmm_no_decay = [], [], [], []
     for name, p in model.named_parameters():
@@ -88,6 +96,23 @@ def build_optimizer(
             f"{total_params} trainable params — either a param is missing or "
             f"is double-counted across groups."
         )
+
+    if use_8bit:
+        try:
+            import bitsandbytes as bnb
+        except ImportError as e:
+            raise RuntimeError(
+                "use_8bit=True requires the `bitsandbytes` package. Install "
+                "with `pip install bitsandbytes` (or `uv pip install "
+                "bitsandbytes`)."
+            ) from e
+        # bnb.optim.AdamW8bit takes the same betas/eps/groups API as
+        # torch.optim.AdamW — drop-in replacement. The 8-bit quantization
+        # applies block-wise to m, v moments; the fp32 master weights are
+        # unaffected, so per-step numerics differ only by the moment-
+        # quantization noise (empirically <1% loss-curve drift in
+        # bitsandbytes' own benchmarks).
+        return bnb.optim.AdamW8bit(groups, betas=betas, eps=eps)
 
     return AdamW(groups, betas=betas, eps=eps)
 
@@ -713,6 +738,18 @@ def main():
     from data.tokenizer import Tokenizer
     from model.titans_gpt2 import TitansMAGGPT2
 
+    # G280: enable TF32 for fp32 matmul. Most of the model runs under
+    # bf16 autocast (attention, MLP, NMM Q/K/V projections); the remaining
+    # fp32 matmuls live in Newton-Schulz 5 (which opts out of autocast for
+    # the G226 fixed-point guarantee) and the analytical-grad LayerNorm
+    # internals. TF32 keeps the iteration variable in fp32 and only
+    # truncates matmul inputs from 23-bit to 10-bit mantissa — much less
+    # aggressive than bf16 throughout, and preserves NS5's spectral-norm
+    # convergence to ~1. ~5-15% step-time win depending on path. This is
+    # a process-global setting; placed here so it covers training and
+    # composes with any later eval / generate calls in the same process.
+    torch.set_float32_matmul_precision("high")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True)
     parser.add_argument("--size", default="small",
@@ -737,6 +774,26 @@ def main():
              "Pass 0 or a negative value to disable pruning.",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--compile-model",
+        action="store_true",
+        help="Wrap the full model in torch.compile after construction. Traces "
+             "the entire forward (embedding + N transformer blocks + LN + LM "
+             "head) into one Inductor graph per shape. Composes with "
+             "nmm_compile_inner_loop (the inner compile is taken first; the "
+             "outer compile then traces around it). Adds 1-3 minutes of "
+             "warm-up compile time on the first training step. Should give "
+             "10-20%% throughput on top of the inner-loop compile alone.",
+    )
+    parser.add_argument(
+        "--optim8bit",
+        action="store_true",
+        help="Use bitsandbytes' 8-bit AdamW for optimizer state (G278). Cuts "
+             "optimizer memory ~4x (8-byte fp32 moments -> 2-byte 8-bit "
+             "moments). Requires `bitsandbytes` package; install via "
+             "`pip install bitsandbytes`. Trained quality is empirically "
+             "close to fp32 AdamW; small drift possible at long horizons.",
+    )
     args = parser.parse_args()
 
     # Device selection — LOCAL_RANK aware under torchrun.
@@ -782,10 +839,20 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed + rank)
 
+        # G277 — full-forward torch.compile. Wrap BEFORE DDP so the
+        # compiled graph sees per-rank model without the DDP comm hooks
+        # threaded in. The `_unwrap` helper already strips both
+        # `_orig_mod.` (compile) and `module.` (DDP) prefixes so
+        # checkpoint save/load survives. mode="default" — same rationale
+        # as the inner-loop compile (G264a): dynamic shapes from per-
+        # chunk dict rebuilds make "reduce-overhead" + cudagraphs unsafe.
+        if args.compile_model:
+            model = torch.compile(model, mode="default", dynamic=False)
+
         if is_distributed:
             model = DDP(model, device_ids=[local_rank])
 
-        optimizer = build_optimizer(model)
+        optimizer = build_optimizer(model, use_8bit=args.optim8bit)
 
         tok = Tokenizer()
         with open(args.data, "r", encoding="utf-8") as f:

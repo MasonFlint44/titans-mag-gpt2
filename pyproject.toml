@@ -17,6 +17,12 @@ dependencies = [
     "tqdm>=4.66",
 ]
 
+[project.optional-dependencies]
+# G278 — 8-bit AdamW optimizer state via bitsandbytes. Optional; falls
+# back to torch.optim.AdamW when not installed (--optim8bit flag fails
+# loud with an install hint).
+optim8bit = ["bitsandbytes>=0.43"]
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",

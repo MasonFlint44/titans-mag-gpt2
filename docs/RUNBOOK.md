@@ -252,6 +252,44 @@ cfg = TitansConfig.gpt2_small(
     nmm_low_rank=64,
     nmm_layer_indices=[0, 3, 6, 9],
 )
+
+# 8. Inner-loop compile (G264a): 1.7-1.9x step-time speedup with
+#    paper-faithful sequential semantics. The single most impactful
+#    speed knob — recommended for any T >= 256 training run.
+#    First step pays a one-time torch.compile cost (~30-60s);
+#    subsequent steps are fast.
+cfg = TitansConfig.gpt2_small(
+    chunk_size=T, block_size=T,
+    nmm_grad_checkpoint=True, nmm_grad_checkpoint_segment_len=32,
+    nmm_state_dtype="bf16",
+    nmm_low_rank=64,
+    nmm_compile_inner_loop=True,   # the speedup
+    nmm_fused_kernel=True,         # +5% on top (analytical inner gradient)
+)
+# T=1024 measured: 158s/step (ref) -> 83s/step (combined). 1.90x.
+# T=256 measured:   40s/step (ref) -> 21s/step (combined). 1.90x.
+
+# 9. Blockwise NMM (G266): chunk-as-update aggregation — ONE memory
+#    update per `nmm_block_size` tokens, not per token. Per-block
+#    forward becomes a batched matmul (TC engages). Approximate
+#    (paper's per-token M_{t-1} replaced by per-block M_{block-1})
+#    but trains stably and unlocks REAL training throughput on
+#    consumer hardware. This is the recommended path for any
+#    serious training run at T >= 256.
+cfg = TitansConfig.gpt2_small(
+    chunk_size=T, block_size=T,
+    nmm_grad_checkpoint=True, nmm_grad_checkpoint_segment_len=32,
+    nmm_state_dtype="bf16",
+    nmm_low_rank=64,
+    nmm_block_size=64,             # 45x faster, 16 blocks per T=1024 chunk
+)
+# T=1024 measured: 83s/step (sequential best) -> 1.88s/step. 45x.
+# Loss trajectory @ blk=64 over 20 steps on fixed batch: 10.94 -> 6.94.
+# 50k-step run: ~31 hours @ blk=64 (vs 7 weeks sequential).
+# Larger block_size = faster but coarser approximation:
+#   block_size=128 -> 0.99s/step ( 86x), 50k-steps in 14h
+#   block_size=256 -> 0.53s/step (160x), 50k-steps in 7.5h
+#   block_size=512 -> 0.31s/step (274x), 50k-steps in 4.3h
 ```
 
 ---

@@ -250,3 +250,18 @@ def test_fuzzed_invalid_config_raises_value_error_with_informative_message(seed)
         f"ValueError message {msg!r} does not mention the offending field "
         f"{expected_substring!r}; kwargs={kwargs}"
     )
+
+
+def test_nmm_depth_default_is_2():
+    """Paper-default L_M; the only value the implementation supports today."""
+    cfg = TitansConfig.gpt2_small()
+    assert cfg.nmm_depth == 2
+
+
+def test_nmm_depth_rejects_other_values():
+    """L_M != 2 raises ValueError — wiring it up requires changes to the
+    analytical-gradient + Triton kernels that we have not made."""
+    import pytest
+    for bad in (1, 3, 4, 0, -1):
+        with pytest.raises(ValueError, match=r"nmm_depth=.*not supported"):
+            TitansConfig.gpt2_small(nmm_depth=bad)

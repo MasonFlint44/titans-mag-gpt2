@@ -336,65 +336,6 @@ def test_bf16_plus_grad_checkpoint_runs_end_to_end():
 
 
 # ---------------------------------------------------------------------------
-# nmm_compile_scan_training — flag wiring
-# ---------------------------------------------------------------------------
-
-
-def test_compile_scan_training_default_does_not_allow_scan():
-    """Default must keep _allow_scan_training=False so the sequential path
-    is always taken under autograd — the scan path is an APPROXIMATION
-    (gradients pre-computed at chunk-start M_0, not M_{t-1}) and silently
-    enabling it would change every existing training run's loss curve."""
-    cfg = TitansConfig(
-        n_layer=2, n_head=2, n_embd=8, vocab_size=16,
-        block_size=16, chunk_size=8, dropout=0.0,
-        nmm_n_persistent=0, finetune_mode=False,
-    )
-    from model.titans_gpt2 import TitansMAGGPT2
-    model = TitansMAGGPT2(cfg)
-    for block in model.blocks:
-        assert block.nmm._allow_scan_training is False
-
-
-def test_compile_scan_training_True_propagates_to_every_block():
-    """Setting nmm_compile_scan_training=True must flip
-    _allow_scan_training on every block's NMM at construction.
-    Without this, the user would have to call allow_scan_training(model)
-    manually before training, an easy step to forget."""
-    cfg = TitansConfig(
-        n_layer=3, n_head=2, n_embd=8, vocab_size=16,
-        block_size=16, chunk_size=8, dropout=0.0,
-        nmm_n_persistent=0, finetune_mode=False,
-        nmm_compile_scan_training=True,
-    )
-    from model.titans_gpt2 import TitansMAGGPT2
-    model = TitansMAGGPT2(cfg)
-    assert len(model.blocks) == 3
-    for i, block in enumerate(model.blocks):
-        assert block.nmm._allow_scan_training is True, (
-            f"block {i} did not receive _allow_scan_training=True"
-        )
-
-
-def test_compile_scan_training_propagates_through_multi_head():
-    """When nmm_n_heads > 1, the flag must reach every head's NMM."""
-    cfg = TitansConfig(
-        n_layer=1, n_head=2, n_embd=8, vocab_size=16,
-        block_size=16, chunk_size=8, dropout=0.0,
-        nmm_n_persistent=0, finetune_mode=False,
-        nmm_n_heads=2,
-        nmm_compile_scan_training=True,
-    )
-    from model.titans_gpt2 import TitansMAGGPT2
-    model = TitansMAGGPT2(cfg)
-    # nmm is a MultiHeadNMM; check each head.
-    for h_idx, head in enumerate(model.blocks[0].nmm.heads):
-        assert head._allow_scan_training is True, (
-            f"multi-head NMM head {h_idx} missing _allow_scan_training"
-        )
-
-
-# ---------------------------------------------------------------------------
 # nmm_cpu_offload_segments — config validation
 # ---------------------------------------------------------------------------
 

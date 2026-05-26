@@ -30,6 +30,7 @@ def generate(
     temperature: float = 1.0,
     top_k: int = 50,
     tokenizer: Tokenizer = None,
+    int8_kv_cache: bool = False,
 ) -> str:
     """Autoregressive sampling using KV-cache + single-token NMM step.
 
@@ -64,7 +65,9 @@ def generate(
 
         # Single call handles both short prompts (one-shot prepare_decode) and
         # long prompts (chunked-warm-up + tail prepare_decode). G249.
-        cache = model.prepare_decode_chunked(context_ids)
+        # G279: `int8_kv_cache=True` quantizes the cache to int8 + per-(B,h,t)
+        # scale — ~2× smaller, decode quality drift bounded for short runs.
+        cache = model.prepare_decode_chunked(context_ids, int8_kv_cache=int8_kv_cache)
         if prompt_len > block_size:
             # Long-prompt path: cache position is at block_size; forward_step
             # would wpe-OOB immediately. The user can sample at most ONE new

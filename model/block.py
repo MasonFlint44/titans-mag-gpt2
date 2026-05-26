@@ -9,56 +9,166 @@ from torch import cat
 from model.nmm import MultiHeadNMM, NeuralMemoryModule
 
 
+# G279 — int8 KV cache (decode-time only).
+#
+# Each cached K or V tensor at a transformer block has shape
+# [B, n_head, T_seen, head_dim]. Per-head, per-token symmetric int8
+# quantization compresses these to ~half the bf16 footprint (int8
+# values + per-(B,h,t) fp16 scale).
+#
+# Why per-(B, h, t) scale and not per-tensor: KV magnitudes vary
+# strongly across heads (some heads carry larger activations than
+# others) and across token positions (early vs late positions in long
+# sequences). Per-tensor would lose precision; per-(B,h,t) keeps
+# resolution per-row. Per-(B,h,t,d) would be max-precision but the
+# scale tensor would dominate the memory savings.
+#
+# Decode-only: training-time attention uses dense bf16 K, V. The cache
+# is only built at `prepare_decode` and only consumed at `forward_step`,
+# both in eval mode.
+
+
+def _quantize_int8_kv(x: torch.Tensor):
+    """Per-(B, head, T) symmetric int8 quantization.
+
+    Args:
+        x: [B, n_head, T, head_dim] tensor (any float dtype).
+
+    Returns:
+        (int8 [B, n_head, T, head_dim], scale [B, n_head, T, 1] fp16)
+        where dequantized = int8.float() * scale.float().
+    """
+    # Operate on a detached fp32 copy — KV cache is built in no_grad
+    # context (eval mode + prepare_decode), so detach is free.
+    x_f = x.detach().float()
+    max_abs = x_f.abs().amax(dim=-1, keepdim=True)        # [B, n_head, T, 1]
+    scale = (max_abs / 127.0).clamp(min=1e-8)
+    q = (x_f / scale).round().clamp(min=-128, max=127).to(torch.int8)
+    return q, scale.to(torch.float16)
+
+
+def _dequantize_int8_kv(q: torch.Tensor, scale: torch.Tensor, dtype=torch.bfloat16) -> torch.Tensor:
+    """Inverse of `_quantize_int8_kv`. Casts to `dtype` for the
+    downstream SDPA call (matches the rest of the decode-path dtype)."""
+    return (q.float() * scale.float()).to(dtype)
+
+
+class KVCacheInt8:
+    """G279 — quantized container for one (K or V) decode-time cache.
+
+    The class wraps `(int8_tensor, scale_tensor)` and exposes:
+      - `dense(dtype)`: full dequantized tensor, ready for SDPA.
+      - `append(new_fp_tensor)`: quantize a new token's K/V and append
+        along the T (time) dim, returning a new container.
+
+    Using a class (not a bare tuple) lets `isinstance(cache, KVCacheInt8)`
+    branch cleanly in `forward_with_kv_cache`; existing callers that
+    receive plain bf16 tensors keep working unchanged.
+
+    Memory: at gpt2_small (n_head=12, head_dim=64), per cached token:
+      bf16:  12 × 64 × 2 = 1.5 KB
+      int8:  12 × 64 × 1 + 12 × 1 × 2 = 0.79 KB  (~2× smaller)
+    """
+    __slots__ = ("int8", "scale")
+
+    def __init__(self, int8_tensor: torch.Tensor, scale_tensor: torch.Tensor):
+        self.int8 = int8_tensor
+        self.scale = scale_tensor
+
+    def dense(self, dtype=torch.bfloat16) -> torch.Tensor:
+        return _dequantize_int8_kv(self.int8, self.scale, dtype=dtype)
+
+    def append(self, new_fp_tensor: torch.Tensor) -> "KVCacheInt8":
+        q_new, s_new = _quantize_int8_kv(new_fp_tensor)
+        return KVCacheInt8(
+            torch.cat([self.int8, q_new], dim=2),
+            torch.cat([self.scale, s_new], dim=2),
+        )
+
+    @property
+    def shape(self):
+        return self.int8.shape
+
+    @property
+    def device(self):
+        return self.int8.device
+
+    @classmethod
+    def from_dense(cls, x: torch.Tensor) -> "KVCacheInt8":
+        q, s = _quantize_int8_kv(x)
+        return cls(q, s)
+
+
 def _state_to_flat(nmm_state) -> tuple:
     """Flatten an NMM state into a flat tuple of tensors + a structure
-    descriptor. Supports single-head `(M, S)` and multi-head
-    `[(M_h, S_h), ...]`. Used to thread NMM state through
-    `torch.utils.checkpoint.checkpoint`, which expects tensor-only
-    positional args.
+    descriptor. Supports:
+      - single-head, momentum_order=1: `(M, S_dict)`
+      - single-head, momentum_order>1: `(M, S_tuple)` where S_tuple is a
+        tuple of N dicts (G272)
+      - multi-head: `[(M_h, S_h), ...]` of either shape per head (G254)
 
     The key ordering is discovered from the dict itself (sorted) rather
-    than hardcoded, so low-rank `MemoryMLP` (6 state keys: W1_a, W1_b,
-    W_gate_a, W_gate_b, W2_a, W2_b) works identically to full-rank
-    (3 keys: W1, W_gate, W2). The descriptor carries the keys so
-    `_flat_to_state` can reverse it."""
+    than hardcoded, so low-rank `MemoryMLP` (6 state keys) works
+    identically to full-rank (3 keys). The descriptor carries the keys
+    AND the momentum order so `_flat_to_state` can reverse it.
+    """
+    def _flatten_single(M, S, keys):
+        order = len(S) if isinstance(S, (list, tuple)) else 1
+        flat = [M[k] for k in keys]
+        if order == 1:
+            flat.extend(S[k] for k in keys)
+        else:
+            for lvl in S:
+                flat.extend(lvl[k] for k in keys)
+        return flat, order
+
     if isinstance(nmm_state, list):
-        # Multi-head: list[n_heads] of (M_dict, S_dict). All heads share
-        # the same key set by construction (same MemoryMLP shape).
+        # Multi-head.
         n_heads = len(nmm_state)
-        sample_M, _ = nmm_state[0]
+        sample_M, sample_S = nmm_state[0]
         keys = tuple(sorted(sample_M.keys()))
+        order = len(sample_S) if isinstance(sample_S, (list, tuple)) else 1
         flat = []
         for M, S in nmm_state:
-            for k in keys:
-                flat.append(M[k])
-            for k in keys:
-                flat.append(S[k])
-        return tuple(flat), ("multi", n_heads, keys)
+            sub_flat, _ = _flatten_single(M, S, keys)
+            flat.extend(sub_flat)
+        return tuple(flat), ("multi", n_heads, keys, order)
     M, S = nmm_state
     keys = tuple(sorted(M.keys()))
-    flat = [M[k] for k in keys] + [S[k] for k in keys]
-    return tuple(flat), ("single", keys)
+    flat, order = _flatten_single(M, S, keys)
+    return tuple(flat), ("single", keys, order)
 
 
 def _flat_to_state(flat, descriptor):
     """Inverse of `_state_to_flat`. `flat` is an iterable of tensors;
     `descriptor` is the structure tag returned alongside the flat tuple."""
-    if descriptor[0] == "multi":
-        _, n_heads, keys = descriptor
+    def _unflatten_single(flat_slice, keys, order):
         k = len(keys)
-        per_head = 2 * k  # M keys + S keys
+        M = {key: flat_slice[i] for i, key in enumerate(keys)}
+        if order == 1:
+            S = {key: flat_slice[k + i] for i, key in enumerate(keys)}
+        else:
+            S_levels = []
+            for lvl in range(order):
+                base = k * (1 + lvl)
+                S_levels.append(
+                    {key: flat_slice[base + i] for i, key in enumerate(keys)}
+                )
+            S = tuple(S_levels)
+        return (M, S)
+
+    if descriptor[0] == "multi":
+        _, n_heads, keys, order = descriptor
+        per_head = len(keys) * (1 + order)
         states = []
         for h in range(n_heads):
             base = h * per_head
-            M = {key: flat[base + i] for i, key in enumerate(keys)}
-            S = {key: flat[base + k + i] for i, key in enumerate(keys)}
-            states.append((M, S))
+            states.append(_unflatten_single(
+                flat[base : base + per_head], keys, order,
+            ))
         return states
-    _, keys = descriptor
-    k = len(keys)
-    M = {key: flat[i] for i, key in enumerate(keys)}
-    S = {key: flat[k + i] for i, key in enumerate(keys)}
-    return (M, S)
+    _, keys, order = descriptor
+    return _unflatten_single(flat, keys, order)
 
 
 class CausalSelfAttention(nn.Module):
@@ -99,18 +209,25 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_dropout(self.proj(y))
 
-    def project_kv(self, x: torch.Tensor) -> tuple:
+    def project_kv(self, x: torch.Tensor, int8_kv_cache: bool = False) -> tuple:
         """Project x into (K, V) tensors shaped [B, n_head, T, head_dim].
 
         Used to seed the KV cache during warm-up: caller runs ln_1(x_aug),
         passes that here, gets the K, V that the attention would have used,
         stores them. No attention is computed — that runs separately during
         the warm-up forward.
+
+        When `int8_kv_cache=True`, the returned K, V are `KVCacheInt8`
+        objects instead of dense tensors. The dense tensor would be ~2×
+        the size of the int8 representation, which matters most for long
+        prompts at gpt2_small (~1.5 KB / token at n_head=12, head_dim=64).
         """
         B, T, C = x.shape
         n, d = self.n_head, self.head_dim
         k = self.k_proj(x).view(B, T, n, d).transpose(1, 2)
         v = self.v_proj(x).view(B, T, n, d).transpose(1, 2)
+        if int8_kv_cache:
+            return KVCacheInt8.from_dense(k), KVCacheInt8.from_dense(v)
         return k, v
 
     def forward_with_kv_cache(
@@ -146,9 +263,24 @@ class CausalSelfAttention(nn.Module):
         k_new = self.k_proj(x_new).view(B, 1, n, d).transpose(1, 2)
         v_new = self.v_proj(x_new).view(B, 1, n, d).transpose(1, 2)
 
-        # Append to cache along the T dim.
-        k_full = torch.cat([k_cache, k_new], dim=2)  # [B, n, T_seen + 1, d]
-        v_full = torch.cat([v_cache, v_new], dim=2)
+        # G279 — int8 KV cache branch: append new K, V in int8 form; dequant
+        # to bf16 for SDPA. The returned cache stays in int8 form to keep
+        # the memory footprint small across decode steps.
+        if isinstance(k_cache, KVCacheInt8):
+            new_k_cache = k_cache.append(k_new)
+            new_v_cache = v_cache.append(v_new)
+            # Dequantize ONLY for the SDPA call. Q is fp/bf16 (not cached);
+            # picking bf16 for the dense view matches the decode-path
+            # dtype contract.
+            sdpa_dtype = q.dtype
+            k_full = new_k_cache.dense(dtype=sdpa_dtype)
+            v_full = new_v_cache.dense(dtype=sdpa_dtype)
+        else:
+            # Dense (bf16) cache — original behavior.
+            k_full = torch.cat([k_cache, k_new], dim=2)  # [B, n, T_seen + 1, d]
+            v_full = torch.cat([v_cache, v_new], dim=2)
+            new_k_cache = k_full
+            new_v_cache = v_full
 
         # SWA at decode: matches warm-up's `_aug_mask` semantics. The new
         # real token (at the LAST absolute position) attends to:
@@ -178,7 +310,7 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, 1, C)
         y = self.proj(y)
         # resid_dropout at p=0 (eval) is a no-op; skip for clarity at decode.
-        return y, k_full, v_full
+        return y, new_k_cache, new_v_cache
 
 
 class GPT2MLP(nn.Module):
@@ -248,14 +380,20 @@ class PlainGPT2Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x, nmm_state  # state pass-through (typically None)
 
-    def init_decode_cache(self, x_prompt: torch.Tensor, nmm_state=None) -> tuple:
+    def init_decode_cache(
+        self, x_prompt: torch.Tensor, nmm_state=None, int8_kv_cache: bool = False,
+    ) -> tuple:
         """Decode-cache seed for the plain block: just the KV cache. No NMM
         conv buffer (the block has no NMM). Returned tuple shape matches
         TitansMAGBlock's so the model's per-block decode loop is uniform —
-        the third slot is None."""
+        the third slot is None.
+
+        `int8_kv_cache=True` returns `KVCacheInt8` containers (G279) for
+        the K and V caches; the rest of the block API is dtype-agnostic.
+        """
         B, T, _ = x_prompt.shape
         x_norm = self.ln_1(x_prompt)
-        k_cache, v_cache = self.attn.project_kv(x_norm)
+        k_cache, v_cache = self.attn.project_kv(x_norm, int8_kv_cache=int8_kv_cache)
         return k_cache, v_cache, None
 
     def forward_step(
@@ -341,11 +479,24 @@ class TitansMAGBlock(nn.Module):
             grad_checkpoint=config.nmm_grad_checkpoint,
             grad_checkpoint_segment_len=config.nmm_grad_checkpoint_segment_len,
             cpu_offload_segments=config.nmm_cpu_offload_segments,
-            allow_scan_training=config.nmm_compile_scan_training,
             low_rank=config.nmm_low_rank,
+            fused_kernel=config.nmm_fused_kernel,
+            compile_inner_loop=config.nmm_compile_inner_loop,
+            softclamp_max=config.nmm_softclamp_max,
+            block_size=config.nmm_block_size,
+            per_token_ns5=config.nmm_per_token_ns5,
+            detach_state_between_blocks=config.nmm_detach_state_between_blocks,
+            lookahead_value=config.nmm_lookahead_value,
+            per_param_lr_modulation=config.nmm_per_param_lr_modulation,
+            momentum_order=config.nmm_momentum_order,
+            compile_ns5=config.nmm_compile_ns5,
         )
         if config.nmm_n_heads > 1:
-            self.nmm = MultiHeadNMM(n_heads=config.nmm_n_heads, **nmm_kwargs)
+            self.nmm = MultiHeadNMM(
+                n_heads=config.nmm_n_heads,
+                per_head_learned_params=config.nmm_per_head_learned_params,
+                **nmm_kwargs,
+            )
         else:
             self.nmm = NeuralMemoryModule(**nmm_kwargs)
 
@@ -467,13 +618,16 @@ class TitansMAGBlock(nn.Module):
         new_state = _flat_to_state(new_flat, state_desc)
         return x_out, new_state
 
-    def init_decode_cache(self, x_prompt: torch.Tensor, nmm_state: tuple) -> tuple:
+    def init_decode_cache(
+        self, x_prompt: torch.Tensor, nmm_state: tuple, int8_kv_cache: bool = False,
+    ) -> tuple:
         """Seed the per-block decode caches from a warm-up prompt.
 
         Called once per block AFTER block.forward has already updated
         nmm_state on the prompt. Computes:
         - (k_cache, v_cache): K, V from attn over ln_1(x_aug_prompt),
           length N_p + T_prompt — includes the persistent prefix.
+          When `int8_kv_cache=True`, returned as `KVCacheInt8` containers.
         - nmm_conv_buffer: dict for NMM step_with_conv (last k-1 Linear
           projections of ln_nmm(prompt)).
 
@@ -487,7 +641,7 @@ class TitansMAGBlock(nn.Module):
         # persistent positions exactly the way warm-up's attention saw them.
         x_aug = cat([self.persistent_mem.expand(B, -1, -1), x_prompt], dim=1)
         x_aug_norm = self.ln_1(x_aug)
-        k_cache, v_cache = self.attn.project_kv(x_aug_norm)
+        k_cache, v_cache = self.attn.project_kv(x_aug_norm, int8_kv_cache=int8_kv_cache)
 
         # NMM conv buffer: last (k-1) Linear projections of ln_nmm input.
         # Under feed_persistent_to_nmm, the conv must have seen the persistent

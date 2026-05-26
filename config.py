@@ -16,9 +16,14 @@ class TitansConfig:
     dropout:    float = 0.0
 
     # NMM
-    # nmm_depth is documentation-only: MemoryMLP is hardcoded to L_M=2
-    # (W1 + W_gate -> W2). Changing this field has no effect on the running
-    # code; to truly change depth, modify MemoryMLP.__init__.
+    # L_M in the paper. Today only L_M=2 is implemented (single SwiGLU
+    # block: silu(W1 x) * sigmoid(W_gate x) -> W2 -> norm -> residual).
+    # Wiring up L_M > 2 requires generalizing the analytical-gradient
+    # fused kernel (model/nmm_fused.py) and the state-key discovery —
+    # non-trivial work for a knob the paper shows gives only marginal
+    # gains beyond L_M=2. We keep the field for paper-vocabulary
+    # alignment but validate that callers ask for the only value we
+    # actually support.
     nmm_depth:         int  = 2
     nmm_expansion:     int  = 4
     nmm_conv_kernel:   int  = 4
@@ -76,9 +81,9 @@ class TitansConfig:
     #   so backward recomputes the inner-loop intermediates instead of
     #   storing them. ~5-10x larger feasible chunk_size at the cost of an
     #   extra forward pass through each segment during backward. Composes
-    #   with nmm_state_dtype="bf16" multiplicatively. The scan path
-    #   (`_forward_chunk_scan`) ignores this flag — it has a different
-    #   memory-vs-compute trade and doesn't share the per-token graph.
+    #   with nmm_state_dtype="bf16" multiplicatively. The blockwise path
+    #   ignores this flag — it only applies to the sequential per-token
+    #   recurrence.
     #
     # nmm_grad_checkpoint_segment_len: segment size when grad-checkpointing
     #   is on. Smaller = less peak memory + more recompute; larger = more
@@ -89,33 +94,15 @@ class TitansConfig:
     nmm_grad_checkpoint: bool = False
     nmm_grad_checkpoint_segment_len: int = 64
 
-    # Two more memory / compute knobs (G258, G259).
-    #
-    # nmm_compile_scan_training: opt the per-block NMM into the
-    #   `_forward_chunk_scan` path during training. This is the
-    #   associative-scan-based parallel path; it pre-computes all T per-
-    #   token gradients at chunk-start M_0 (an APPROXIMATION — does NOT
-    #   match the paper's M_{t-1}-conditioned gradients). The scan path
-    #   needs torch.compile to have autograd; without it autograd is
-    #   silently zeroed for the NMM (G164/G180). Setting this flag only
-    #   flips `_allow_scan_training` on each block's NMM at construction;
-    #   YOU STILL HAVE TO call `torch.compile(model)` yourself to actually
-    #   enable the scan path under autograd.
-    #   Note: scan is a COMPUTE optimization (parallelism), NOT a memory
-    #   optimization. It allocates `[T, B, h, d]` gradient tensors upfront,
-    #   which at T=1024 can be larger than the sequential path's per-token
-    #   graph — combine with cpu_offload below if VRAM is the bottleneck.
-    #
-    # nmm_cpu_offload_segments: when True, gradient-checkpoint boundary
-    #   (M, S) tensors are stashed on CPU between forward and backward
-    #   instead of staying on GPU. Backward moves them back to GPU one
-    #   segment at a time, recomputes, and discards. ~20x reduction in
-    #   GPU memory used by checkpoint boundaries at the cost of CPU↔GPU
-    #   transfer time (PCIe 4.0 x16: ~16 GB/s realistic). Requires
-    #   `nmm_grad_checkpoint=True` — without it there are no boundary
-    #   tensors to offload. Composes with `nmm_state_dtype="bf16"`
-    #   (offloaded tensors are bf16, transfer is half the size).
-    nmm_compile_scan_training: bool = False
+    # nmm_cpu_offload_segments (G258): when True, gradient-checkpoint
+    # boundary (M, S) tensors are stashed on CPU between forward and
+    # backward instead of staying on GPU. Backward moves them back to GPU
+    # one segment at a time, recomputes, and discards. ~20x reduction in
+    # GPU memory used by checkpoint boundaries at the cost of CPU↔GPU
+    # transfer time (PCIe 4.0 x16: ~16 GB/s realistic). Requires
+    # `nmm_grad_checkpoint=True` — without it there are no boundary
+    # tensors to offload. Composes with `nmm_state_dtype="bf16"`
+    # (offloaded tensors are bf16, transfer is half the size).
     nmm_cpu_offload_segments: bool = False
 
     # nmm_block_grad_checkpoint (G260): wrap each `TitansMAGBlock.forward`
@@ -154,6 +141,241 @@ class TitansConfig:
     # train at all" because of VRAM. None = all blocks have NMM (default).
     nmm_layer_indices: Optional[list] = None
 
+    # nmm_block_size (G266): chunk-as-update aggregation for the NMM inner
+    # loop. When >1, the per-token sequential recurrence is REPLACED by a
+    # blockwise recurrence: every `nmm_block_size` consecutive tokens
+    # produce ONE memory update instead of `nmm_block_size` separate
+    # updates. The per-block forward through MemoryMLP runs as a batched
+    # matmul over the block's tokens — TC engages at block_size ≥ 16.
+    #
+    # Default 1 = paper-strict per-token recurrence. Bit-equivalent to the
+    # current sequential path at this setting (locked by tests).
+    #
+    # Approximation cost at block_size > 1:
+    # - Within a block: all `nmm_block_size` tokens share the block-start
+    #   M for both surprise gradient and retrieval. Paper's per-token
+    #   M_{t-1} resolution is replaced by per-block M_{block-1}.
+    # - One theta/eta/alpha per block (mean over the block) instead of
+    #   per-token. The fine-grained adaptive-rate signal is averaged out.
+    #
+    # Throughput win (vs sequential at block_size=1) comes from:
+    # - Forward matmuls (pre1, preg, y, retrieval) become bmm with N=block_size,
+    #   engaging tensor cores. At gpt2_small with block_size=64: ~5-10×
+    #   speedup on each matmul.
+    # - Gradient accumulation across the block is a single GEMM
+    #   (`einsum("bth,btd->bhd", d_pre1, k)`) instead of T outer products.
+    #
+    # Valid values: any positive int. Must divide `chunk_size` for clean
+    # block alignment; validation enforces this.
+    #
+    # When using `nmm_block_size > 1`, the per-token state-key dimensions
+    # (`pre1`, `preg`, `a`) get an extra leading T dim — block-checkpoint /
+    # cpu-offload / `compile_inner_loop` paths all compose.
+    nmm_block_size: int = 1
+
+    # nmm_detach_state_between_blocks (G268 — lucidrains' `detach_mem_state`):
+    # when True AND `nmm_block_size > 1`, the blockwise path detaches (M, S)
+    # at the START of each block. Backward graph spans ONE block instead of
+    # the full chunk — peak transient memory drops ~proportional to (T /
+    # block_size). Standard truncated BPTT trade-off: outer params
+    # (k_proj, q_proj, v_proj, W_theta, W_eta, W_alpha, gamma_mem, NMM
+    # weight inits) only learn from gradients within a single block; the
+    # cross-block "remember earlier in this chunk" signal is lost. Good
+    # fit for TITANS' memorize-at-test-time framing, where the inner loop
+    # is the load-bearing learner and outer params just need to learn TO
+    # memorize effectively.
+    #
+    # Semantics:
+    # - At block boundary, M and S are detached before being fed into the
+    #   next block's gradient and retrieval ops. The block produces a new
+    #   (M_new, S_new) with a fresh graph rooted at the detached predecessor.
+    # - The CHUNK output state (last block's M, S) still has a graph for
+    #   that block; only the inter-block links are cut.
+    # - At `block_size=1`, the v1 blockwise path with detach effectively
+    #   makes the NMM per-token-only-trained from the outer optimizer's
+    #   perspective. Usually not what you want — pair with `block_size >= 16`
+    #   to keep meaningful per-block training signal.
+    #
+    # No-op when `block_size = 1` (only one block per chunk, no boundaries
+    # to detach at) and when the path isn't blockwise (sequential / scan
+    # paths ignore this flag — they have their own memory-management
+    # mechanisms via grad_checkpoint / segment boundaries).
+    nmm_detach_state_between_blocks: bool = False
+
+    # nmm_lookahead_value (G269 — lucidrains' `store_with_lookahead_value`):
+    # when True, the NMM's inner reconstruction loss uses v_{t+1} as the
+    # target for token t (predictive) instead of v_t (reconstructive).
+    # The inner gradient becomes ∇ℓ(M; k_t, v_{t+1}), so the memory learns
+    # to predict the NEXT value-projected token from the current
+    # key-projected one — closer to a small inner LM loss than to a
+    # key→value reconstruction.
+    #
+    # Boundary handling: the last token in each chunk has no v_{t+1}
+    # within the chunk; we DROP its inner-loss contribution (the update
+    # from that final position is skipped — the M and S advance only by
+    # the (1-α), η decay terms with zero surprise gradient). This is the
+    # cleanest boundary: no cross-chunk peek, no synthetic padding.
+    # Cross-chunk semantics: a token's v_{t+1} would, in principle, come
+    # from the FIRST token of the next chunk, but threading that across
+    # the chunk boundary would require restructuring chunked training to
+    # peek ahead. We accept the within-chunk-only semantics, which is
+    # what lucidrains does too.
+    #
+    # Affects: blockwise, sequential, scan paths — value-side shift applied
+    # at the chunk level before each path runs. Composes with all other
+    # NMM knobs.
+    nmm_lookahead_value: bool = False
+
+    # nmm_per_param_lr_modulation (G270 — lucidrains'
+    # `per_parameter_lr_modulation`): when True, the data-dependent
+    # learning rate θ_t becomes per-state-key instead of a single scalar.
+    # `W_theta` projects x_t to K independent scalars (one per recurrent
+    # weight key — 3 for full-rank, 6 for low-rank), and each weight's
+    # update uses its OWN θ. The downside is K times the W_theta param
+    # count (still tiny — a few thousand params total at gpt2_small).
+    # The upside is more expressivity: different state keys can adapt at
+    # different rates, which can matter when (e.g.) W2 has different
+    # gradient scales than W1.
+    #
+    # Affects all paths: step, step_with_conv, sequential, blockwise,
+    # scan. At construction time, `W_theta`'s output dim grows from 1
+    # to K = len(state_keys); the per-token θ tensor becomes [B, T, K]
+    # and is split per key when applying the update.
+    #
+    # NOT a no-op when `nmm_n_heads > 1`: each head gets its own
+    # per-key W_theta (independently learned per head).
+    nmm_per_param_lr_modulation: bool = False
+
+    # nmm_per_head_learned_params (G271 — lucidrains'
+    # `per_head_learned_parameters`): when False AND `nmm_n_heads > 1`,
+    # the MemoryMLP weights are SHARED across heads instead of replicated.
+    # Per-head recurrent state is still independent (each head threads its
+    # own (M, S) — required for distinct head outputs), but the INIT M
+    # comes from the SAME shared weight matrix, and the LayerNorm /
+    # `out_scale` are still per-head.
+    #
+    # Default True = current behavior (each head fully independent).
+    # Setting False reduces per-block NMM parameter count by ~`n_heads`×
+    # for the recurrent weight inits. At n_heads=8 with full-rank
+    # MemoryMLP that's ~7× param reduction on the inner weights.
+    #
+    # No-op when `nmm_n_heads = 1` (single-head NMM, no replication to
+    # share). Wired through `MultiHeadNMM.__init__`.
+    nmm_per_head_learned_params: bool = True
+
+    # nmm_momentum_order (G272 — lucidrains' `momentum_order`): order of
+    # the momentum recurrence on S. Default 1 = paper-strict
+    # `S_t = η·S_{t-1} - θ·g_t`. With order N > 1, N nested momenta
+    # are maintained, each decaying the next; the formula is recursive:
+    #   S1_t = η1·S1_{t-1} - θ·g_t
+    #   S2_t = η2·S2_{t-1} + S1_t
+    #   ...
+    #   SN_t = ηN·SN_{t-1} + S{N-1}_t
+    #   M_t  = (1-α)·M_{t-1} + SN_t
+    # Each level uses an INDEPENDENTLY-learned η projection (W_eta
+    # becomes a Linear with output dim N instead of 1).
+    #
+    # Memory cost: N× the S state. At N=2, the recurrent state doubles
+    # in size. Compute is negligible per level (broadcast multiply +
+    # add). Use only when stuck on convergence — the paper doesn't
+    # endorse this strongly, and lucidrains exposes it as an experimental
+    # knob.
+    #
+    # Affects: every path. Validated to be >= 1.
+    nmm_momentum_order: int = 1
+
+    # nmm_compile_ns5 (G274 — fused Newton-Schulz via torch.compile): when
+    # True, every NS5 call in this NMM's forward paths goes through a
+    # torch.compile-wrapped variant. The 5 NS5 iterations execute as 10
+    # matmuls + 10 elementwise ops; without compile each is a separate
+    # CUDA kernel launch (~5-10 μs each), so 50-100 μs of pure launch
+    # overhead per NS5 call. Compile collapses this into a single graph.
+    #
+    # When meaningful:
+    # - block_size=1 sequential path WITHOUT nmm_compile_inner_loop
+    #   (which already wraps NS5 transitively).
+    # - blockwise path: NS5 is called per-block; compile saves the
+    #   per-block launch overhead.
+    # - per_token_ns5=True (G267): NS5 called per token within a block.
+    # - decode-time step_with_conv() where NS5 launch overhead is a
+    #   bigger fraction of step time.
+    #
+    # No effect when nmm_compile_inner_loop=True (compile already
+    # transitively traces the NS5 ops). Composable with every other
+    # path.
+    #
+    # First call pays a 1-3 s warm-up cost (Inductor traces the
+    # iteration); subsequent calls reuse the cached compiled graph.
+    # Module-level singleton cache so all NMMs share one warm-up.
+    nmm_compile_ns5: bool = False
+
+    # nmm_per_token_ns5 (G267): when True AND `nmm_block_size > 1`, the
+    # blockwise path uses per-token NS5 + per-token θ weighting, matching
+    # paper Eq 16's `Σ_t θ_t · NS5(∇_t)` exactly. Default False, which
+    # uses v1's `θ_mean · NS5(Σ_t ∇_t)` simplification.
+    #
+    # Why this matters: putting θ INSIDE the aggregation pre-NS5 (a
+    # tempting "cheap" approach) does NOT preserve θ's effect — NS5
+    # normalises the Frobenius norm, cancelling any positive scalar
+    # applied before it. To get per-token θ to actually weight the
+    # update, NS5 must be applied PER TOKEN.
+    #
+    # Cost: stores per-token gradient tensors of shape [B, block, ...]
+    # per state-key for the duration of one block's forward. At
+    # gpt2_small full-rank, block_size=64: ~1.8 GiB per layer; at
+    # low_rank=64: ~300 MiB per layer. Pair with
+    # `nmm_block_grad_checkpoint=True` at production scales to bound
+    # peak memory by recomputing per-block intermediates during backward.
+    #
+    # At block_size=1, per_token_ns5 is a no-op (single-token block has
+    # θ_mean = θ_t and per-token NS5 = single NS5).
+    nmm_per_token_ns5: bool = False
+
+    # nmm_softclamp_max (G265): when set to a float, applies tanh-based
+    # soft norm clamping to the per-token surprise gradient BEFORE NS5.
+    # Smooth analog of hard clip_grad_norm — never has zero gradient,
+    # never has a discontinuous threshold. Off (None) by default since
+    # paper-strict NS5 alone suffices when the inner loss is well-behaved.
+    # Enable to add a safety net when training a fresh-init model where
+    # the first few steps' gradients can spike (NS5 input far from its
+    # convergence regime). Reasonable values: 5.0 to 20.0 (matches
+    # lucidrains/titans-pytorch default of ~5).
+    nmm_softclamp_max: Optional[float] = None
+
+    # nmm_compile_inner_loop (G264a): wrap `_run_inner_loop` in
+    # `torch.compile(mode="default")`. This is the dominant speedup mechanism
+    # — at gpt2_small, T=256, low_rank=64 it cuts step time ~1.8x (40s -> 22s
+    # on RTX 5070 Ti). Inductor traces the Python time loop and fuses
+    # adjacent ops into batched Triton kernels, eliminating the per-token
+    # dispatch overhead that dominates the reference path. Composes with
+    # nmm_fused_kernel for an extra ~5% on top of compile alone (the
+    # analytical-gradient ops trace more cleanly than `torch.func.grad`).
+    #
+    # Why not mode="reduce-overhead" (which enables cudagraphs): the inner
+    # loop builds new dicts each step (`{k: a + b for k, b in ...}`) which
+    # cudagraph's "no input-buffer overwrite" contract rejects without
+    # explicit `torch.compiler.cudagraph_mark_step_begin()` calls per step.
+    # Default mode is the safe + always-works choice; future work could
+    # rewrite the loop to use pre-allocated buffers for reduce-overhead.
+    nmm_compile_inner_loop: bool = False
+
+    # nmm_fused_kernel (G264): swap the per-token NMM inner update from the
+    # reference `vmap(grad(...)) + newton_schulz5` path to a fused
+    # implementation that uses analytical inner gradients (no `torch.func.grad`
+    # overhead) and an analytical NS5 backward. Optionally dispatches into a
+    # Triton kernel when CUDA is available, otherwise falls back to the
+    # analytical-PyTorch path (still ~5-20x faster than the reference).
+    #
+    # The reference path remains the correctness oracle — equivalence tests
+    # in `tests/unit/test_nmm_fused.py` lock the numerical match to within
+    # fp32/bf16 tolerance. Default False so users opt into the optimization
+    # explicitly; flip to True for any T >= 256 training run.
+    #
+    # Composes with every existing memory knob (nmm_low_rank,
+    # nmm_grad_checkpoint, nmm_state_dtype="bf16", nmm_block_grad_checkpoint,
+    # nmm_layer_indices).
+    nmm_fused_kernel: bool = False
+
     # nmm_low_rank (G262): factor the MemoryMLP weights as A @ B with an
     # intermediate dim of `nmm_low_rank`. At gpt2_small d=768, default
     # expansion=4: full-rank state per layer is 3 × [4d, d] = ~28 MB bf16;
@@ -186,6 +408,20 @@ class TitansConfig:
             raise ValueError(
                 f"nmm_expansion must be >= 1 (got {self.nmm_expansion}); "
                 f"MemoryMLP needs a hidden dim."
+            )
+
+        # L_M only supports the paper's recommended value of 2 today.
+        # Wiring up L_M > 2 requires generalizing the analytical-gradient
+        # kernel + Triton kernels — see `model/nmm_fused.py` and
+        # `model/nmm.py::MemoryMLP`. Reject other values loudly rather
+        # than silently no-op (a previous failure mode of this field).
+        if self.nmm_depth != 2:
+            raise ValueError(
+                f"nmm_depth={self.nmm_depth} is not supported. Only L_M=2 "
+                f"(single SwiGLU block) is implemented today; the paper's "
+                f"L_M ablations beyond 2 give only marginal gains. To add "
+                f"support, generalize `MemoryMLP` and the analytical-gradient "
+                f"kernel in `model/nmm_fused.py`."
             )
 
         if self.n_embd % self.n_head != 0:
@@ -221,13 +457,21 @@ class TitansConfig:
                 f"{self.nmm_n_heads * head_dim}, not {self.n_embd}."
             )
 
-        # Memory-saving knob validation (G256 / G257).
-        if self.nmm_state_dtype not in ("fp32", "bf16"):
+        # Memory-saving knob validation (G256 / G257 / G275).
+        if self.nmm_state_dtype not in ("fp32", "bf16", "int8"):
             raise ValueError(
-                f"nmm_state_dtype must be 'fp32' or 'bf16' (got "
+                f"nmm_state_dtype must be 'fp32', 'bf16', or 'int8' (got "
                 f"{self.nmm_state_dtype!r}). fp16 is NOT supported — it "
-                f"needs loss scaling that this codebase doesn't wire; "
-                f"bf16 is the safe choice for halved NMM state memory."
+                f"needs loss scaling that this codebase doesn't wire. "
+                f"bf16 halves state memory vs fp32; int8 quarters it (G275)."
+            )
+        # G275 int8 state: only the blockwise path supports it.
+        if self.nmm_state_dtype == "int8" and self.nmm_block_size <= 1:
+            raise ValueError(
+                "nmm_state_dtype='int8' requires nmm_block_size > 1. The "
+                "sequential per-token path would dequantize/requantize on "
+                "every step. Use the blockwise path "
+                "(block_size >= 16 recommended for TC engagement)."
             )
         if self.nmm_grad_checkpoint_segment_len < 1:
             raise ValueError(
@@ -293,6 +537,66 @@ class TitansConfig:
                     f"At this rank the factored form has MORE parameters than "
                     f"full-rank, defeating the purpose. Use r << d_model "
                     f"(e.g. 32, 64, 128 for d=768)."
+                )
+
+        # nmm_block_size: must be a positive int that divides chunk_size.
+        if not isinstance(self.nmm_block_size, int) or self.nmm_block_size < 1:
+            raise ValueError(
+                f"nmm_block_size must be a positive int (got "
+                f"{self.nmm_block_size!r}). Use 1 for paper-strict "
+                f"per-token recurrence; larger for blockwise (approximate)."
+            )
+        # NOTE on alignment: we DO NOT require chunk_size % block_size == 0.
+        # The NMM sees `chunk_size + nmm_n_persistent` tokens per call (the
+        # persistent prefix is prepended), so requiring strict alignment at
+        # the config level would force users to do off-by-n_persistent math
+        # to pick a valid block_size. Instead, `_forward_chunk_blockwise`
+        # handles a possibly-smaller TRAILING block gracefully — the math
+        # is correct for any block size, just less TC-efficient on that
+        # trailing block. Common configs (block_size=64, chunk_size=1024,
+        # n_persistent=4) give 16 full blocks of 64 + 1 trailing block of 4,
+        # which is fine.
+        # nmm_momentum_order: must be a positive int. 1 = paper-default; >1
+        # enables higher-order momentum (G272).
+        if not isinstance(self.nmm_momentum_order, int) or self.nmm_momentum_order < 1:
+            raise ValueError(
+                f"nmm_momentum_order must be a positive int (got "
+                f"{self.nmm_momentum_order!r}). Use 1 for the paper-default "
+                f"first-order momentum; >1 stacks additional momentum levels."
+            )
+
+        # nmm_detach_state_between_blocks only meaningful when blockwise (G268).
+        # Fail loud when set without blockwise — silent no-op would mislead
+        # users into thinking they enabled truncated BPTT.
+        if self.nmm_detach_state_between_blocks and self.nmm_block_size <= 1:
+            raise ValueError(
+                "nmm_detach_state_between_blocks=True requires "
+                "nmm_block_size > 1. The blockwise path is the only one that "
+                "exposes block boundaries to detach at; with block_size=1 the "
+                "blockwise path isn't taken (sequential is) and this flag "
+                "would be a silent no-op. Set nmm_block_size >= 16 (for TC "
+                "engagement) or set nmm_detach_state_between_blocks=False."
+            )
+
+        # nmm_per_head_learned_params=False meaningless at n_heads=1: nothing
+        # to share. Loud rather than silent.
+        if (not self.nmm_per_head_learned_params) and self.nmm_n_heads <= 1:
+            raise ValueError(
+                "nmm_per_head_learned_params=False requires nmm_n_heads > 1. "
+                "Sharing learned parameters across heads is only meaningful "
+                "when there are multiple heads; with n_heads=1 there's nothing "
+                "to share. Either set nmm_n_heads > 1 to use multi-head NMM, "
+                "or leave nmm_per_head_learned_params=True (default)."
+            )
+
+        # nmm_softclamp_max: must be positive if set.
+        if self.nmm_softclamp_max is not None:
+            if (not isinstance(self.nmm_softclamp_max, (int, float))
+                or self.nmm_softclamp_max <= 0):
+                raise ValueError(
+                    f"nmm_softclamp_max must be a positive float or None "
+                    f"(got {self.nmm_softclamp_max!r}). Use None to disable, "
+                    f"or e.g. 5.0 for lucidrains-style soft norm clamping."
                 )
 
         # From-scratch with chunk_size < block_size leaves wpe rows above

@@ -129,7 +129,6 @@ Compare against a baseline run of §2.1 with each modification.
 |---|---|---|
 | `nmm_spectral_norm=False` (no NS5) | Training will diverge or plateau | Loss spikes or NaN within 1K steps |
 | `nmm_n_persistent=0` (no persistent tokens) | Negligible effect alone | <1% perplexity change |
-| `nmm_depth=1` (linear memory) | Significant degradation | Paper ablation: L_M=2 ≫ 1 |
 | `nmm_conv_kernel=1` (no temporal mixing) | Modest degradation | +1-2 perplexity per paper §4.4 |
 | `nmm_expansion=1` (small hidden) | Modest degradation, 4× less state memory | Trade-off; should still beat vanilla |
 | `use_swa=True, swa_window=256` | Acceptable for from-scratch | Verify training is stable; not for fine-tune |
