@@ -186,6 +186,47 @@ def test_compute_nmm_norm_increases_when_M_is_larger():
         assert abs(n2 / n1 - 2.0) < 1e-5
 
 
+def test_run_training_handles_all_none_nmm_norms():
+    """Regression: under --vanilla-gpt2 every block is a PlainGPT2Block, so
+    `compute_nmm_norm(states)` returns `[None, None, ...]` — a list that's
+    truthy as a Python object but whose elements can't be summed. The
+    per-step aggregator in `run_training` must filter Nones BEFORE summing,
+    otherwise step 0 of vanilla training raises
+    `TypeError: unsupported operand type(s) for +: 'int' and 'NoneType'`.
+
+    This test exercises the smallest possible vanilla config end-to-end —
+    1 step, batch=1, T=4 — so a CI run catches the regression in seconds.
+    """
+    cfg = TitansConfig(
+        n_layer=2, n_head=2, n_embd=8, vocab_size=32,
+        block_size=64, chunk_size=4, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=2,
+        finetune_mode=False,
+        nmm_layer_indices=[],  # vanilla mode — every block is PlainGPT2Block
+    )
+    model = TitansMAGGPT2(cfg)
+    optimizer = build_optimizer(model)
+
+    # Fake loader yielding one (idx, doc_boundaries) pair.
+    class _OneShotLoader:
+        def __iter__(self):
+            yield _fake_batch(cfg, B=1, T=4)
+    loader = _OneShotLoader()
+
+    # Import locally to avoid contaminating test_checkpoint's top-level imports.
+    from train import run_training
+    # Single step must complete without raising. `show_progress=False` keeps
+    # tqdm quiet under pytest capture.
+    run_training(
+        model=model, optimizer=optimizer, loader=loader,
+        device=torch.device("cpu"),
+        max_steps=1, warmup_steps=0, accum_steps=1,
+        log_every=1, save_every=None, save_dir=None,
+        config=cfg, autocast_dtype=None,
+        show_progress=False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # save_checkpoint_rotating + prune_old_checkpoints
 # ---------------------------------------------------------------------------

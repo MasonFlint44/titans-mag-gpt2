@@ -649,8 +649,18 @@ def run_training(
             loss_full = loss.item() * accum_steps
             grad_norm_v = grad_norm.item()
             nmm_norms = compute_nmm_norm(nmm_states)
+            # `compute_nmm_norm` returns None when nmm_states is None (G172,
+            # first-step case) AND emits per-layer Nones for plain blocks
+            # (G261). Under --vanilla-gpt2 every block is plain, so nmm_norms
+            # is a list of Nones — truthy as a list, but `sum([None, ...])`
+            # raises TypeError. Filter Nones BEFORE summing so the vanilla
+            # control run (and any subset-NMM config) logs cleanly.
+            valid_norms = (
+                [n for n in nmm_norms if n is not None] if nmm_norms else []
+            )
             nmm_mean = (
-                sum(nmm_norms) / len(nmm_norms) if nmm_norms else float("nan")
+                sum(valid_norms) / len(valid_norms)
+                if valid_norms else float("nan")
             )
             cur_lr = optimizer.param_groups[0]["lr"]  # gpt2_decay group
 
@@ -661,7 +671,7 @@ def run_training(
                     gn=f"{grad_norm_v:.2f}",
                     lr=f"{cur_lr:.2e}",
                     toks_s=f"{tok_per_sec:.0f}",
-                    nmm=f"{nmm_mean:.2f}" if nmm_norms else "nan",
+                    nmm=f"{nmm_mean:.2f}" if valid_norms else "nan",
                     refresh=False,
                 )
                 if step % log_every == 0:
