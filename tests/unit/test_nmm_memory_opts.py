@@ -1,23 +1,20 @@
-"""G256/G257 — nmm_state_dtype + nmm_grad_checkpoint memory-saving options.
-
-Two independent, composable flags:
+"""G256 / G260 — nmm_state_dtype + nmm_block_grad_checkpoint memory-saving
+options.
 
 - `nmm_state_dtype="bf16"`: (M, S) and per-step update buffers stored in
   bf16 instead of fp32 (~2x smaller). NS5 still casts to fp32 internally
   (the bf16-NS5-spectral-norm-drift hazard documented in G226).
 
-- `nmm_grad_checkpoint=True`: `_forward_chunk_sequential` runs in
-  `grad_checkpoint_segment_len`-token segments, each wrapped in
-  `torch.utils.checkpoint.checkpoint`. Backward recomputes inner-loop
-  intermediates; ~5-10x peak-memory headroom for the per-token graph.
+- `nmm_block_grad_checkpoint=True`: wraps each TitansMAGBlock.forward in
+  `torch.utils.checkpoint.checkpoint`. Pair with `nmm_block_size >= 16`
+  so the per-block NMM transient that gets rebuilt during recompute is
+  itself bounded.
 
 The contract these tests pin down:
   (a) dtype choice is honored end-to-end (state, output, retrieval).
   (b) bf16 output ≈ fp32 output within a paper-faithful tolerance.
-  (c) checkpoint True ≈ False — forward AND backward — at small T.
-  (d) the two flags compose without crashing.
-  (e) doc_boundary reset still fires correctly across segment edges.
-  (f) seg_len that doesn't divide T evenly works (tail segment).
+  (c) block-checkpoint True ≈ False — forward AND backward.
+  (d) the flags compose without crashing.
 """
 
 import pytest
@@ -43,18 +40,12 @@ def test_config_accepts_fp32_and_bf16_state_dtype():
     TitansConfig(nmm_state_dtype="bf16")
 
 
-def test_config_rejects_zero_segment_len():
-    with pytest.raises(ValueError, match="grad_checkpoint_segment_len"):
-        TitansConfig(nmm_grad_checkpoint_segment_len=0)
-
-
 def test_config_defaults_preserve_legacy_behavior():
-    """Defaults must NOT enable either memory-saving option — that would
+    """Defaults must NOT enable any memory-saving option — that would
     silently shift the dtype + recompute behavior of every existing run."""
     cfg = TitansConfig()
     assert cfg.nmm_state_dtype == "fp32"
-    assert cfg.nmm_grad_checkpoint is False
-    assert cfg.nmm_grad_checkpoint_segment_len == 64  # documented default
+    assert cfg.nmm_block_grad_checkpoint is False
 
 
 # ---------------------------------------------------------------------------
@@ -62,15 +53,13 @@ def test_config_defaults_preserve_legacy_behavior():
 # ---------------------------------------------------------------------------
 
 
-def _tiny_nmm(state_dtype="fp32", grad_checkpoint=False, segment_len=4):
+def _tiny_nmm(state_dtype="fp32"):
     """Build a minimal single-head NMM and a random input chunk."""
     nmm = NeuralMemoryModule(
         n_embd=8, expansion=2, kernel_size=2,
         spectral_norm=True, finetune_mode=False,
         retrieval_from_M_prev=True,
         state_dtype=state_dtype,
-        grad_checkpoint=grad_checkpoint,
-        grad_checkpoint_segment_len=segment_len,
     )
     return nmm
 
@@ -145,350 +134,17 @@ def test_bf16_state_output_finite_and_similar_magnitude_to_fp32(seed=0):
 
 
 # ---------------------------------------------------------------------------
-# Gradient checkpointing — forward equivalence
-# ---------------------------------------------------------------------------
-
-
-def test_grad_checkpoint_forward_matches_uncheckpointed():
-    """Under grad-disabled forward, checkpoint=True / False must produce
-    bitwise-identical outputs. The checkpoint wrapper is a pure forward
-    shim when grad is off (it doesn't recompute, since there's no graph)."""
-    torch.manual_seed(0)
-    nmm = _tiny_nmm(grad_checkpoint=False)
-    nmm_ckpt = _tiny_nmm(grad_checkpoint=True, segment_len=3)
-    nmm_ckpt.load_state_dict(nmm.state_dict())
-
-    x = torch.randn(2, 8, 8)
-    state_a = nmm.init_state(B=2, device=torch.device("cpu"))
-    state_b = nmm_ckpt.init_state(B=2, device=torch.device("cpu"))
-
-    with torch.no_grad():
-        y_a, _ = nmm.forward_chunk(x, state_a, None)
-        y_b, _ = nmm_ckpt.forward_chunk(x, state_b, None)
-    assert torch.equal(y_a, y_b)
-
-
-def test_grad_checkpoint_forward_under_autograd_matches():
-    """Under grad-enabled forward, checkpoint=True still runs the SAME
-    forward — backward differs (recompute) but the forward output is
-    identical (or near-identical, modulo recompute-rounding which only
-    affects backward)."""
-    torch.manual_seed(0)
-    nmm = _tiny_nmm(grad_checkpoint=False)
-    nmm_ckpt = _tiny_nmm(grad_checkpoint=True, segment_len=3)
-    nmm_ckpt.load_state_dict(nmm.state_dict())
-
-    x = torch.randn(2, 8, 8)
-    state_a = nmm.init_state(B=2, device=torch.device("cpu"))
-    state_b = nmm_ckpt.init_state(B=2, device=torch.device("cpu"))
-
-    y_a, _ = nmm.forward_chunk(x, state_a, None)
-    y_b, _ = nmm_ckpt.forward_chunk(x, state_b, None)
-    # Same forward computation; only backward differs. Allow tiny
-    # floating-point reorder noise from segment_len != T.
-    assert torch.allclose(y_a, y_b, atol=1e-6), (
-        f"checkpoint changed forward by {(y_a - y_b).abs().max().item():.2e}"
-    )
-
-
-def test_grad_checkpoint_backward_produces_same_gradients():
-    """The whole point — backward through checkpoint=True must yield the
-    same gradients (up to recompute-rounding) as backward through
-    checkpoint=False. Use Block.forward so we exercise an end-to-end loss
-    where the gradients flow back through the chunked NMM into
-    `memory_mlp.W*.weight` (the initial M)."""
-    torch.manual_seed(0)
-    cfg_a = TitansConfig(
-        n_layer=1, n_head=2, n_embd=8, vocab_size=16,
-        block_size=64, chunk_size=8, dropout=0.0,
-        nmm_expansion=2, nmm_n_persistent=0,
-        finetune_mode=False,
-        nmm_grad_checkpoint=False,
-    )
-    cfg_b = TitansConfig(
-        n_layer=1, n_head=2, n_embd=8, vocab_size=16,
-        block_size=64, chunk_size=8, dropout=0.0,
-        nmm_expansion=2, nmm_n_persistent=0,
-        finetune_mode=False,
-        nmm_grad_checkpoint=True,
-        nmm_grad_checkpoint_segment_len=3,
-    )
-
-    block_a = TitansMAGBlock(cfg_a)
-    block_b = TitansMAGBlock(cfg_b)
-    block_b.load_state_dict(block_a.state_dict())
-
-    x = torch.randn(2, 8, 8, requires_grad=True)
-    s_a = block_a.nmm.init_state(B=2, device=torch.device("cpu"))
-    s_b = block_b.nmm.init_state(B=2, device=torch.device("cpu"))
-
-    y_a, _ = block_a(x, s_a)
-    y_b, _ = block_b(x.detach().clone().requires_grad_(True), s_b)
-    y_a.sum().backward()
-    y_b.sum().backward()
-
-    # Compare gradients on memory_mlp weights — most sensitive to recompute.
-    for (n_a, p_a), (n_b, p_b) in zip(
-        block_a.nmm.memory_mlp.named_parameters(),
-        block_b.nmm.memory_mlp.named_parameters(),
-    ):
-        assert n_a == n_b
-        assert p_a.grad is not None and p_b.grad is not None
-        max_diff = (p_a.grad - p_b.grad).abs().max().item()
-        # Tolerance: 1e-4 absolute. Recompute pass introduces small
-        # rounding diffs but never order-of-magnitude.
-        assert max_diff < 1e-4, (
-            f"grad mismatch on {n_a}: max diff {max_diff:.2e} (checkpoint "
-            f"path should match uncheckpointed within float rounding)"
-        )
-
-
-def test_grad_checkpoint_uneven_segment_len_handles_tail():
-    """T=10, seg_len=3 -> segments at [0:3, 3:6, 6:9, 9:10] (the tail
-    has 1 token, not a full segment). Must not crash and the output
-    must match the uncheckpointed version."""
-    torch.manual_seed(0)
-    nmm = _tiny_nmm(grad_checkpoint=False)
-    nmm_ckpt = _tiny_nmm(grad_checkpoint=True, segment_len=3)
-    nmm_ckpt.load_state_dict(nmm.state_dict())
-
-    x = torch.randn(2, 10, 8)
-    state_a = nmm.init_state(B=2, device=torch.device("cpu"))
-    state_b = nmm_ckpt.init_state(B=2, device=torch.device("cpu"))
-
-    with torch.no_grad():
-        y_a, _ = nmm.forward_chunk(x, state_a, None)
-        y_b, _ = nmm_ckpt.forward_chunk(x, state_b, None)
-    assert y_a.shape == (2, 10, 8) and y_b.shape == (2, 10, 8)
-    assert torch.equal(y_a, y_b)
-
-
-def test_grad_checkpoint_doc_boundary_fires_across_segment_edge():
-    """A boundary at t=4 within a checkpointed forward (seg_len=3, so
-    segments [0:3, 3:6, 6:8]) must still reset state at t=4. The
-    init_M is pre-built once at chunk level and passed in as flat
-    tensors so the checkpoint's recompute uses the same init values."""
-    torch.manual_seed(0)
-    nmm = _tiny_nmm(grad_checkpoint=False)
-    nmm_ckpt = _tiny_nmm(grad_checkpoint=True, segment_len=3)
-    nmm_ckpt.load_state_dict(nmm.state_dict())
-
-    x = torch.randn(2, 8, 8)
-    db = torch.zeros(2, 8, dtype=torch.bool)
-    db[:, 4] = True  # mid-chunk boundary, crosses segment edge
-
-    state_a = nmm.init_state(B=2, device=torch.device("cpu"))
-    state_b = nmm_ckpt.init_state(B=2, device=torch.device("cpu"))
-    with torch.no_grad():
-        y_a, _ = nmm.forward_chunk(x, state_a, db)
-        y_b, _ = nmm_ckpt.forward_chunk(x, state_b, db)
-    # The reset path must produce identical results.
-    assert torch.equal(y_a, y_b)
-
-
-def test_grad_checkpoint_doc_boundary_at_segment_start():
-    """Boundary at t=3 — exactly the start of segment 2 when seg_len=3.
-    Edge case for the per-segment boundary slicing."""
-    torch.manual_seed(0)
-    nmm = _tiny_nmm(grad_checkpoint=False)
-    nmm_ckpt = _tiny_nmm(grad_checkpoint=True, segment_len=3)
-    nmm_ckpt.load_state_dict(nmm.state_dict())
-    x = torch.randn(2, 9, 8)
-    db = torch.zeros(2, 9, dtype=torch.bool)
-    db[:, 3] = True
-
-    state_a = nmm.init_state(B=2, device=torch.device("cpu"))
-    state_b = nmm_ckpt.init_state(B=2, device=torch.device("cpu"))
-    with torch.no_grad():
-        y_a, _ = nmm.forward_chunk(x, state_a, db)
-        y_b, _ = nmm_ckpt.forward_chunk(x, state_b, db)
-    assert torch.equal(y_a, y_b)
-
-
-# ---------------------------------------------------------------------------
-# Combined: bf16 + checkpoint
-# ---------------------------------------------------------------------------
-
-
-def test_bf16_plus_grad_checkpoint_runs_end_to_end():
-    """Both options on at once should produce a working forward+backward.
-    No exact-equivalence check (bf16 already drifts from fp32); just a
-    smoke test that the combination doesn't crash and produces finite
-    gradients on the memory_mlp weights."""
-    torch.manual_seed(0)
-    cfg = TitansConfig(
-        n_layer=1, n_head=2, n_embd=8, vocab_size=16,
-        block_size=64, chunk_size=8, dropout=0.0,
-        nmm_expansion=2, nmm_n_persistent=0,
-        finetune_mode=False,
-        nmm_state_dtype="bf16",
-        nmm_grad_checkpoint=True,
-        nmm_grad_checkpoint_segment_len=3,
-    )
-    block = TitansMAGBlock(cfg)
-    state = block.nmm.init_state(B=2, device=torch.device("cpu"))
-    x = torch.randn(2, 8, 8, requires_grad=True)
-    y, _ = block(x, state)
-    y.sum().backward()
-    for n, p in block.nmm.memory_mlp.named_parameters():
-        assert p.grad is not None, f"{n} has no grad"
-        assert torch.isfinite(p.grad).all(), f"{n} grad has NaN/Inf"
-
-
-# ---------------------------------------------------------------------------
-# nmm_cpu_offload_segments — config validation
-# ---------------------------------------------------------------------------
-
-
-def test_config_rejects_cpu_offload_without_grad_checkpoint():
-    """cpu_offload is meaningless without grad_checkpoint — there are no
-    segment boundary tensors to stash. Catch this loudly at construction
-    so the user doesn't enable cpu_offload and wonder why memory didn't
-    change."""
-    with pytest.raises(ValueError, match="requires nmm_grad_checkpoint=True"):
-        TitansConfig(nmm_cpu_offload_segments=True)
-
-
-def test_config_accepts_cpu_offload_when_grad_checkpoint_enabled():
-    TitansConfig(
-        nmm_grad_checkpoint=True,
-        nmm_cpu_offload_segments=True,
-    )
-
-
-# ---------------------------------------------------------------------------
-# CPU-offload checkpoint — correctness
-# ---------------------------------------------------------------------------
-
-
-def _block_with_cpu_offload(seg_len=3):
-    cfg = TitansConfig(
-        n_layer=1, n_head=2, n_embd=8, vocab_size=16,
-        block_size=64, chunk_size=8, dropout=0.0,
-        nmm_expansion=2, nmm_n_persistent=0,
-        finetune_mode=False,
-        nmm_grad_checkpoint=True,
-        nmm_grad_checkpoint_segment_len=seg_len,
-        nmm_cpu_offload_segments=True,
-    )
-    return TitansMAGBlock(cfg)
-
-
-def _block_with_gpu_checkpoint(seg_len=3):
-    cfg = TitansConfig(
-        n_layer=1, n_head=2, n_embd=8, vocab_size=16,
-        block_size=64, chunk_size=8, dropout=0.0,
-        nmm_expansion=2, nmm_n_persistent=0,
-        finetune_mode=False,
-        nmm_grad_checkpoint=True,
-        nmm_grad_checkpoint_segment_len=seg_len,
-        nmm_cpu_offload_segments=False,
-    )
-    return TitansMAGBlock(cfg)
-
-
-def test_cpu_offload_backward_matches_gpu_checkpoint():
-    """Gradients of memory_mlp params must match between GPU checkpoint
-    and CPU-offload checkpoint within float-rounding tolerance. The
-    offload path moves saved inputs CPU→GPU on backward and recomputes;
-    if anything in the round-trip rounds or loses precision (dtype
-    casting bug, device-arg drop, requires_grad loss), the gradients
-    drift visibly."""
-    torch.manual_seed(0)
-    block_a = _block_with_gpu_checkpoint(seg_len=3)
-    block_b = _block_with_cpu_offload(seg_len=3)
-    block_b.load_state_dict(block_a.state_dict())
-
-    x_a = torch.randn(2, 8, 8, requires_grad=True)
-    x_b = x_a.detach().clone().requires_grad_(True)
-    s_a = block_a.nmm.init_state(B=2, device=torch.device("cpu"))
-    s_b = block_b.nmm.init_state(B=2, device=torch.device("cpu"))
-
-    y_a, _ = block_a(x_a, s_a)
-    y_b, _ = block_b(x_b, s_b)
-    y_a.sum().backward()
-    y_b.sum().backward()
-
-    for (n_a, p_a), (n_b, p_b) in zip(
-        block_a.nmm.memory_mlp.named_parameters(),
-        block_b.nmm.memory_mlp.named_parameters(),
-    ):
-        assert n_a == n_b
-        max_diff = (p_a.grad - p_b.grad).abs().max().item()
-        assert max_diff < 1e-4, (
-            f"cpu_offload diverged from gpu checkpoint on {n_a}: "
-            f"max grad diff = {max_diff:.3e}"
-        )
-
-
-def test_cpu_offload_runs_with_doc_boundaries():
-    """Doc-boundary reset must work across the offloaded segment edge.
-    The init_M_* tensors used by reset_state are passed through the same
-    arg list and must round-trip CPU/GPU correctly."""
-    torch.manual_seed(0)
-    block = _block_with_cpu_offload(seg_len=3)
-    state = block.nmm.init_state(B=2, device=torch.device("cpu"))
-    x = torch.randn(2, 8, 8, requires_grad=True)
-    db = torch.zeros(2, 8, dtype=torch.bool)
-    db[:, 4] = True  # boundary mid-chunk; init_M_* are tensors not None
-    y, _ = block(x, state, doc_boundaries=db)
-    y.sum().backward()
-    for p in block.nmm.memory_mlp.parameters():
-        assert torch.isfinite(p.grad).all()
-
-
-def test_cpu_offload_runs_without_doc_boundaries():
-    """The common path: no boundaries -> init_M_* are None. The arg list
-    has tensors-then-Nones, which `cpu_offload_checkpoint` handles by
-    auto-detecting the tensor prefix and threading non-tensors through
-    untouched."""
-    torch.manual_seed(0)
-    block = _block_with_cpu_offload(seg_len=3)
-    state = block.nmm.init_state(B=2, device=torch.device("cpu"))
-    x = torch.randn(2, 8, 8, requires_grad=True)
-    y, _ = block(x, state, doc_boundaries=None)
-    y.sum().backward()
-    for p in block.nmm.memory_mlp.parameters():
-        assert torch.isfinite(p.grad).all()
-
-
-def test_cpu_offload_plus_bf16_state_runs():
-    """All three memory knobs on at once — smoke test for finite gradients."""
-    torch.manual_seed(0)
-    cfg = TitansConfig(
-        n_layer=1, n_head=2, n_embd=8, vocab_size=16,
-        block_size=64, chunk_size=8, dropout=0.0,
-        nmm_expansion=2, nmm_n_persistent=0,
-        finetune_mode=False,
-        nmm_state_dtype="bf16",
-        nmm_grad_checkpoint=True,
-        nmm_grad_checkpoint_segment_len=3,
-        nmm_cpu_offload_segments=True,
-    )
-    block = TitansMAGBlock(cfg)
-    state = block.nmm.init_state(B=2, device=torch.device("cpu"))
-    x = torch.randn(2, 8, 8, requires_grad=True)
-    y, _ = block(x, state)
-    y.sum().backward()
-    for n, p in block.nmm.memory_mlp.named_parameters():
-        assert p.grad is not None
-        assert torch.isfinite(p.grad).all(), f"{n} non-finite grad"
-
-
-# ---------------------------------------------------------------------------
 # Block-level grad checkpoint (G260) — flatten/unflatten, equivalence,
-# composition with segment checkpoint, multi-head support.
+# multi-head support.
 # ---------------------------------------------------------------------------
 
 
-def _cfg_block_ckpt(*, block_ckpt, seg_ckpt=True, seg_len=3, n_heads=1):
+def _cfg_block_ckpt(*, block_ckpt, n_heads=1):
     return TitansConfig(
         n_layer=1, n_head=2, n_embd=8, vocab_size=16,
         block_size=64, chunk_size=8, dropout=0.0,
         nmm_expansion=2, nmm_n_persistent=0,
         finetune_mode=False,
-        nmm_grad_checkpoint=seg_ckpt,
-        nmm_grad_checkpoint_segment_len=seg_len,
         nmm_block_grad_checkpoint=block_ckpt,
         nmm_n_heads=n_heads,
     )
@@ -526,12 +182,10 @@ def test_block_checkpoint_forward_matches_uncheckpointed():
 
 def test_block_checkpoint_backward_matches_uncheckpointed():
     """Memory-mlp gradients through block-checkpointed forward must match
-    uncheckpointed within float rounding. Combines block + segment
-    checkpoint — the recommended composition (block alone would re-run a
-    full NMM forward per block, which OOMs at long T)."""
+    uncheckpointed within float rounding."""
     torch.manual_seed(0)
-    block_a = TitansMAGBlock(_cfg_block_ckpt(block_ckpt=False, seg_ckpt=True))
-    block_b = TitansMAGBlock(_cfg_block_ckpt(block_ckpt=True, seg_ckpt=True))
+    block_a = TitansMAGBlock(_cfg_block_ckpt(block_ckpt=False))
+    block_b = TitansMAGBlock(_cfg_block_ckpt(block_ckpt=True))
     block_b.load_state_dict(block_a.state_dict())
 
     x_a = torch.randn(2, 8, 8, requires_grad=True)
@@ -565,7 +219,7 @@ def test_block_checkpoint_handles_doc_boundary():
     """doc_boundaries is captured via closure (checkpoint doesn't pass
     kwargs). Mid-chunk reset must still fire on the recompute path."""
     torch.manual_seed(0)
-    block = TitansMAGBlock(_cfg_block_ckpt(block_ckpt=True, seg_ckpt=True))
+    block = TitansMAGBlock(_cfg_block_ckpt(block_ckpt=True))
     state = block.nmm.init_state(B=2, device=torch.device("cpu"))
     x = torch.randn(2, 8, 8, requires_grad=True)
     db = torch.zeros(2, 8, dtype=torch.bool)
@@ -582,7 +236,7 @@ def test_block_checkpoint_works_with_multi_head_nmm():
     """Multi-head state is a `list[(M, S)]`. The flatten helper handles
     both shapes; this test confirms multi-head end-to-end."""
     torch.manual_seed(0)
-    cfg = _cfg_block_ckpt(block_ckpt=True, seg_ckpt=True, n_heads=2)
+    cfg = _cfg_block_ckpt(block_ckpt=True, n_heads=2)
     block_a = TitansMAGBlock(_cfg_block_ckpt(block_ckpt=False, n_heads=2))
     block_b = TitansMAGBlock(cfg)
     block_b.load_state_dict(block_a.state_dict())
@@ -611,9 +265,8 @@ def test_block_checkpoint_works_with_multi_head_nmm():
 
 
 def test_block_checkpoint_composes_with_bf16_state():
-    """All four NMM memory knobs on at once via block + segment + bf16 +
-    cpu_offload. End-to-end finite gradients only — bf16 already drifts
-    from fp32 so we don't compare exact values."""
+    """bf16 state + block checkpoint together. End-to-end finite gradients
+    only — bf16 already drifts from fp32 so we don't compare exact values."""
     torch.manual_seed(0)
     cfg = TitansConfig(
         n_layer=1, n_head=2, n_embd=8, vocab_size=16,
@@ -621,9 +274,6 @@ def test_block_checkpoint_composes_with_bf16_state():
         nmm_expansion=2, nmm_n_persistent=0,
         finetune_mode=False,
         nmm_state_dtype="bf16",
-        nmm_grad_checkpoint=True,
-        nmm_grad_checkpoint_segment_len=3,
-        nmm_cpu_offload_segments=True,
         nmm_block_grad_checkpoint=True,
     )
     block = TitansMAGBlock(cfg)
@@ -648,8 +298,6 @@ def test_block_checkpoint_through_full_model_propagates_grads():
         block_size=32, chunk_size=8, dropout=0.0,
         nmm_expansion=2, nmm_n_persistent=2,
         finetune_mode=False,
-        nmm_grad_checkpoint=True,
-        nmm_grad_checkpoint_segment_len=4,
         nmm_block_grad_checkpoint=True,
     )
     model = TitansMAGGPT2(cfg)
@@ -1061,30 +709,6 @@ def test_low_rank_trains_end_to_end():
             assert torch.isfinite(p.grad).all(), f"{n} non-finite grad"
 
 
-def test_low_rank_composes_with_grad_checkpoint():
-    """Low-rank state flows through the segmented checkpoint loop. The
-    flat-tensor checkpoint plumbing must respect the dynamic state_keys
-    (6 items instead of 3)."""
-    cfg = TitansConfig(
-        n_layer=1, n_head=2, n_embd=16, vocab_size=16,
-        block_size=16, chunk_size=8, dropout=0.0,
-        nmm_expansion=2, nmm_low_rank=4, nmm_n_persistent=0,
-        finetune_mode=False,
-        nmm_grad_checkpoint=True,
-        nmm_grad_checkpoint_segment_len=3,
-    )
-    from model.block import TitansMAGBlock
-    torch.manual_seed(0)
-    block = TitansMAGBlock(cfg)
-    state = block.nmm.init_state(B=2, device=torch.device("cpu"))
-    x = torch.randn(2, 8, 16, requires_grad=True)
-    y, _ = block(x, state)
-    y.sum().backward()
-    for n, p in block.nmm.memory_mlp.named_parameters():
-        assert p.grad is not None
-        assert torch.isfinite(p.grad).all(), f"{n} non-finite"
-
-
 def test_low_rank_composes_with_bf16_state():
     """bf16 state dtype + low-rank — gradients still finite."""
     cfg = TitansConfig(
@@ -1118,8 +742,6 @@ def test_low_rank_composes_with_block_checkpoint():
         block_size=16, chunk_size=8, dropout=0.0,
         nmm_expansion=2, nmm_low_rank=4, nmm_n_persistent=0,
         finetune_mode=False,
-        nmm_grad_checkpoint=True,
-        nmm_grad_checkpoint_segment_len=3,
         nmm_block_grad_checkpoint=True,
     )
     from model.block import TitansMAGBlock

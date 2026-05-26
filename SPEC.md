@@ -241,52 +241,26 @@ buffer is a separate per-block decode cache (§6).
    bf16 (G256).
 4. Build the per-position "any boundary?" mask once on CPU (avoids T
    GPU↔CPU syncs). If any boundary fires anywhere in the chunk, build
-   `init_M` **eagerly** (not lazily) so it can be passed to the
-   checkpointed inner loop as a flat tensor list — checkpoint can't
-   tolerate building it during recompute.
-5. Inner loop, broken into segments of length `seg_len`:
-   - `seg_len = grad_checkpoint_segment_len` if `grad_checkpoint=True`
-     and `torch.is_grad_enabled()`; otherwise `seg_len = T` (one segment).
-   - Each segment runs `_run_inner_loop(...)`. When `seg_len < T` the
-     segment call is wrapped in
-     `torch.utils.checkpoint.checkpoint(..., use_reentrant=True)` so
-     backward recomputes the segment instead of storing it.
-6. Inside each `_run_inner_loop` call, for each `t` in the segment:
-   - If `db_seg[:, t].any()`: reset state via
-     `reset_state((M, S), db_seg[:, t], init_M)`.
+   `init_M` eagerly so the inner loop sees a stable tensor.
+5. Run `_run_inner_loop(...)` once over the full chunk. For each `t`:
+   - If `doc_boundaries[:, t].any()`: reset state via
+     `reset_state((M, S), doc_boundaries[:, t], init_M)`.
    - Capture `M_prev = M` (needed if `retrieval_from_M_prev`).
    - Compute `g_t`, NS5, update `S` and `M` per §2.3.
    - Retrieve from `M_prev` or `M` per `retrieval_from_M_prev`.
-7. Concatenate segment outputs into `[B, T, d]` and return `(y_chunk, (M, S))`.
-
-**`use_reentrant=True` is required**, not just convenient.
-`use_reentrant=False` calls `disable_saved_tensors_hooks`, and
-`torch.func.grad` (used inside `per_sample_grad_fn`) rejects that
-at runtime. The reentrant path uses `torch.autograd.function.Function`
-which composes with `torch.func`.
+6. Return `(y_chunk, (M, S))`.
 
 `reset_state(state, mask, init_M)` uses `torch.where` (NOT in-place
 assignment): in-place index assignment on tensors in the autograd graph
 raises `RuntimeError`. `where` is non-mutating and differentiable.
 
-**Memory characterization** (gpt2_small, RTX 5070 Ti, 16 GiB, bf16 autocast):
-
-| Config | Peak VRAM | Notes |
-|---|---|---|
-| `B=1, T=64`, defaults (fp32, no ckpt) | OOM @ 12.6 GiB | baseline |
-| `B=1, T=64`, bf16 only | OOM @ 12.6 GiB | bf16 alone ~no win |
-| `B=1, T=64`, fp32 + ckpt seg=16 | 10.9 GiB | OK |
-| `B=1, T=64`, bf16 + ckpt seg=16 | 7.7 GiB | OK |
-| `B=1, T=128`, bf16 + ckpt seg=16 | 9.0 GiB | OK |
-| `B=1, T=256`, bf16 + ckpt seg=16 | 11.7 GiB | **practical limit on this card** |
-| `B=1, T=512`, bf16 + ckpt seg=16 | OOM @ 12.8 GiB | |
-| `B=1, T=1024`, bf16 + ckpt seg ∈ {8..64} | OOM @ ~13 GiB | total boundary state > 40 GiB |
-
-Gradient checkpointing is the dominant unlock. The remaining cost
-scales as `n_blocks × (T / seg_len) × per_segment_state_bytes` for the
-boundary M/S tensors retained between segments — at gpt2_small with
-12 blocks, that's ~28·B MiB per layer per segment. T=1024 exceeds
-a 16 GiB card's budget at any seg_len.
+**Memory characterization** (sequential path, gpt2_small, bf16 autocast):
+the sequential path retains the full per-token autograd graph for the
+chunk; on a 16 GiB consumer card it tops out around `B=1, T≈64-128` even
+with bf16 state. For longer T or larger batch, prefer the blockwise path
+(`nmm_block_size >= 16`) combined with `nmm_block_grad_checkpoint=True`
+— that path is both faster (TC engagement) and amenable to per-block
+checkpoint recompute with bounded peak transient.
 
 ### 2.9 Dispatcher (`forward_chunk`)
 
@@ -515,11 +489,8 @@ properties are preserved unless you opt in.
 
 | Field | Default | What it does | Cost |
 |---|---|---|---|
-| `nmm_state_dtype` | `"fp32"` | Storage dtype of `(M, S)` and per-step buffers. `"bf16"` halves their footprint. NS5 still casts to fp32 internally (G226 invariant preserved). | Minor accumulated rounding in the per-step `M_t = (1−α)M_{t-1} + S_t` update — measure loss curves before relying on it. |
-| `nmm_grad_checkpoint` | `False` | When `True`, segments `_forward_chunk_sequential`'s inner loop into `nmm_grad_checkpoint_segment_len` slices; each segment wrapped in `torch.utils.checkpoint.checkpoint(use_reentrant=True)`. | One extra forward per segment during backward (typical: 30-50% slower step). |
-| `nmm_grad_checkpoint_segment_len` | `64` | Segment length used when checkpointing is on. Smaller = less peak memory + more recompute. | None directly — but small `seg_len` ⇒ more checkpoint boundaries ⇒ more backward recompute. |
-| `nmm_cpu_offload_segments` | `False` | **Requires `nmm_grad_checkpoint=True`.** Replaces the GPU `torch.utils.checkpoint` with a custom `autograd.Function` (`_CPUOffloadCheckpoint` in `model/nmm.py`) that stashes saved-input tensors on **CPU** between forward and backward; backward moves them back to GPU one segment at a time, recomputes, and discards. Removes the `n_blocks × n_segments × per_segment` GPU ceiling that bounds the regular checkpoint. | PCIe transfer cost added to every backward (~16 GiB/s on PCIe 4.0 x16). Step time can be 5–10× slower at T=1024 — useful for "fit anything to do correctness work", not for production training on a 16 GiB consumer card. |
-| `nmm_block_grad_checkpoint` | `False` | Wraps `TitansMAGBlock.forward` in `torch.utils.checkpoint.checkpoint(use_reentrant=True)`. The whole block (attn + NMM + MAG + MLP) is recomputed on backward; only block-input/output tensors + the NMM `(M, S)` I/O dicts live in the autograd graph between blocks. Both single-head `(M, S)` and multi-head `[(M, S), ...]` states are handled via the `_state_to_flat` / `_flat_to_state` helpers (`model/block.py`). **Combine with `nmm_grad_checkpoint=True`** — block alone re-builds the full per-token NMM graph during one block's backward recompute (~50 GiB at T=1024) and OOMs. Segment checkpoint bounds the in-block transient during recompute. | Each block's forward runs twice (forward + backward recompute), ~2× step time on top of segment-recompute overhead. Removes the `n_blocks × n_segments × per_segment` boundary term that dominated GPU memory at long T — but does NOT help with the in-segment per-block transient (which scales with B), so it does not unlock B>1 on a 16 GiB card. |
+| `nmm_state_dtype` | `"fp32"` | Storage dtype of `(M, S)` and per-step buffers. `"bf16"` halves their footprint, `"int8"` (blockwise-only) quarters it. NS5 still casts to fp32 internally (G226 invariant preserved). | Minor accumulated rounding in the per-step `M_t = (1−α)M_{t-1} + S_t` update — measure loss curves before relying on it. |
+| `nmm_block_grad_checkpoint` | `False` | Wraps `TitansMAGBlock.forward` in `torch.utils.checkpoint.checkpoint(use_reentrant=True)`. The whole block (attn + NMM + MAG + MLP) is recomputed on backward; only block-input/output tensors + the NMM `(M, S)` I/O dicts live in the autograd graph between blocks. Both single-head `(M, S)` and multi-head `[(M, S), ...]` states are handled via the `_state_to_flat` / `_flat_to_state` helpers (`model/block.py`). **Pair with `nmm_block_size >= 16`** so the per-block NMM transient that gets rebuilt during recompute is itself bounded; with `block_size=1` (per-token sequential) the recompute re-builds the full per-token NMM graph for one block (~50 GiB at T=1024 gpt2_small) and OOMs. | Each block's forward runs twice (forward + backward recompute), ~2× step time. |
 
 ### 5.6 Capacity-vs-memory knobs (G261, G262, G263)
 
@@ -601,8 +572,8 @@ whatever leftover tokens remain — math is correct, TC just doesn't
 engage on that one small block.
 
 **Constraints**:
-- Composes with `nmm_low_rank`, `nmm_state_dtype="bf16"`,
-  `nmm_grad_checkpoint`, `nmm_softclamp_max`, `nmm_block_grad_checkpoint`.
+- Composes with `nmm_low_rank`, `nmm_state_dtype` (`"bf16"`, `"int8"`),
+  `nmm_softclamp_max`, `nmm_block_grad_checkpoint`.
 
 This is the recommended path for any T >= 256 training run on
 consumer hardware where the paper-strict per-token recurrence's
@@ -679,19 +650,15 @@ State-structure invariants for callers reading internal state:
 | `True`  | `True`  | + analytical inner gradient. Slightly faster than compile alone (~12 tok/s) and same numerical contract as reference. **Recommended default for T ≥ 256 training.** |
 | `False` | `True`  | Analytical gradient without compile. Modest ~10-15% win. Useful for debugging the math without compile masking issues. |
 
-**`use_reentrant=True` is required** for the GPU checkpoint, not just
-convenient. `use_reentrant=False` calls `disable_saved_tensors_hooks`,
-and `torch.func.grad` (used inside `per_sample_grad_fn`) rejects that
-at runtime. The CPU-offload path uses the same legacy reentrant
-autograd-Function approach and composes with `torch.func` for the same
-reason.
+**`use_reentrant=True` is required** for the block-level checkpoint,
+not just convenient. `use_reentrant=False` calls
+`disable_saved_tensors_hooks`, and `torch.func.grad` (used inside
+`per_sample_grad_fn`) rejects that at runtime.
 
 Validation:
 - `nmm_state_dtype` must be `"fp32"`, `"bf16"`, or `"int8"`. `fp16` is
   explicitly rejected (would require GradScaler wiring that doesn't
   exist). `"int8"` requires `nmm_block_size > 1`.
-- `nmm_grad_checkpoint_segment_len >= 1`.
-- `nmm_cpu_offload_segments=True` AND `nmm_grad_checkpoint=False` → `ValueError`.
 
 ### 5.5 Attention / mode flags
 

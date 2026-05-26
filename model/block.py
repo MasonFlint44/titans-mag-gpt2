@@ -451,8 +451,8 @@ class TitansMAGBlock(nn.Module):
         # G260: when True, wrap the whole block forward in checkpoint so
         # in-block intermediates (attn outputs, per-token NMM graph, MLP
         # internals) are dropped after the block returns and recomputed on
-        # backward. Combine with nmm_grad_checkpoint=True so the recompute
-        # path's transient in-block NMM graph is also bounded.
+        # backward. Pair with nmm_block_size >= 16 so the per-block NMM
+        # transient that gets rebuilt during recompute is itself bounded.
         self.block_grad_checkpoint = config.nmm_block_grad_checkpoint
 
         # Small init like GPT-2 wte; learned, no weight decay (routed in §4.1).
@@ -476,9 +476,6 @@ class TitansMAGBlock(nn.Module):
             finetune_mode=config.finetune_mode,
             retrieval_from_M_prev=config.retrieval_from_M_prev,
             state_dtype=config.nmm_state_dtype,
-            grad_checkpoint=config.nmm_grad_checkpoint,
-            grad_checkpoint_segment_len=config.nmm_grad_checkpoint_segment_len,
-            cpu_offload_segments=config.nmm_cpu_offload_segments,
             low_rank=config.nmm_low_rank,
             fused_kernel=config.nmm_fused_kernel,
             compile_inner_loop=config.nmm_compile_inner_loop,

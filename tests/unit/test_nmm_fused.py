@@ -117,23 +117,18 @@ def test_flag_propagates_to_every_nmm():
 # ---------------------------------------------------------------------------
 
 
-def _build_pair(d=32, h_expansion=2, T=8, B=2, low_rank=None, state_dtype="fp32",
-                grad_checkpoint=False):
+def _build_pair(d=32, h_expansion=2, T=8, B=2, low_rank=None, state_dtype="fp32"):
     """Build two identical NMMs — one ref, one fused — sharing initial weights."""
     torch.manual_seed(7)
     ref = NeuralMemoryModule(
         n_embd=d, expansion=h_expansion, kernel_size=2,
         spectral_norm=True, finetune_mode=False,
         state_dtype=state_dtype, low_rank=low_rank,
-        grad_checkpoint=grad_checkpoint,
-        grad_checkpoint_segment_len=max(T // 2, 1),
     )
     fused = NeuralMemoryModule(
         n_embd=d, expansion=h_expansion, kernel_size=2,
         spectral_norm=True, finetune_mode=False,
         state_dtype=state_dtype, low_rank=low_rank,
-        grad_checkpoint=grad_checkpoint,
-        grad_checkpoint_segment_len=max(T // 2, 1),
         fused_kernel=True,
     )
     fused.load_state_dict(ref.state_dict())
@@ -311,34 +306,6 @@ def test_bf16_state_runs_and_produces_finite_output():
     fused_scale = y_fused.abs().mean().item() + 1e-6
     ratio = max(ref_scale, fused_scale) / min(ref_scale, fused_scale)
     assert ratio < 100, f"bf16 scale ratio {ratio:.1f} too large"
-
-
-def test_composes_with_grad_checkpoint():
-    """fused_kernel + grad_checkpoint should both work and match the
-    non-checkpointed reference within fp32 round-off."""
-    torch.manual_seed(5)
-    d, T, B = 32, 8, 2
-    ref, fused = _build_pair(d=d, T=T, B=B, low_rank=None, grad_checkpoint=True)
-    base = (torch.randn(B, T, d) * 0.3).detach()
-    x_ref = base.clone().requires_grad_(True)
-    x_fused = base.clone().requires_grad_(True)
-    s0 = ref.init_state(B, x_ref.device)
-    y_ref, _ = ref.forward_chunk(
-        x_ref,
-        ({k: v.clone() for k, v in s0[0].items()},
-         {k: v.clone() for k, v in s0[1].items()}),
-        None,
-    )
-    y_fused, _ = fused.forward_chunk(
-        x_fused,
-        ({k: v.clone() for k, v in s0[0].items()},
-         {k: v.clone() for k, v in s0[1].items()}),
-        None,
-    )
-    y_ref.pow(2).sum().backward()
-    y_fused.pow(2).sum().backward()
-    assert torch.allclose(y_ref, y_fused, atol=ATOL, rtol=RTOL)
-    assert torch.allclose(x_ref.grad, x_fused.grad, atol=ATOL, rtol=RTOL)
 
 
 def test_compile_inner_loop_default_off():

@@ -165,15 +165,32 @@ base_lrs = [g['lr'] for g in optimizer.param_groups]  # BUG
 
 ### Most likely causes (in order)
 
-1. **`_forward_chunk_sequential`'s per-token autograd graph.** This is the dominant OOM mode at `chunk_size >= 64` on consumer GPUs. The per-token NMM loop retains `(M_t, S_t, g_t)` snapshots for every t, growing linearly with `chunk_size`. **Fix:** set `nmm_grad_checkpoint=True` (and tune `nmm_grad_checkpoint_segment_len` — start at 64, drop to 32 or 16 if it still OOMs). Backward recomputes intermediates instead of storing them. See `docs/CONFIG_REFERENCE.md` "Memory-saving knobs".
+1. **Sequential per-token NMM at long T.** The sequential path
+   (`nmm_block_size=1`) retains the full per-token autograd graph for
+   the chunk. On a 16 GiB consumer card it tops out around
+   `B=1, T≈64-128`. **Fix:** switch to the blockwise path
+   (`nmm_block_size >= 16`) — both faster (TC engagement) and amenable
+   to bounded peak transient via `nmm_block_grad_checkpoint=True`.
 
-2. **fp32 NMM state.** With checkpoint on, the fp32 `(M, S)` snapshots at segment boundaries plus inner-loop intermediates dominate. **Fix:** set `nmm_state_dtype="bf16"` to halve them. Combines with the checkpoint flag multiplicatively. NS5 still runs in fp32 internally (G226 invariant preserved).
+2. **fp32 NMM state.** Per-step `(M, S)` buffers in fp32 dominate at long
+   T. **Fix:** set `nmm_state_dtype="bf16"` to halve them, or
+   `"int8"` (blockwise-only) to quarter them. NS5 still runs in fp32
+   internally (G226 invariant preserved).
 
-3. **NMM state base size too big.** State per layer is `~24·B·d²·dtype_bytes`. For `gpt2_medium` (`d_model=1024`) at `B=8` fp32: ~6 GB across 24 layers on top of model weights, AdamW moments, and activations. Try `nmm_expansion=1` (halves hidden dim) or smaller `B`.
+3. **NMM state base size too big.** State per layer scales with `B·d²`.
+   **Fix:** `nmm_low_rank=64` factors `memory_mlp` weights and shrinks
+   per-step state ~10×. Use `nmm_expansion=1` for an additional ~4×
+   reduction (paper ablation — minor capacity loss).
 
-4. **`chunk_size` too large.** Even with both knobs above on, very long chunks blow up activations. Halve `chunk_size`. On a 16 GiB consumer card with `gpt2_small`, expect to fit `T` up to ~256 with bf16 + ckpt seg=16; `T=1024` realistically needs ≥ 24 GiB.
+4. **`chunk_size` too large.** Even with all NMM knobs on, very long
+   chunks blow up activations. Halve `chunk_size`. T=1024 + B>1 on a
+   16 GiB consumer card needs `nmm_low_rank=64` + blockwise + bf16 +
+   `nmm_block_grad_checkpoint=True`.
 
-5. **Stuck reference to old `nmm_states`.** Detaching between chunks releases the graph; not detaching means the graph keeps every chunk's intermediates pinned. Verify `detach_states` is actually called between TBPTT chunks.
+5. **Stuck reference to old `nmm_states`.** Detaching between chunks
+   releases the graph; not detaching means the graph keeps every
+   chunk's intermediates pinned. Verify `detach_states` is actually
+   called between TBPTT chunks.
 
 ### Diagnose
 ```python
@@ -185,111 +202,57 @@ Look for "Active memory" — if it's much larger than "Allocated memory" expecta
 ### Recovery checklist (in fix-cost order)
 
 ```python
-# 1. Enable checkpointing first — biggest win, no accuracy risk.
-cfg = TitansConfig.gpt2_small(
-    chunk_size=T,
-    block_size=T,
-    nmm_grad_checkpoint=True,
-    nmm_grad_checkpoint_segment_len=32,
-)
-
-# 2. Add bf16 state if still OOM. Accuracy risk is minor but measure
-#    loss curves vs fp32 baseline before committing to it.
+# 1. Switch to the blockwise NMM path — biggest single-knob win at long T.
+#    Approximate (paper's per-token M_{t-1} becomes per-block M_{block-1})
+#    but trains stably and engages tensor cores via batched matmul.
 cfg = TitansConfig.gpt2_small(
     chunk_size=T, block_size=T,
-    nmm_grad_checkpoint=True, nmm_grad_checkpoint_segment_len=16,
-    nmm_state_dtype="bf16",
-)
-
-# 3. Reduce capacity if still OOM.
-cfg = TitansConfig.gpt2_small(
-    chunk_size=T // 2, block_size=T // 2,
-    nmm_grad_checkpoint=True, nmm_grad_checkpoint_segment_len=16,
-    nmm_state_dtype="bf16",
-    nmm_expansion=1,
-)
-
-# 4. Last resort if you NEED long T and don't care about step time:
-#    enable CPU-offload of the checkpoint boundaries. Adds 5-10x to
-#    step time at long T due to PCIe transfers + extra recompute.
-#    Suitable for correctness work, not production training.
-cfg = TitansConfig.gpt2_small(
-    chunk_size=T, block_size=T,
-    nmm_grad_checkpoint=True, nmm_grad_checkpoint_segment_len=32,
-    nmm_state_dtype="bf16",
-    nmm_cpu_offload_segments=True,
-)
-
-# 5. Alternative to #4: block-level checkpointing. Wraps each
-#    TitansMAGBlock.forward in a recompute boundary so only block I/O
-#    lives across the stack. Comparable VRAM win to cpu_offload at the
-#    same step-time scale (~5-10x slower than no checkpointing).
-cfg = TitansConfig.gpt2_small(
-    chunk_size=T, block_size=T,
-    nmm_grad_checkpoint=True, nmm_grad_checkpoint_segment_len=32,
-    nmm_state_dtype="bf16",
+    nmm_block_size=64,
     nmm_block_grad_checkpoint=True,
+    nmm_state_dtype="bf16",
 )
 
-# 6. The unlock for T=1024 + B>1 on a 16 GiB card: low-rank NMM.
+# 2. The unlock for T=1024 + B>1 on a 16 GiB card: low-rank NMM.
 #    Factors memory_mlp weights so per-step state is ~10x smaller.
 #    Loses some NMM capacity vs paper full-rank; measure loss vs
 #    baseline before committing.
 cfg = TitansConfig.gpt2_small(
     chunk_size=T, block_size=T,
-    nmm_grad_checkpoint=True, nmm_grad_checkpoint_segment_len=32,
+    nmm_block_size=64,
+    nmm_block_grad_checkpoint=True,
     nmm_state_dtype="bf16",
     nmm_low_rank=64,
 )
 
-# 7. If you need MAX speed at T=1024 and accept lower NMM capacity
+# 3. If you need MAX speed at T=1024 and accept lower NMM capacity
 #    (paper applies NMM at every block — reducing to 4-of-12 cuts
 #    NMM-recompute cost ~3x).
 cfg = TitansConfig.gpt2_small(
     chunk_size=T, block_size=T,
-    nmm_grad_checkpoint=True, nmm_grad_checkpoint_segment_len=32,
+    nmm_block_size=64,
+    nmm_block_grad_checkpoint=True,
     nmm_state_dtype="bf16",
     nmm_low_rank=64,
     nmm_layer_indices=[0, 3, 6, 9],
 )
 
-# 8. Inner-loop compile (G264a): 1.7-1.9x step-time speedup with
-#    paper-faithful sequential semantics. The single most impactful
-#    speed knob — recommended for any T >= 256 training run.
-#    First step pays a one-time torch.compile cost (~30-60s);
-#    subsequent steps are fast.
+# 4. Inner-loop compile (G264a): 1.7-1.9x step-time speedup with
+#    paper-faithful sequential semantics. Stacks on top of all of the
+#    above. First step pays a one-time torch.compile cost (~30-60s).
 cfg = TitansConfig.gpt2_small(
     chunk_size=T, block_size=T,
-    nmm_grad_checkpoint=True, nmm_grad_checkpoint_segment_len=32,
+    nmm_block_size=64,
+    nmm_block_grad_checkpoint=True,
     nmm_state_dtype="bf16",
     nmm_low_rank=64,
     nmm_compile_inner_loop=True,   # the speedup
     nmm_fused_kernel=True,         # +5% on top (analytical inner gradient)
 )
-# T=1024 measured: 158s/step (ref) -> 83s/step (combined). 1.90x.
-# T=256 measured:   40s/step (ref) -> 21s/step (combined). 1.90x.
-
-# 9. Blockwise NMM (G266): chunk-as-update aggregation — ONE memory
-#    update per `nmm_block_size` tokens, not per token. Per-block
-#    forward becomes a batched matmul (TC engages). Approximate
-#    (paper's per-token M_{t-1} replaced by per-block M_{block-1})
-#    but trains stably and unlocks REAL training throughput on
-#    consumer hardware. This is the recommended path for any
-#    serious training run at T >= 256.
-cfg = TitansConfig.gpt2_small(
-    chunk_size=T, block_size=T,
-    nmm_grad_checkpoint=True, nmm_grad_checkpoint_segment_len=32,
-    nmm_state_dtype="bf16",
-    nmm_low_rank=64,
-    nmm_block_size=64,             # 45x faster, 16 blocks per T=1024 chunk
-)
-# T=1024 measured: 83s/step (sequential best) -> 1.88s/step. 45x.
-# Loss trajectory @ blk=64 over 20 steps on fixed batch: 10.94 -> 6.94.
-# 50k-step run: ~31 hours @ blk=64 (vs 7 weeks sequential).
-# Larger block_size = faster but coarser approximation:
-#   block_size=128 -> 0.99s/step ( 86x), 50k-steps in 14h
-#   block_size=256 -> 0.53s/step (160x), 50k-steps in 7.5h
-#   block_size=512 -> 0.31s/step (274x), 50k-steps in 4.3h
+# Blockwise throughput at gpt2_small, RTX 5070 Ti, T=1024:
+#   block_size=64  -> 1.88 s/step ( 45x over sequential), 50k steps in ~31 h
+#   block_size=128 -> 0.99 s/step ( 86x), 50k-steps in 14h
+#   block_size=256 -> 0.53 s/step (160x), 50k-steps in 7.5h
+#   block_size=512 -> 0.31 s/step (274x), 50k-steps in 4.3h
 ```
 
 ---

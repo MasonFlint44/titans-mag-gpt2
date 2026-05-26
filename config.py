@@ -61,7 +61,7 @@ class TitansConfig:
     feed_persistent_to_nmm: bool = True
     nmm_n_heads: int = 1
 
-    # Memory-saving knobs (G256, G257). Defaults preserve the original
+    # Memory-saving knobs (G256). Defaults preserve the original
     # fp32 / no-checkpoint behavior; flip when you hit OOM training the
     # NMM with realistic chunk sizes.
     #
@@ -73,62 +73,28 @@ class TitansConfig:
     #   instead of ~1), so this is safe-by-construction; the only drift
     #   risk is the per-step M_t = (1-a)*M_{t-1} + S_t update rounding in
     #   bf16. Measure loss curves before relying on it for full training.
-    #   Valid values: "fp32", "bf16".
-    #
-    # nmm_grad_checkpoint: when True, `_forward_chunk_sequential` runs the
-    #   per-token inner loop in segments of `nmm_grad_checkpoint_segment_len`
-    #   tokens; each segment is wrapped in `torch.utils.checkpoint.checkpoint`
-    #   so backward recomputes the inner-loop intermediates instead of
-    #   storing them. ~5-10x larger feasible chunk_size at the cost of an
-    #   extra forward pass through each segment during backward. Composes
-    #   with nmm_state_dtype="bf16" multiplicatively. The blockwise path
-    #   ignores this flag — it only applies to the sequential per-token
-    #   recurrence.
-    #
-    # nmm_grad_checkpoint_segment_len: segment size when grad-checkpointing
-    #   is on. Smaller = less peak memory + more recompute; larger = more
-    #   peak memory + less recompute. 64 is a reasonable default that
-    #   roughly matches "checkpoint every 64 tokens" guidance from other
-    #   sequence-model checkpoint implementations.
+    #   Valid values: "fp32", "bf16", "int8" (int8 requires blockwise; see
+    #   the validator in `__post_init__`).
     nmm_state_dtype: str = "fp32"
-    nmm_grad_checkpoint: bool = False
-    nmm_grad_checkpoint_segment_len: int = 64
-
-    # nmm_cpu_offload_segments (G258): when True, gradient-checkpoint
-    # boundary (M, S) tensors are stashed on CPU between forward and
-    # backward instead of staying on GPU. Backward moves them back to GPU
-    # one segment at a time, recomputes, and discards. ~20x reduction in
-    # GPU memory used by checkpoint boundaries at the cost of CPU↔GPU
-    # transfer time (PCIe 4.0 x16: ~16 GB/s realistic). Requires
-    # `nmm_grad_checkpoint=True` — without it there are no boundary
-    # tensors to offload. Composes with `nmm_state_dtype="bf16"`
-    # (offloaded tensors are bf16, transfer is half the size).
-    nmm_cpu_offload_segments: bool = False
 
     # nmm_block_grad_checkpoint (G260): wrap each `TitansMAGBlock.forward`
     # in `torch.utils.checkpoint.checkpoint(use_reentrant=True)`. The entire
     # block (attn + NMM forward_chunk + MAG gate + MLP) is recomputed on
     # backward; only block-input/output tensors live in the autograd graph
     # between blocks. Removes the
-    # `n_blocks × n_segments × per_segment` term from the GPU checkpoint's
-    # memory ceiling that bounded the inner `nmm_grad_checkpoint` mode at
-    # long T. At gpt2_small T=1024 this saves ~10 GiB.
+    # `n_blocks × per_block_transient` term from the autograd graph between
+    # blocks — at gpt2_small T=1024 this saves ~10 GiB.
     #
-    # COMPOSITION: this flag is intended to combine WITH
-    # `nmm_grad_checkpoint=True`. Block-level checkpointing alone (without
-    # inner segment checkpointing) re-builds the FULL per-token NMM graph
-    # for one block at a time during backward recompute — at T=1024 that's
-    # still ~50 GiB of transient NMM state for the one block in flight, so
-    # backward will OOM. The combination "block checkpoint + segment
-    # checkpoint" is the intended configuration; segment checkpoint
-    # bounds the transient in-block graph during recompute. We do NOT
-    # automatically enable nmm_grad_checkpoint when this flag is set —
-    # users may explicitly want both off for the sequential code path, or
-    # explicitly want only segment-level for short T.
+    # COMPOSITION: pair with `nmm_block_size >= 16` so the per-block NMM
+    # transient that gets rebuilt during recompute is itself bounded.
+    # Block-level checkpointing combined with `block_size=1` (per-token
+    # sequential) re-builds the full per-token NMM graph for one block
+    # at a time during backward recompute — at T=1024 that's still
+    # ~50 GiB of transient NMM state for the one block in flight, so
+    # backward will OOM.
     #
     # Cost: each block's forward runs twice (once on forward, once on
-    # backward recompute). At gpt2_small that's roughly 2x step time on
-    # top of any segment-level recompute overhead.
+    # backward recompute). At gpt2_small that's roughly 2x step time.
     nmm_block_grad_checkpoint: bool = False
 
     # nmm_layer_indices (G261): if not None, NMM is wired only on the
@@ -372,8 +338,7 @@ class TitansConfig:
     # explicitly; flip to True for any T >= 256 training run.
     #
     # Composes with every existing memory knob (nmm_low_rank,
-    # nmm_grad_checkpoint, nmm_state_dtype="bf16", nmm_block_grad_checkpoint,
-    # nmm_layer_indices).
+    # nmm_state_dtype="bf16", nmm_block_grad_checkpoint, nmm_layer_indices).
     nmm_fused_kernel: bool = False
 
     # nmm_low_rank (G262): factor the MemoryMLP weights as A @ B with an
@@ -473,26 +438,6 @@ class TitansConfig:
                 "every step. Use the blockwise path "
                 "(block_size >= 16 recommended for TC engagement)."
             )
-        if self.nmm_grad_checkpoint_segment_len < 1:
-            raise ValueError(
-                f"nmm_grad_checkpoint_segment_len must be >= 1 (got "
-                f"{self.nmm_grad_checkpoint_segment_len})."
-            )
-
-        # cpu_offload only makes sense when grad_checkpoint is on — without
-        # checkpointing there are no boundary tensors to offload (the full
-        # graph is on GPU). Fail loud so callers don't enable cpu_offload
-        # alone and wonder why memory didn't drop.
-        if self.nmm_cpu_offload_segments and not self.nmm_grad_checkpoint:
-            raise ValueError(
-                "nmm_cpu_offload_segments=True requires "
-                "nmm_grad_checkpoint=True. The CPU-offload only stashes "
-                "checkpoint-boundary tensors; with checkpointing off there "
-                "are no boundaries to offload (the full per-token graph "
-                "lives on GPU). Set nmm_grad_checkpoint=True too, or set "
-                "nmm_cpu_offload_segments=False."
-            )
-
         # nmm_layer_indices: must reference valid block indices, no dupes.
         if self.nmm_layer_indices is not None:
             if not isinstance(self.nmm_layer_indices, (list, tuple)):
