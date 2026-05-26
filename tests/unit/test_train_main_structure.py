@@ -267,3 +267,51 @@ def test_init_destroy_process_group_pair_present():
     destroy_lines = _find_call_lines(tree, "destroy_process_group")
     assert init_lines, "init_process_group not found in train.main() (G201)"
     assert destroy_lines, "destroy_process_group not found in train.main() (G201)"
+
+
+# ---------------------------------------------------------------------------
+# G282 — capture_scalar_outputs set at module import
+# ---------------------------------------------------------------------------
+
+def test_train_sets_dynamo_capture_scalar_outputs_on_import():
+    """Importing `train` MUST set `torch._dynamo.config.capture_scalar_outputs`
+    to True so the NMM's `bool(doc_boundaries.any())` scalar read at
+    model/nmm.py doesn't graph-break `torch.compile(...)` from
+    --compile-model.
+
+    Regression guard: if a refactor moves this setting out of train.py's
+    top-level (or deletes it), every --compile-model run silently emits
+    the dynamo warning AND splits its compiled forward at the NMM
+    boundary, losing the documented ~2-5% step-time win.
+    """
+    import torch._dynamo
+    # `train` was imported at module top; the side effect should already
+    # have fired. Verify by reading the dynamo config.
+    assert torch._dynamo.config.capture_scalar_outputs is True, (
+        "train.py must set torch._dynamo.config.capture_scalar_outputs = True "
+        "at module import to suppress the NMM graph break under "
+        "--compile-model. See G282 in train.py."
+    )
+
+
+def test_train_sets_capture_scalar_outputs_before_run_training():
+    """Defensive structural check: the config mutation must happen at
+    MODULE level (not inside a function), so importing `train` is
+    sufficient. If someone moves it inside `main()` or `run_training()`
+    the setting wouldn't apply when finetune.py wraps the model with
+    torch.compile BEFORE calling run_training."""
+    src = inspect.getsource(train)
+    # The mutation must appear in the module body, before any def block.
+    assignment_re = re.compile(
+        r"torch\._dynamo\.config\.capture_scalar_outputs\s*=\s*True"
+    )
+    match = assignment_re.search(src)
+    assert match, "capture_scalar_outputs assignment missing from train.py"
+    # Find the position of the first `def ` after the import block.
+    first_def = re.search(r"^def ", src, re.MULTILINE)
+    assert first_def, "train.py has no top-level def — file structure changed"
+    assert match.start() < first_def.start(), (
+        "capture_scalar_outputs is set AFTER the first def — it would not "
+        "take effect at module import time. Move the assignment above any "
+        "function definitions."
+    )

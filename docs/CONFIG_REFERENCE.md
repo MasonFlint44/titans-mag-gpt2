@@ -437,6 +437,8 @@ Wraps the full `TitansMAGGPT2` in `torch.compile(mode="default", dynamic=False)`
 - DDP is applied AFTER compile (model = DDP(torch.compile(model))).
 - Dropout, gradient checkpointing, autocast all compose normally.
 
+**G282 — graph-break suppression**: the NMM's `bool(doc_boundaries.any())` scalar read at `_forward_chunk_blockwise` / `_forward_chunk_sequential` would otherwise split the compiled forward at every NMM block boundary (dynamo can't trace `.item()` / `bool(tensor)` without help). `train.py` sets `torch._dynamo.config.capture_scalar_outputs = True` at module import to include the scalar sync in the captured graph instead. The Python-level downstream branch (`if any_boundary: ...`) causes mild specialization, but our SQuAD-style training has `doc_boundaries.any() == False` for the overwhelming majority of chunks, so dynamo caches the False-branch graph and reuses it. Without G282, you'd see `W ... Graph break from 'Tensor.item()'` in the log at first step and lose ~2-5% steady-state throughput.
+
 ### 8-bit AdamW (G278)
 
 CLI flag: `--optim8bit`. Requires `bitsandbytes` installed (`pip install bitsandbytes` or use the `optim8bit` optional dependency group in `pyproject.toml`).

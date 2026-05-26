@@ -9,10 +9,31 @@ import time
 from pathlib import Path
 
 import torch
+import torch._dynamo
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from tqdm.auto import tqdm
+
+
+# G282 — graph-break suppression for the NMM's `bool(doc_boundaries.any())`
+# scalar read at `model/nmm.py:_forward_chunk_blockwise` (and the matching
+# sequential-path call). Without this, `torch.compile` warns at first
+# encounter and SPLITS the compiled forward at every NMM block boundary,
+# losing some of the fusion the --compile-model flag is meant to deliver.
+#
+# Setting `capture_scalar_outputs = True` tells dynamo to include the
+# scalar sync (item() / bool()) inside the captured graph instead of
+# bailing out. The Python-level branch downstream (`if any_boundary: ...`)
+# would still cause specialization, but in our SQuAD training the bool
+# value is overwhelmingly False (no doc boundary mid-chunk), so dynamo
+# caches that branch's graph and reuses it for the vast majority of
+# steps.
+#
+# Set at module import — runs before any `torch.compile(...)` call in
+# downstream entry points (scripts/finetune.py wraps the model AFTER
+# `from train import ...`). Idempotent if set again elsewhere.
+torch._dynamo.config.capture_scalar_outputs = True
 
 
 # ---------------------------------------------------------------------------
