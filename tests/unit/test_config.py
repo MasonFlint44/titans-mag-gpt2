@@ -243,6 +243,45 @@ def test_ns5_steps_propagates_to_nmm():
 
 
 # ---------------------------------------------------------------------------
+# nmm_use_gram_ns5 — Tri Dao's Gram-Newton-Schulz drop-in
+# ---------------------------------------------------------------------------
+
+def test_use_gram_ns5_default_is_false():
+    """Default must be off so existing configs are unaffected and we
+    don't add a runtime import failure for users who haven't installed
+    the optional dep."""
+    cfg = TitansConfig()
+    assert cfg.nmm_use_gram_ns5 is False
+
+
+def test_use_gram_ns5_can_be_set_at_config_time():
+    """Config construction must succeed even when the gram-newton-schulz
+    package isn't imported. The import is lazy (happens at NMM
+    construction time when the flag is True)."""
+    cfg = TitansConfig(nmm_use_gram_ns5=True)
+    assert cfg.nmm_use_gram_ns5 is True
+
+
+def test_use_gram_ns5_warns_when_overridden_knobs_set():
+    """If user sets both gram_ns5 AND nmm_ns5_steps != 5, warn — the
+    ns5_steps value is ignored because Gram-NS5 has its own per-iter
+    coefficient table."""
+    with pytest.warns(UserWarning, match="nmm_use_gram_ns5=True overrides"):
+        TitansConfig(nmm_use_gram_ns5=True, nmm_ns5_steps=4)
+
+
+def test_use_gram_ns5_warns_when_compile_ns5_set():
+    with pytest.warns(UserWarning, match="nmm_use_gram_ns5=True overrides"):
+        TitansConfig(nmm_use_gram_ns5=True, nmm_compile_ns5=True)
+
+
+def test_use_gram_ns5_no_warn_with_default_knobs():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        TitansConfig(nmm_use_gram_ns5=True)  # default ns5_steps=5, compile_ns5=False
+
+
+# ---------------------------------------------------------------------------
 # Validation survives `python -O` (G190)
 # ---------------------------------------------------------------------------
 

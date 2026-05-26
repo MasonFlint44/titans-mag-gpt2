@@ -260,11 +260,16 @@ python -m train --data corpus.txt \
     --nmm-block-size 64 \
     --nmm-state-dtype bf16 \
     --nmm-detach-state-between-blocks \
+    --nmm-use-gram-ns5 \
     --compile-model \
     --optim8bit
 ```
 
-Measured on RTX 5070 Ti: ~1.11 s/step, 8.5 GiB peak.
+Measured on RTX 5070 Ti: ~940 ms/step, 6.5 GiB peak with Gram-NS5
+(~1.11 s/step, 8.5 GiB without). The `--nmm-use-gram-ns5` flag needs
+`pip install gram-newton-schulz` and a Hopper/Blackwell GPU; drop it if
+unavailable.
+
 (`--nmm-compile-inner-loop` and `--nmm-fused-kernel` are no-ops on the
 blockwise path used here; the config validator warns if set.) The `--nmm-detach-state-between-blocks`
 flag is what makes full-rank fit at T=1024 — it bounds the backward

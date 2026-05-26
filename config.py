@@ -275,6 +275,33 @@ class TitansConfig:
     # Module-level singleton cache so all NMMs share one warm-up.
     nmm_compile_ns5: bool = False
 
+    # nmm_use_gram_ns5: when True, replace the stock Newton-Schulz polar
+    # decomposition with Tri Dao's Gram-Newton-Schulz (Dao-AILab/
+    # gram-newton-schulz). Standard NS5 does 2T rectangular matmuls
+    # (T=5 iterations × 2 each); Gram-NS5 does 2 rectangular matmuls
+    # total + T iterations on the small n×n Gram matrix. At gpt2_small
+    # dims (m=4d=3072, n=d=768, α=4): claimed 42% FLOP reduction,
+    # measured 1.17-3.07× wall-clock speedup on a consumer Blackwell
+    # (RTX 5070 Ti, sm_120). The library also runs the iteration in
+    # fp16 (better than TF32 tensor-core throughput).
+    #
+    # Convergence: the library uses Polar Express coefficients (different
+    # per iteration) with a restart at iteration 2 to reset Gram-matrix
+    # drift. On random Gaussian inputs, |sv - 1| ≈ 0.12-0.15 — comparable
+    # to stock NS5-steps=5. Authors claim perplexity preserved within
+    # 0.01 on trillion-parameter Muon training.
+    #
+    # Optional dependency: install via `pip install
+    # 'titans-mag-gpt2[gram_ns5]'` or `pip install gram-newton-schulz`.
+    # Targets Hopper / Blackwell GPUs and requires PyTorch 2.7+, CUDA 12.9+.
+    # Construction-time flag, NOT runtime — set at config time so we
+    # can build the Gram-NS module once and reuse it across all NS calls.
+    #
+    # When this flag is set, `nmm_ns5_steps` is IGNORED (Gram-NS5 has its
+    # own per-iteration coefficient table) and `nmm_compile_ns5` is
+    # redundant (Gram-NS5 has its own optimized kernels).
+    nmm_use_gram_ns5: bool = False
+
     # nmm_per_token_ns5 (G267): when True AND `nmm_block_size > 1`, the
     # blockwise path uses per-token NS5 + per-token θ weighting, matching
     # paper Eq 16's `Σ_t θ_t · NS5(∇_t)` exactly. Default False, which
@@ -555,6 +582,24 @@ class TitansConfig:
                 "to share. Either set nmm_n_heads > 1 to use multi-head NMM, "
                 "or leave nmm_per_head_learned_params=True (default)."
             )
+
+        # nmm_use_gram_ns5: warn about ignored knobs so the user knows
+        # their nmm_ns5_steps / nmm_compile_ns5 settings don't apply.
+        if self.nmm_use_gram_ns5:
+            redundant = []
+            if self.nmm_ns5_steps != 5:
+                redundant.append(f"nmm_ns5_steps={self.nmm_ns5_steps}")
+            if self.nmm_compile_ns5:
+                redundant.append("nmm_compile_ns5=True")
+            if redundant:
+                warnings.warn(
+                    f"nmm_use_gram_ns5=True overrides {', '.join(redundant)} — "
+                    f"Gram-NS5 has its own per-iteration coefficient table "
+                    f"and optimized kernels. Drop those knobs to silence "
+                    f"this warning.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
         # nmm_ns5_steps: paper default is 5; sanity bounds [1, 10].
         if not isinstance(self.nmm_ns5_steps, int) or not (1 <= self.nmm_ns5_steps <= 10):

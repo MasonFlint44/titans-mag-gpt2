@@ -133,6 +133,18 @@ def add_nmm_args(parser: argparse.ArgumentParser) -> None:
              "steps=3 ~33%% faster + ~20%% LR drift. Validate convergence on "
              "your data before lowering.",
     )
+    group.add_argument(
+        "--nmm-use-gram-ns5",
+        action="store_true",
+        help="Replace stock Newton-Schulz with Tri Dao's Gram-Newton-Schulz "
+             "(Dao-AILab/gram-newton-schulz). Standard NS5 does 2T "
+             "rectangular matmuls; Gram-NS5 does 2 rectangular + T cheap "
+             "n×n Gram-matrix iterations. Empirically measured 1.17-3.07× "
+             "speedup at gpt2_small dims on consumer Blackwell (RTX 5070 Ti). "
+             "Requires `pip install gram-newton-schulz` and PyTorch 2.7+ / "
+             "CUDA 12.9+ on a Hopper/Blackwell GPU. Overrides "
+             "--nmm-ns5-steps and --nmm-compile-ns5.",
+    )
 
 
 def nmm_kwargs_from_args(args: argparse.Namespace) -> dict:
@@ -159,4 +171,6 @@ def nmm_kwargs_from_args(args: argparse.Namespace) -> dict:
         kwargs["nmm_compile_ns5"] = True
     if args.nmm_ns5_steps is not None:
         kwargs["nmm_ns5_steps"] = args.nmm_ns5_steps
+    if args.nmm_use_gram_ns5:
+        kwargs["nmm_use_gram_ns5"] = True
     return kwargs

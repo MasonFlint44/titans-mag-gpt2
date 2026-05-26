@@ -409,6 +409,7 @@ class TitansMAGBlock(nn.Module):
             momentum_order=config.nmm_momentum_order,
             compile_ns5=config.nmm_compile_ns5,
             ns5_steps=config.nmm_ns5_steps,
+            use_gram_ns5=config.nmm_use_gram_ns5,
         )
         if config.nmm_n_heads > 1:
             self.nmm = MultiHeadNMM(

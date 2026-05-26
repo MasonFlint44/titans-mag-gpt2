@@ -416,6 +416,55 @@ def _get_compiled_ns5():
     return _ns5_compiled_cache
 
 
+# Tri Dao's Gram-Newton-Schulz: drop-in NS5 replacement that does most
+# work on the small Gram matrix instead of the rectangular input. ~1.17-
+# 3.07× speedup at gpt2_small dims on consumer Blackwell, claimed 42%
+# FLOP reduction at α=m/n=4. See config.nmm_use_gram_ns5 for the user-
+# facing docs.
+#
+# Module-level singleton so all NMM instances share a single GramNS
+# object (avoids repeated coefficient-table allocation).
+_gram_ns_cache = None
+
+
+def _get_gram_ns5_callable():
+    """Return a callable matching `newton_schulz5(G, steps=5, eps=1e-7)`
+    that dispatches to Tri Dao's Gram-Newton-Schulz.
+
+    Fails loud at first call if the `gram-newton-schulz` package isn't
+    installed — we don't want a silent fallback to stock NS5, since the
+    user explicitly set the flag.
+    """
+    global _gram_ns_cache
+    if _gram_ns_cache is None:
+        try:
+            from gram_newton_schulz import (
+                GramNewtonSchulz,
+                POLAR_EXPRESS_COEFFICIENTS,
+            )
+        except ImportError as e:
+            raise ImportError(
+                "nmm_use_gram_ns5=True requires the `gram-newton-schulz` "
+                "package. Install via `pip install gram-newton-schulz` or "
+                "`pip install titans-mag-gpt2[gram_ns5]`. Requires PyTorch "
+                "2.7+, CUDA 12.9+, and a Hopper/Blackwell GPU."
+            ) from e
+
+        _gram_instance = GramNewtonSchulz(
+            ns_coefficients=POLAR_EXPRESS_COEFFICIENTS,
+            gram_newton_schulz_reset_iterations=[2],
+        )
+
+        def _gram_ns5_wrapper(G: torch.Tensor, steps: int = 5, eps: float = 1e-7):
+            # Gram-NS5 ignores `steps` (per-iter coefficient table) and `eps`
+            # (handled internally). Signature kept compatible with
+            # `newton_schulz5` so callers don't have to branch.
+            return _gram_instance(G)
+
+        _gram_ns_cache = _gram_ns5_wrapper
+    return _gram_ns_cache
+
+
 def _make_grad_fn(memory_mlp: nn.Module, spectral_norm: bool):
     """Build the cached vmap(grad(inner_loss)) per-sample gradient function.
 
@@ -593,6 +642,7 @@ class NeuralMemoryModule(nn.Module):
         momentum_order: int = 1,
         compile_ns5: bool = False,
         ns5_steps: int = 5,
+        use_gram_ns5: bool = False,
     ):
         super().__init__()
         self.n_embd = n_embd
@@ -651,6 +701,7 @@ class NeuralMemoryModule(nn.Module):
         # variant. No effect when compile_inner_loop=True (the inner-
         # loop compile already wraps NS5 transitively).
         self.compile_ns5 = bool(compile_ns5)
+        self.use_gram_ns5 = bool(use_gram_ns5)
         # Number of Newton-Schulz iterations. 5 = paper-faithful (Muon
         # coefficients tuned for this fixed point); lower drifts the
         # spectral norm away from 1 (see config.nmm_ns5_steps docstring).
@@ -659,10 +710,18 @@ class NeuralMemoryModule(nn.Module):
         self.ns5_steps = int(ns5_steps)
         # Resolved NS5 callable — used by every path that applies NS5.
         # Bind `steps` here so call sites stay `self._ns5_fn(g)` with no
-        # extra argument threading. Default (uncompiled) preserves existing
-        # behavior bit-for-bit; opt-in switches every call site to the
-        # compiled variant in one place rather than scattering branches.
-        _ns5_base = _get_compiled_ns5() if self.compile_ns5 else newton_schulz5
+        # extra argument threading. Three options, mutually exclusive in
+        # practice (Gram-NS5 supersedes both compile_ns5 and ns5_steps —
+        # see TitansConfig validator's warning):
+        #   1. use_gram_ns5=True → Tri Dao's Gram-NS5 (different algorithm)
+        #   2. compile_ns5=True → torch.compile-wrapped stock NS5
+        #   3. default → plain stock NS5
+        if self.use_gram_ns5:
+            _ns5_base = _get_gram_ns5_callable()
+        elif self.compile_ns5:
+            _ns5_base = _get_compiled_ns5()
+        else:
+            _ns5_base = newton_schulz5
         _steps = self.ns5_steps
         self._ns5_fn = lambda g, _f=_ns5_base, _s=_steps: _f(g, steps=_s)
         # Paper Eq. 15: y_t = M(q_t) where M is M_{t-1} (read-then-write).
@@ -1573,6 +1632,7 @@ class MultiHeadNMM(nn.Module):
         momentum_order: int = 1,
         compile_ns5: bool = False,
         ns5_steps: int = 5,
+        use_gram_ns5: bool = False,
         per_head_learned_params: bool = True,
     ):
         super().__init__()
@@ -1616,6 +1676,7 @@ class MultiHeadNMM(nn.Module):
                 momentum_order=momentum_order,
                 compile_ns5=compile_ns5,
                 ns5_steps=ns5_steps,
+                use_gram_ns5=use_gram_ns5,
             )
             for _ in range(n_heads)
         ])

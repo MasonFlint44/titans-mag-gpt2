@@ -1299,6 +1299,51 @@ def test_compile_ns5_resolves_to_compiled_function():
     assert compiled_base is not _nmm.newton_schulz5
 
 
+def test_use_gram_ns5_resolves_to_gram_callable():
+    """When use_gram_ns5=True, self._ns5_fn dispatches to Tri Dao's
+    Gram-Newton-Schulz wrapper instead of stock NS5 or its compiled
+    variant. Only attempts to construct when the package is installed."""
+    import importlib.util
+    if importlib.util.find_spec("gram_newton_schulz") is None:
+        pytest.skip("gram-newton-schulz not installed; skipping")
+    if not torch.cuda.is_available():
+        pytest.skip("Gram-NS5 requires CUDA")
+    from model import nmm as _nmm
+    nmm_gram = NeuralMemoryModule(
+        n_embd=16, expansion=2, kernel_size=2,
+        spectral_norm=True, finetune_mode=False,
+        use_gram_ns5=True,
+    )
+    gram_base = nmm_gram._ns5_fn.__defaults__[0]
+    # Wrapper is module-private but named _gram_ns5_wrapper.
+    assert gram_base.__name__ == "_gram_ns5_wrapper"
+    assert gram_base is not _nmm.newton_schulz5
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Gram-NS5 requires CUDA")
+def test_gram_ns5_produces_spectrally_normalized_output():
+    """Gram-NS5 should produce output with spectral norm close to 1 on a
+    realistically-shaped NMM gradient tensor — same convergence target
+    as stock NS5, just a different algorithm/coefficients."""
+    import importlib.util
+    if importlib.util.find_spec("gram_newton_schulz") is None:
+        pytest.skip("gram-newton-schulz not installed; skipping")
+    from model.nmm import _get_gram_ns5_callable
+    torch.manual_seed(0)
+    G = torch.randn(1, 3072, 768, device="cuda", dtype=torch.float32)
+    gram_ns = _get_gram_ns5_callable()
+    Y = gram_ns(G)
+    assert Y.shape == G.shape
+    sv = torch.linalg.svdvals(Y[0])
+    # Polar Express coefficients give |sv - 1| ~ 0.12-0.15 on random
+    # Gaussian inputs, comparable to stock NS5-steps=5 (~0.13).
+    # Allow generous slack — bound is "spectrally normalized to within
+    # ~30%", catches catastrophic regressions (e.g. wrong shape passed).
+    assert abs(sv.max().item() - 1.0) < 0.3, (
+        f"Gram-NS5 sv_max = {sv.max().item():.4f}, expected near 1"
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="torch.compile + CUDA required")
 def test_compile_ns5_matches_uncompiled_output():
     """Compiled NS5 must produce the same output as the reference. With

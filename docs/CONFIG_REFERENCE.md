@@ -143,6 +143,7 @@ passed to `TitansConfig`. Quick reference:
 | `--nmm-fused-kernel` | flag | Analytical inner gradient (~5-15% on top of `--nmm-compile-inner-loop`) |
 | `--nmm-compile-ns5` | flag | Fused NS5 via torch.compile (no effect when `--nmm-compile-inner-loop` is set) |
 | `--nmm-ns5-steps N` | int | Newton-Schulz iteration count (default 5). **Lowering speeds up training significantly but drifts the spectral norm of NS5(g) — measured at gpt2_small: steps=4 ~16% faster + ~12% LR drift; steps=3 ~33% faster + ~20% LR drift.** Validate convergence on your data before lowering. |
+| `--nmm-use-gram-ns5` | flag | Replace stock NS5 with Tri Dao's Gram-Newton-Schulz (Dao-AILab/gram-newton-schulz). 2 rectangular matmuls + T iterations on the n×n Gram matrix, vs stock NS5's 2T rectangular matmuls. **Measured: ~15-20% speedup + ~2 GiB memory savings on the recommended recipe.** Requires `pip install gram-newton-schulz`, PyTorch 2.7+, CUDA 12.9+, and Hopper/Blackwell GPU. Overrides `--nmm-ns5-steps` and `--nmm-compile-ns5` (Gram-NS5 has its own coefficients and kernels). |
 
 ### Recommended consumer-GPU recipe (T=1024, full-rank, 16 GiB card)
 
@@ -157,21 +158,30 @@ python -m train --data corpus.txt \
     --nmm-block-size 64 \
     --nmm-state-dtype bf16 \
     --nmm-detach-state-between-blocks \
+    --nmm-use-gram-ns5 \
     --compile-model \
     --optim8bit
 ```
 
-**Measured on RTX 5070 Ti (15.5 GiB VRAM):**
+The `--nmm-use-gram-ns5` flag requires an optional dependency
+(`pip install gram-newton-schulz`); drop it if you can't install it
+and the numbers below will degrade by ~15% step time and ~2 GiB peak.
+See the "Faster polar decomposition" section below for details.
+
+**Measured on RTX 5070 Ti (15.5 GiB VRAM) with Gram-NS5:**
 
 | Metric | Value |
 |---|---|
-| Step time (B=1, T=1024) | **~1.11 s** |
-| Peak VRAM | **8.5 GiB** (7.0 GiB headroom) |
-| Throughput | **~920 tok/s** |
+| Step time (B=1, T=1024) | **~940 ms** |
+| Peak VRAM | **~6.5 GiB** (9 GiB headroom) |
+| Throughput | **~1080 tok/s** |
 | Effective batch (`--grad-accum 16`) | 16 |
-| Optimizer step wall-clock | ~17.8 s |
-| 1k optimizer steps | ~5 h |
-| 50k optimizer steps | ~10 days |
+| Optimizer step wall-clock | ~15 s |
+| 1k optimizer steps | ~4 h |
+| 50k optimizer steps | ~8.7 days |
+
+Without `--nmm-use-gram-ns5`: ~1.11 s/step, 8.5 GiB peak, ~17.8 s/optimizer
+step, ~10 days for 50k steps.
 
 **What each flag buys you:**
 
@@ -193,6 +203,46 @@ only affect the per-token sequential path (`block_size=1`); they're
 silent no-ops on the blockwise path used here, and `--nmm-compile-inner-loop`
 in particular adds ~20 s of compile warm-up for zero runtime gain. Don't
 include them with this recipe — the config validator warns if you do.
+
+### Faster polar decomposition: `--nmm-use-gram-ns5`
+
+Tri Dao's Gram-Newton-Schulz (Dao-AILab/gram-newton-schulz) is a drop-in
+replacement for the polar decomposition iteration. Standard NS5 does 2T
+rectangular matmuls (`X = aX + (bA + cA²) X` where the second term is
+also rectangular). Gram-NS5 reformulates the iteration so that:
+
+1. Compute `R₀ = X X^T` once (one rectangular matmul, `O(n²m)`)
+2. Iterate purely on the small `n × n` Gram matrix (cheap symmetric ops)
+3. Apply the accumulated `Q_T` to X once (one rectangular matmul)
+
+Total: **2 rectangular matmuls + T cheap n×n iterations** vs stock NS5's
+**2T rectangular matmuls**. At gpt2_small dims (m=4d=3072, n=d=768,
+α=m/n=4) Tri Dao's paper claims 42% FLOP reduction.
+
+**Measured on RTX 5070 Ti (Blackwell consumer, sm_120):**
+
+| Recipe | Step time | Peak VRAM | Throughput |
+|---|---|---|---|
+| Stock NS5 (default) | ~1110 ms | ~8.5 GiB | ~920 tok/s |
+| **+ `--nmm-use-gram-ns5`** | **~940 ms** | **~6.5 GiB** | **~1080 tok/s** |
+
+15-20% wall-clock + 2 GiB memory. B=2 still OOMs either way (per-step
+rectangular activations scale linearly with batch regardless of NS
+algorithm).
+
+**Convergence:** Polar Express coefficients with restart at iter 2 (their
+default config). `|sv - 1|` on random Gaussian gradients ≈ 0.12-0.15 —
+comparable to stock NS5-steps=5. Authors claim perplexity preserved
+within 0.01 on trillion-param Muon training. We have a GPU-gated test
+verifying spectral normalization but no convergence study on actual NMM
+training; validate with a short loss-curve comparison if you're starting
+a long pretraining run.
+
+**Requirements:** PyTorch 2.7+, CUDA 12.9+, Hopper or Blackwell GPU.
+Install via `pip install gram-newton-schulz` or the `gram_ns5` optional
+dependency group. Library targets H100/B200/B300 datacenter GPUs but
+**confirmed working on consumer Blackwell** (RTX 5070 Ti, sm_120) in our
+testing.
 
 ### Speed-quality tradeoff: `--nmm-ns5-steps`
 
