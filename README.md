@@ -190,6 +190,20 @@ uv run python generate.py \
     --temperature 0 --max-new-tokens 15
 ```
 
+To chat with **stock HuggingFace GPT-2** (no checkpoint, no fine-tune)
+swap `--checkpoint` for `--stock-gpt2`. Useful as a qualitative baseline
+to compare against your fine-tunes:
+
+```bash
+uv run python generate.py \
+    --stock-gpt2 --size small \
+    --interactive \
+    --temperature 0 --max-new-tokens 15
+```
+
+`--size` picks `small`/`medium`/`large`/`xl` (default `small`). Weights
+load from the HF cache on first run.
+
 Inside the REPL:
 
 | Input | Effect |

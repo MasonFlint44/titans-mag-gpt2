@@ -294,8 +294,27 @@ def _main():
     )
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", required=True,
-                        help="Path to a training checkpoint (step_*.pt or latest.pt).")
+    parser.add_argument(
+        "--checkpoint", default=None,
+        help="Path to a training checkpoint (step_*.pt or latest.pt). "
+             "Required unless --stock-gpt2 is set.",
+    )
+    parser.add_argument(
+        "--stock-gpt2", action="store_true",
+        help="Run against stock HuggingFace GPT-2 (no fine-tune). Loads "
+             "pretrained weights via load_pretrained and constructs every "
+             "block as PlainGPT2Block (no NMM). Useful as a baseline for "
+             "qualitative comparison against fine-tuned checkpoints. "
+             "Mutually exclusive with --checkpoint. Use --size to pick "
+             "small/medium/large/xl.",
+    )
+    parser.add_argument(
+        "--size", default="small",
+        choices=["small", "medium", "large", "xl"],
+        help="GPT-2 size for --stock-gpt2 mode. Default: small. Ignored "
+             "when --checkpoint is used (the checkpoint's saved config "
+             "determines the size).",
+    )
     parser.add_argument("--prompt", default="",
                         help="Prompt text. Empty = start from EOT.")
     parser.add_argument("--max-new-tokens", type=int, default=200)
@@ -335,34 +354,68 @@ def _main():
     )
     args = parser.parse_args()
 
-    # Load checkpoint and build model.
+    # Mode selection: stock HF GPT-2 baseline vs. trained checkpoint.
+    # Mutually exclusive; at least one is required.
+    if args.stock_gpt2 and args.checkpoint:
+        raise SystemExit(
+            "--checkpoint and --stock-gpt2 are mutually exclusive. Use "
+            "--stock-gpt2 to load fresh HF weights, or --checkpoint to "
+            "load a trained checkpoint."
+        )
+    if not args.stock_gpt2 and not args.checkpoint:
+        raise SystemExit(
+            "Either --checkpoint or --stock-gpt2 is required."
+        )
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt = load_checkpoint(args.checkpoint, device=device)
-    if "config" not in ckpt:
-        raise SystemExit(
-            f"Checkpoint {args.checkpoint} lacks a 'config' key. "
-            f"Cannot rebuild the model architecture; pass a checkpoint "
-            f"saved by `save_checkpoint` from train.py."
-        )
-    # save_checkpoint stores config as dataclasses.asdict(config) — rebuild
-    # the TitansConfig from the dict (same pattern as test_checkpoint.py
-    # and scripts.eval_qa_recall._load_model).
-    config = TitansConfig(**ckpt["config"])
-    model = TitansMAGGPT2(config).to(device)
-    # state_dict keys may have _orig_mod./module. prefixes from
-    # torch.compile / DDP wrapping at save time. _unwrap strips them.
-    # train.py saves under "state_dict"; accept "model" too for any
-    # historical checkpoints that used the older key name.
-    from model import _unwrap
-    state = ckpt.get("state_dict", ckpt.get("model"))
-    if state is None:
-        raise SystemExit(
-            f"Checkpoint {args.checkpoint} has neither 'state_dict' nor "
-            f"'model' keys. Pass a checkpoint saved by save_checkpoint "
-            f"from train.py."
-        )
-    model.load_state_dict(_unwrap(state))
-    model.eval()
+
+    if args.stock_gpt2:
+        # Build a vanilla-blocks model and overwrite with HF GPT-2 weights.
+        # nmm_layer_indices=[] makes every block a PlainGPT2Block — pure
+        # attn + MLP, no NMM compute, no MAG gate. finetune_mode=True is
+        # a no-op here (no NMM means no gate to configure) but matches
+        # the convention used elsewhere in the codebase.
+        from scripts.load_pretrained import load_pretrained
+        factory = {
+            "small": TitansConfig.gpt2_small,
+            "medium": TitansConfig.gpt2_medium,
+            "large": TitansConfig.gpt2_large,
+            "xl": TitansConfig.gpt2_xl,
+        }[args.size]
+        config = factory(nmm_layer_indices=[], finetune_mode=True)
+        model = TitansMAGGPT2(config).to(device)
+        load_pretrained(model, config)
+        model.eval()
+        print(f"[stock-gpt2] loaded HF gpt2_{args.size} ({config.n_layer} layers, "
+              f"{config.n_embd} d_model, vanilla blocks)",
+              file=sys.stderr)
+    else:
+        ckpt = load_checkpoint(args.checkpoint, device=device)
+        if "config" not in ckpt:
+            raise SystemExit(
+                f"Checkpoint {args.checkpoint} lacks a 'config' key. "
+                f"Cannot rebuild the model architecture; pass a checkpoint "
+                f"saved by `save_checkpoint` from train.py."
+            )
+        # save_checkpoint stores config as dataclasses.asdict(config) — rebuild
+        # the TitansConfig from the dict (same pattern as test_checkpoint.py
+        # and scripts.eval_qa_recall._load_model).
+        config = TitansConfig(**ckpt["config"])
+        model = TitansMAGGPT2(config).to(device)
+        # state_dict keys may have _orig_mod./module. prefixes from
+        # torch.compile / DDP wrapping at save time. _unwrap strips them.
+        # train.py saves under "state_dict"; accept "model" too for any
+        # historical checkpoints that used the older key name.
+        from model import _unwrap
+        state = ckpt.get("state_dict", ckpt.get("model"))
+        if state is None:
+            raise SystemExit(
+                f"Checkpoint {args.checkpoint} has neither 'state_dict' nor "
+                f"'model' keys. Pass a checkpoint saved by save_checkpoint "
+                f"from train.py."
+            )
+        model.load_state_dict(_unwrap(state))
+        model.eval()
 
     # Load NMM state if requested and the file exists.
     initial_nmm_states = None
