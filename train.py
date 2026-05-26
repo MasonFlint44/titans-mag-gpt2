@@ -719,8 +719,28 @@ def run_training(
 
             step += 1
             if not cycle_completed:
-                # Single-GPU partial cycle exhausted the loader; stop.
-                break
+                # Single-GPU partial cycle: the loader exhausted mid-cycle.
+                # We've already stepped on the partial gradients (safe on
+                # single-GPU; DDP returned earlier at line ~587). For
+                # max_steps > one_epoch we want training to continue into
+                # the next epoch — the clean-boundary branch above will
+                # rebuild `micro_batches` on the next outer iteration. Resetting
+                # nmm_states here matches that branch's semantics (a fresh
+                # pass through the corpus is a fresh context). The original
+                # `break` here truncated training to one epoch silently —
+                # exactly the "silently early-stop" failure mode this
+                # function's docstring warns against. (Bug observed on
+                # vanilla GPT-2 SQuAD training: max_steps=5000 stopped at
+                # step ~998 with no checkpoint written, because save_every
+                # hadn't fired yet.)
+                if is_distributed:
+                    # DDP can't safely restart mid-cycle — the asymmetric
+                    # per-rank partial micro-batch count would diverge ranks
+                    # on the next iter. (Belt-and-suspenders: we already
+                    # returned in the DDP branch above.)
+                    break
+                micro_batches = iter(loader)
+                nmm_states = None
     finally:
         bar.close()
 

@@ -186,6 +186,63 @@ def test_compute_nmm_norm_increases_when_M_is_larger():
         assert abs(n2 / n1 - 2.0) < 1e-5
 
 
+def test_run_training_continues_across_epochs_on_single_gpu():
+    """Regression: when `max_steps > batches_per_epoch`, run_training MUST
+    rebuild the iterator and continue into the next epoch — not silently
+    early-stop after one pass. The docstring promises this; the single-GPU
+    partial-cycle branch previously broke out of the outer loop, truncating
+    a 5000-step run to ~one epoch with no checkpoint (the bug observed on
+    vanilla GPT-2 SQuAD training).
+
+    We exercise the path by giving the loader fewer batches than
+    `max_steps * accum_steps` and asserting that the training loop sees
+    every optimizer step.
+    """
+    cfg = TitansConfig(
+        n_layer=2, n_head=2, n_embd=8, vocab_size=32,
+        block_size=64, chunk_size=4, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=2,
+        finetune_mode=False,
+        nmm_layer_indices=[],  # vanilla — exercises the same code path
+    )
+    model = TitansMAGGPT2(cfg)
+    optimizer = build_optimizer(model)
+
+    # Loader yields exactly 3 micro-batches per pass. With accum_steps=2,
+    # that's 1 full cycle + 1 partial cycle per epoch (the single-GPU
+    # partial-cycle branch hits the break we just fixed). max_steps=4
+    # therefore requires AT LEAST 3 epoch restarts to complete.
+    class _SmallLoader:
+        def __iter__(self):
+            for _ in range(3):
+                yield _fake_batch(cfg, B=1, T=4)
+
+    loader = _SmallLoader()
+
+    # Snapshot optimizer step count to verify we actually advanced.
+    from train import run_training
+    run_training(
+        model=model, optimizer=optimizer, loader=loader,
+        device=torch.device("cpu"),
+        max_steps=4, warmup_steps=0, accum_steps=2,
+        log_every=1, save_every=None, save_dir=None,
+        config=cfg, autocast_dtype=None,
+        show_progress=False,
+    )
+
+    # The first param's step counter is the most reliable signal: the
+    # optimizer only steps on completed cycles. We REQUIRE max_steps
+    # optimizer steps — anything less means epoch-restart didn't kick in.
+    p = next(iter(model.parameters()))
+    state = optimizer.state.get(p, {})
+    n_steps = int(state.get("step", torch.tensor(0)).item()) if state else 0
+    assert n_steps == 4, (
+        f"Expected 4 optimizer steps (max_steps), got {n_steps}. "
+        f"run_training likely truncated to one epoch — the partial-cycle "
+        f"break has regressed."
+    )
+
+
 def test_run_training_handles_all_none_nmm_norms():
     """Regression: under --vanilla-gpt2 every block is a PlainGPT2Block, so
     `compute_nmm_norm(states)` returns `[None, None, ...]` — a list that's
