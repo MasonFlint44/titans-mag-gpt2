@@ -622,9 +622,9 @@ class NeuralMemoryModule(nn.Module):
         # When True, paper Eq 16's `Σ_t θ_t · NS5(∇_t)` is implemented
         # exactly (instead of v1's `θ_mean · NS5(Σ_t ∇_t)`). Costs more
         # memory (per-token gradient tensors of shape [B, block, H, D]
-        # per state key) — pair with nmm_block_grad_checkpoint=True at
-        # production scales. No-op when block_size=1 (single-token block
-        # has theta_mean = θ_t and per-token NS5 = single NS5).
+        # per state key) — reach for `nmm_low_rank` if memory is tight.
+        # No-op when block_size=1 (single-token block has theta_mean = θ_t
+        # and per-token NS5 = single NS5).
         self.per_token_ns5 = bool(per_token_ns5)
         # G268: truncated BPTT — detach (M, S) at each block boundary in the
         # blockwise path so the backward graph spans one block instead of the
@@ -1148,9 +1148,9 @@ class NeuralMemoryModule(nn.Module):
 
         Memory note: this path retains the full per-token autograd graph for
         the chunk. At long T on a memory-constrained card, prefer the
-        blockwise path (`nmm_block_size > 1`) which is both faster (TC
-        engagement) and amenable to `nmm_block_grad_checkpoint=True` for
-        bounded peak transient.
+        blockwise path (`nmm_block_size >= 16`) — it engages TC via batched
+        matmul and its peak transient scales with `block_size` rather than
+        full T.
         """
         if self.nmm_spectral_norm != self._spectral_norm_at_init:
             raise RuntimeError(

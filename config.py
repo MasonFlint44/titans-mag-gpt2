@@ -77,26 +77,6 @@ class TitansConfig:
     #   the validator in `__post_init__`).
     nmm_state_dtype: str = "fp32"
 
-    # nmm_block_grad_checkpoint (G260): wrap each `TitansMAGBlock.forward`
-    # in `torch.utils.checkpoint.checkpoint(use_reentrant=True)`. The entire
-    # block (attn + NMM forward_chunk + MAG gate + MLP) is recomputed on
-    # backward; only block-input/output tensors live in the autograd graph
-    # between blocks. Removes the
-    # `n_blocks × per_block_transient` term from the autograd graph between
-    # blocks — at gpt2_small T=1024 this saves ~10 GiB.
-    #
-    # COMPOSITION: pair with `nmm_block_size >= 16` so the per-block NMM
-    # transient that gets rebuilt during recompute is itself bounded.
-    # Block-level checkpointing combined with `block_size=1` (per-token
-    # sequential) re-builds the full per-token NMM graph for one block
-    # at a time during backward recompute — at T=1024 that's still
-    # ~50 GiB of transient NMM state for the one block in flight, so
-    # backward will OOM.
-    #
-    # Cost: each block's forward runs twice (once on forward, once on
-    # backward recompute). At gpt2_small that's roughly 2x step time.
-    nmm_block_grad_checkpoint: bool = False
-
     # nmm_layer_indices (G261): if not None, NMM is wired only on the
     # listed transformer blocks; other blocks are plain GPT-2 blocks
     # (attn + MLP only, no persistent prefix, no MAG gate). Cuts NMM-
@@ -289,9 +269,8 @@ class TitansConfig:
     # Cost: stores per-token gradient tensors of shape [B, block, ...]
     # per state-key for the duration of one block's forward. At
     # gpt2_small full-rank, block_size=64: ~1.8 GiB per layer; at
-    # low_rank=64: ~300 MiB per layer. Pair with
-    # `nmm_block_grad_checkpoint=True` at production scales to bound
-    # peak memory by recomputing per-block intermediates during backward.
+    # low_rank=64: ~300 MiB per layer. Reach for `nmm_low_rank` if
+    # memory is tight.
     #
     # At block_size=1, per_token_ns5 is a no-op (single-token block has
     # θ_mean = θ_t and per-token NS5 = single NS5).
@@ -338,7 +317,7 @@ class TitansConfig:
     # explicitly; flip to True for any T >= 256 training run.
     #
     # Composes with every existing memory knob (nmm_low_rank,
-    # nmm_state_dtype="bf16", nmm_block_grad_checkpoint, nmm_layer_indices).
+    # nmm_state_dtype="bf16", nmm_layer_indices).
     nmm_fused_kernel: bool = False
 
     # nmm_low_rank (G262): factor the MemoryMLP weights as A @ B with an

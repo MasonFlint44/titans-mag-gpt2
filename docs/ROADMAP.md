@@ -168,7 +168,7 @@ For `_forward_chunk_sequential`:
 - Run the conv on the full chunk in one shot (not per-token) — that's the whole point vs. T-many `step()` calls (G154).
 - Precompute the per-t boundary mask on CPU; do NOT slice into a CUDA tensor inside the per-token loop (G202).
 - Lazy-build `init_M` only when a doc boundary actually fires (G211).
-- For long-T OOM pressure, the recommended path is the blockwise NMM (`nmm_block_size >= 16`) combined with `nmm_block_grad_checkpoint=True` — both faster (TC engagement) and amenable to per-block recompute with bounded peak transient. An earlier per-token-segmented `nmm_grad_checkpoint` flag (G229, G256/G257/G258) was removed once blockwise + block_grad_checkpoint covered the same use case more cleanly.
+- For long-T OOM pressure, the recommended path is the blockwise NMM (`nmm_block_size >= 16`) combined with `nmm_low_rank` and `nmm_state_dtype="bf16"`. Blockwise replaces the per-token autograd graph with a per-block one (`T / block_size` smaller) and engages TC via batched matmul. Two earlier custom checkpointing mechanisms (per-token-segmented `nmm_grad_checkpoint` and block-level `nmm_block_grad_checkpoint`) were removed once blockwise covered the same use case more cleanly — if a user genuinely needs attn+MLP recompute, PyTorch's native `torch.utils.checkpoint` works directly on the model.
 
 → PLAN.md §1.8
 

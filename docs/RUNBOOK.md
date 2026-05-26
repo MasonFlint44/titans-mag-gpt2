@@ -169,8 +169,8 @@ base_lrs = [g['lr'] for g in optimizer.param_groups]  # BUG
    (`nmm_block_size=1`) retains the full per-token autograd graph for
    the chunk. On a 16 GiB consumer card it tops out around
    `B=1, T≈64-128`. **Fix:** switch to the blockwise path
-   (`nmm_block_size >= 16`) — both faster (TC engagement) and amenable
-   to bounded peak transient via `nmm_block_grad_checkpoint=True`.
+   (`nmm_block_size >= 16`) — faster (TC engagement) and the per-block
+   transient is `T / block_size` smaller than the per-token one.
 
 2. **fp32 NMM state.** Per-step `(M, S)` buffers in fp32 dominate at long
    T. **Fix:** set `nmm_state_dtype="bf16"` to halve them, or
@@ -184,8 +184,7 @@ base_lrs = [g['lr'] for g in optimizer.param_groups]  # BUG
 
 4. **`chunk_size` too large.** Even with all NMM knobs on, very long
    chunks blow up activations. Halve `chunk_size`. T=1024 + B>1 on a
-   16 GiB consumer card needs `nmm_low_rank=64` + blockwise + bf16 +
-   `nmm_block_grad_checkpoint=True`.
+   16 GiB consumer card needs `nmm_low_rank=64` + blockwise + bf16.
 
 5. **Stuck reference to old `nmm_states`.** Detaching between chunks
    releases the graph; not detaching means the graph keeps every
@@ -208,7 +207,6 @@ Look for "Active memory" — if it's much larger than "Allocated memory" expecta
 cfg = TitansConfig.gpt2_small(
     chunk_size=T, block_size=T,
     nmm_block_size=64,
-    nmm_block_grad_checkpoint=True,
     nmm_state_dtype="bf16",
 )
 
@@ -219,7 +217,6 @@ cfg = TitansConfig.gpt2_small(
 cfg = TitansConfig.gpt2_small(
     chunk_size=T, block_size=T,
     nmm_block_size=64,
-    nmm_block_grad_checkpoint=True,
     nmm_state_dtype="bf16",
     nmm_low_rank=64,
 )
@@ -230,7 +227,6 @@ cfg = TitansConfig.gpt2_small(
 cfg = TitansConfig.gpt2_small(
     chunk_size=T, block_size=T,
     nmm_block_size=64,
-    nmm_block_grad_checkpoint=True,
     nmm_state_dtype="bf16",
     nmm_low_rank=64,
     nmm_layer_indices=[0, 3, 6, 9],
@@ -242,7 +238,6 @@ cfg = TitansConfig.gpt2_small(
 cfg = TitansConfig.gpt2_small(
     chunk_size=T, block_size=T,
     nmm_block_size=64,
-    nmm_block_grad_checkpoint=True,
     nmm_state_dtype="bf16",
     nmm_low_rank=64,
     nmm_compile_inner_loop=True,   # the speedup

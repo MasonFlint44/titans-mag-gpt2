@@ -72,7 +72,6 @@ properties are preserved.
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `nmm_state_dtype` | `str` | `"fp32"` | Storage dtype for the recurrent `(M, S)` and per-step update buffers. `"bf16"` roughly halves per-step state retention; `"int8"` (blockwise path only) quarters it. NS5 still casts to fp32 internally (G226), so the spectral-norm fixed point is preserved. The drift risk for bf16 is the per-step `M_t = (1-α)·M_{t-1} + S_t` rounding — measure loss curves before relying on it. Valid: `"fp32"`, `"bf16"`, `"int8"`. `fp16` is rejected (would need loss scaling). |
-| `nmm_block_grad_checkpoint` | `bool` | `False` | Wraps each `TitansMAGBlock.forward` in `torch.utils.checkpoint.checkpoint(use_reentrant=True)`. The whole block (attention + NMM forward_chunk + MAG gate + MLP) is recomputed on backward; only block-input/output tensors and the NMM `(M, S)` I/O dicts live in the autograd graph between blocks. **Pair with `nmm_block_size >= 16`** so the per-block NMM transient that gets rebuilt during recompute is itself bounded; with `block_size=1` (per-token sequential) the recompute re-builds the full per-token NMM graph for one block (~50 GiB at T=1024 gpt2_small) and OOMs. Cost: each block's forward runs twice (forward + backward recompute), ~2× step time. Handles both single-head `(M, S)` and multi-head `[(M, S), ...]` states via the `_state_to_flat` / `_flat_to_state` helpers in `model/block.py`. |
 
 ## Capacity-vs-memory knobs (G261, G262, G263)
 
@@ -88,20 +87,14 @@ above the rank-of-meaningful-information for memory_mlp-style maps).
 | `nmm_layer_indices` | `Optional[list[int]]` | `None` | When set, NMM is wired only on the listed blocks; others become plain GPT-2 blocks (attention + MLP only, no NMM, no persistent prefix, no MAG gate). Linear reduction of NMM-related compute and memory in the number of NMM layers. The paper applies NMM at every block; this is a deliberate departure for VRAM. Validation rejects out-of-range / duplicate / non-int indices. **Decode path is supported**: plain blocks contribute a KV cache only (no NMM conv buffer; their slot in `nmm_conv_buffers` is `None`). |
 | `nmm_low_rank` | `Optional[int]` | `None` | When set, factor `MemoryMLP`'s three weight matrices as `A @ B` with intermediate rank `r`. Per-step NMM state drops from `3 × 4d²` to `3 × r × 5d` ≈ `5r/(4d)` of full-rank. At `d=768, r=64` that's ~10× smaller (the biggest single-knob win for long T). State key set goes from 3 to 6; the existing checkpoint plumbing handles this via the `state_keys` discovery at NMM construction time. NS5 still converges on the factored rectangles. Validation rejects `r >= n_embd` (factored form would be larger than full-rank — defeats the purpose). |
 
-**Why `use_reentrant=True`** is *required* for `nmm_block_grad_checkpoint`
-(not just convenient): `use_reentrant=False` calls
-`disable_saved_tensors_hooks`, and `torch.func.grad` (used inside
-`per_sample_grad_fn`) rejects that at runtime. The reentrant path uses
-`torch.autograd.function.Function` which composes with `torch.func`.
-
 **Findings (RTX 5070 Ti, 16 GiB):**
 
 - The per-token sequential path holds the entire chunk's autograd graph
   in memory; on a 16 GiB consumer card it tops out around `B=1, T≈64-128`
   even with `nmm_state_dtype="bf16"`. The right answer for long T is the
-  **blockwise path** (`nmm_block_size >= 16`), which both engages TC and
-  composes cleanly with `nmm_block_grad_checkpoint=True` for bounded
-  peak transient.
+  **blockwise path** (`nmm_block_size >= 16`), which engages TC via
+  batched matmul and replaces the per-token autograd graph with a
+  per-block one (~`T / block_size` smaller).
 - `bf16` state (`nmm_state_dtype="bf16"`) ~2× headroom on per-step
   buffers, composable with everything else.
 - **`nmm_low_rank=64` is the biggest single-knob memory win at long T.**
@@ -118,7 +111,6 @@ TitansConfig.gpt2_small(
     chunk_size=1024, block_size=1024,
     nmm_state_dtype="bf16",
     nmm_block_size=64,              # TC-engaged blockwise path
-    nmm_block_grad_checkpoint=True, # bound per-block transient
     nmm_low_rank=64,                # ~10x smaller per-step state
 )
 
@@ -127,7 +119,6 @@ TitansConfig.gpt2_small(
     chunk_size=1024, block_size=1024,
     nmm_state_dtype="bf16",
     nmm_block_size=64,
-    nmm_block_grad_checkpoint=True,
     nmm_low_rank=64,
     nmm_layer_indices=[0, 3, 6, 9], # NMM on 4 of 12 blocks
 )
@@ -179,7 +170,7 @@ which batches matmuls across tokens to engage TC.
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `nmm_block_size` | `int` | `1` | Chunk-as-update aggregation. At `1` (default), the inner loop is paper-strict per-token. At `>1`, every `nmm_block_size` consecutive tokens produce ONE memory update via batched matmul. **TC engages at `block_size >= 16`** — every forward matmul (pre1, preg, y, retrieval) becomes a `[B, H, D] @ [B, D, block_size] → [B, H, block_size]` GEMM where the `block_size` is the N dim. Gradient accumulation across the block is a single `einsum("bth,btd->bhd", d_pre1, k)` — also TC-eligible. Trailing block may be smaller than `block_size`; math handles it (just runs without TC on that one block). |
-| `nmm_per_token_ns5` | `bool` | `False` | G267 paper-faithful refinement. When `True` + `block_size > 1`, the blockwise update applies NS5 PER TOKEN and weights by per-token θ before summing — matching paper Eq 16's `Σ_t θ_t · NS5(∇_t)` exactly. The default (`False`) uses v1's `θ_mean · NS5(Σ_t ∇_t)` simplification. **Note**: a tempting "cheap" approach — folding θ into the pre-NS5 aggregation — does NOT work because NS5 normalises the Frobenius norm, cancelling any positive scalar applied before it. Real per-token θ weighting requires per-token NS5, which materialises per-token gradient tensors of shape `[B, block, H, D]` per key. **Cost**: ~5-10× slower than `per_token_ns5=False` and significantly higher peak memory; at gpt2_small T=1024 with `block_size=64` it OOMs at 16 GiB even with `nmm_block_grad_checkpoint=True`. Use only when paper-strict per-token θ matters and your config has the memory budget (small T or rented compute). |
+| `nmm_per_token_ns5` | `bool` | `False` | G267 paper-faithful refinement. When `True` + `block_size > 1`, the blockwise update applies NS5 PER TOKEN and weights by per-token θ before summing — matching paper Eq 16's `Σ_t θ_t · NS5(∇_t)` exactly. The default (`False`) uses v1's `θ_mean · NS5(Σ_t ∇_t)` simplification. **Note**: a tempting "cheap" approach — folding θ into the pre-NS5 aggregation — does NOT work because NS5 normalises the Frobenius norm, cancelling any positive scalar applied before it. Real per-token θ weighting requires per-token NS5, which materialises per-token gradient tensors of shape `[B, block, H, D]` per key. **Cost**: ~5-10× slower than `per_token_ns5=False` and significantly higher peak memory; at gpt2_small T=1024 with `block_size=64` it OOMs at 16 GiB. Use only when paper-strict per-token θ matters and your config has the memory budget (small T or rented compute) — reach for `nmm_low_rank` if memory is tight. |
 
 **Approximation cost at `block_size > 1`**:
 - All tokens within a block share the block-start M for surprise gradient AND retrieval. Paper's per-token M_{t-1} resolution becomes per-block M_{block-1}.
@@ -220,7 +211,6 @@ ablation or when comparing against published TITANS numbers.
 TitansConfig.gpt2_small(
     block_size=1024, chunk_size=1024,
     nmm_state_dtype="bf16",
-    nmm_block_grad_checkpoint=True,
     nmm_low_rank=64,
     nmm_block_size=64,        # ← 45× over sequential, 6 GiB headroom
     # If you want even MORE speed and can tolerate coarser approximation:
@@ -308,7 +298,7 @@ For long-context generation (e.g., 8K tokens cached across 12 layers), this is ~
 |---|---|---|---|
 | `nmm_momentum_order` | `int` | `1` | Order N of the momentum recurrence on S. Default 1 = paper-strict `S_t = η·S_{t-1} - θ·g`. With `N > 1`, N nested momenta are maintained with independently-learned η projections (W_eta gains N output dims): `S_k_t = η_k · S_k_{t-1} + S_{k-1}_t` for k=2..N. M update uses S_N (the smoothest). Per-step state grows linearly in N. Affects all paths except scan v1 / scan v2. Lucidrains' `momentum_order`. |
 
-**State structure changes**: at `nmm_momentum_order > 1`, the per-layer NMM state's S field becomes a `tuple` of N dicts (one per momentum level) instead of a single dict. `init_state`, `reset_state`, `detach_states`, `_state_to_flat` / `_flat_to_state` all handle both shapes transparently — but callers reading state internals should branch on `isinstance(S, tuple)`.
+**State structure changes**: at `nmm_momentum_order > 1`, the per-layer NMM state's S field becomes a `tuple` of N dicts (one per momentum level) instead of a single dict. `init_state`, `reset_state`, `detach_states` all handle both shapes transparently — but callers reading state internals should branch on `isinstance(S, tuple)`.
 
 ### Per-head shared MemoryMLP (G271)
 
@@ -333,7 +323,6 @@ TitansConfig.gpt2_small(
     chunk_size=1024, block_size=1024,
     nmm_state_dtype="bf16",
     nmm_block_size=64,
-    nmm_block_grad_checkpoint=True,
     nmm_low_rank=64,
     nmm_compile_inner_loop=True,    # the big speedup
     nmm_fused_kernel=True,          # +5% on top, free correctness oracle

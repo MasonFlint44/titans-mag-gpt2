@@ -233,7 +233,6 @@ use a fixed `eps = 1e-5` for comparisons except where higher precision is docume
 - **Conv sees full chunk** — `_forward_chunk_sequential(x)` ≠ `[step(x[:,t:t+1])` stacked]: the per-token conv lookback differs. **Defends:** G154.
 - **Boundary mask precomputed on CPU** — patch `torch.Tensor.__getitem__` to log accesses; verify no per-token GPU-resident indexing inside the for-loop. **Defends:** G202.
 - **Lazy init_M build** — patch `_build_init_M` to count calls; with `doc_boundaries=None`, called 0 times; with one true boundary mid-chunk, called once. **Defends:** G211.
-- **Block-level grad checkpoint parity** — with `nmm_block_grad_checkpoint=True`, output and gradients match the non-checkpointed path to 1e-4 (rematerialization is value-preserving).
 - **Multi-step BPTT** — calling `_forward_chunk_sequential` for two consecutive chunks with `detach_states` between, then `.backward()` on the second chunk's loss, produces non-NaN gradients for `memory_mlp.W*.weight`.
 
 ### `test_state_mgmt.py` — init/reset/detach

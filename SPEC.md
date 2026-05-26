@@ -258,9 +258,10 @@ raises `RuntimeError`. `where` is non-mutating and differentiable.
 the sequential path retains the full per-token autograd graph for the
 chunk; on a 16 GiB consumer card it tops out around `B=1, T≈64-128` even
 with bf16 state. For longer T or larger batch, prefer the blockwise path
-(`nmm_block_size >= 16`) combined with `nmm_block_grad_checkpoint=True`
-— that path is both faster (TC engagement) and amenable to per-block
-checkpoint recompute with bounded peak transient.
+(`nmm_block_size >= 16`) — it engages tensor cores via batched matmul
+and its peak transient scales with `block_size` rather than full T, so
+combined with `nmm_low_rank` it fits T=1024 at meaningful batch size on
+a 16 GiB consumer card.
 
 ### 2.9 Dispatcher (`forward_chunk`)
 
@@ -490,7 +491,6 @@ properties are preserved unless you opt in.
 | Field | Default | What it does | Cost |
 |---|---|---|---|
 | `nmm_state_dtype` | `"fp32"` | Storage dtype of `(M, S)` and per-step buffers. `"bf16"` halves their footprint, `"int8"` (blockwise-only) quarters it. NS5 still casts to fp32 internally (G226 invariant preserved). | Minor accumulated rounding in the per-step `M_t = (1−α)M_{t-1} + S_t` update — measure loss curves before relying on it. |
-| `nmm_block_grad_checkpoint` | `False` | Wraps `TitansMAGBlock.forward` in `torch.utils.checkpoint.checkpoint(use_reentrant=True)`. The whole block (attn + NMM + MAG + MLP) is recomputed on backward; only block-input/output tensors + the NMM `(M, S)` I/O dicts live in the autograd graph between blocks. Both single-head `(M, S)` and multi-head `[(M, S), ...]` states are handled via the `_state_to_flat` / `_flat_to_state` helpers (`model/block.py`). **Pair with `nmm_block_size >= 16`** so the per-block NMM transient that gets rebuilt during recompute is itself bounded; with `block_size=1` (per-token sequential) the recompute re-builds the full per-token NMM graph for one block (~50 GiB at T=1024 gpt2_small) and OOMs. | Each block's forward runs twice (forward + backward recompute), ~2× step time. |
 
 ### 5.6 Capacity-vs-memory knobs (G261, G262, G263)
 
@@ -573,7 +573,7 @@ engage on that one small block.
 
 **Constraints**:
 - Composes with `nmm_low_rank`, `nmm_state_dtype` (`"bf16"`, `"int8"`),
-  `nmm_softclamp_max`, `nmm_block_grad_checkpoint`.
+  `nmm_softclamp_max`.
 
 This is the recommended path for any T >= 256 training run on
 consumer hardware where the paper-strict per-token recurrence's
@@ -639,7 +639,7 @@ training recipes are unaffected.
 
 State-structure invariants for callers reading internal state:
 - At `momentum_order == 1`: `state = (M, S)` where both are dicts. Backward compat — every existing test that unpacks state this way still works.
-- At `momentum_order  > 1`: `state = (M, S)` where M is a dict and S is a `tuple` of N dicts. Use `isinstance(S, tuple)` to detect. `init_state`, `reset_state`, `detach_states`, `_state_to_flat`/`_flat_to_state`, `compute_nmm_norm` all handle both shapes.
+- At `momentum_order  > 1`: `state = (M, S)` where M is a dict and S is a `tuple` of N dicts. Use `isinstance(S, tuple)` to detect. `init_state`, `reset_state`, `detach_states`, `compute_nmm_norm` all handle both shapes.
 
 #### Composition matrix
 
