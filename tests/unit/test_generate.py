@@ -256,3 +256,154 @@ def test_perplexity_restores_training_mode():
     db[:, 0] = True
     perplexity(model, [(idx, db)], torch.device("cpu"))
     assert model.training is True
+
+
+# ---------------------------------------------------------------------------
+# Interactive REPL loop (generate._run_interactive_loop)
+# ---------------------------------------------------------------------------
+
+import io
+
+
+def _scripted_input(lines):
+    """Returns an input-shaped function that yields the next line from
+    `lines`, raising EOFError when exhausted. Lets tests drive the REPL
+    with a controlled sequence instead of stdin."""
+    it = iter(lines)
+    def _input(prompt=""):  # noqa: ARG001 (prompt unused — REPL prints it)
+        try:
+            return next(it)
+        except StopIteration:
+            raise EOFError
+    return _input
+
+
+def test_interactive_quit_command_exits_cleanly():
+    """`/quit` exits the loop without trying to send anything to the
+    model. Final state is whatever we passed in (None here)."""
+    from generate import _run_interactive_loop
+    cfg, model = _tiny_model_real_vocab()
+    model.eval()
+    out = io.StringIO()
+    final_state = _run_interactive_loop(
+        model, Tokenizer(), initial_nmm_states=None,
+        max_new_tokens=2, temperature=0, top_k=1, int8_kv_cache=False,
+        input_fn=_scripted_input(["/quit"]),
+        out_stream=out,
+    )
+    assert final_state is None
+    # The welcome banner should have been emitted.
+    assert "Interactive mode" in out.getvalue()
+
+
+def test_interactive_eof_exits_cleanly():
+    """Ctrl-D (EOFError) ends the session — matches shell convention. Final
+    state returned so the caller can persist via --nmm-state-file."""
+    from generate import _run_interactive_loop
+    cfg, model = _tiny_model_real_vocab()
+    model.eval()
+    out = io.StringIO()
+    # No /quit — the scripted iterator just runs out, raising EOFError.
+    final_state = _run_interactive_loop(
+        model, Tokenizer(), initial_nmm_states=None,
+        max_new_tokens=2, temperature=0, top_k=1, int8_kv_cache=False,
+        input_fn=_scripted_input([]),
+        out_stream=out,
+    )
+    assert final_state is None
+
+
+def test_interactive_sends_prompt_on_blank_line():
+    """Multi-line prompt accumulation: the loop collects lines until a
+    blank line, then sends the joined prompt to the model. Verify by
+    checking that *some* generated text reaches the output stream
+    (we don't care what — untrained tiny model produces gibberish)."""
+    from generate import _run_interactive_loop
+    cfg, model = _tiny_model_real_vocab()
+    model.eval()
+    out = io.StringIO()
+    final_state = _run_interactive_loop(
+        model, Tokenizer(), initial_nmm_states=None,
+        max_new_tokens=2, temperature=0, top_k=1, int8_kv_cache=False,
+        input_fn=_scripted_input([
+            "hello world",
+            "",          # blank line → send
+            "/quit",
+        ]),
+        out_stream=out,
+    )
+    # The final state from generate_with_state must propagate back out
+    # (one (M, S) per layer). Even if M values are zero-ish on untrained,
+    # the structure must match — that's what enables --nmm-state-file
+    # persistence after interactive sessions.
+    assert isinstance(final_state, list)
+    assert len(final_state) == cfg.n_layer
+
+
+def test_interactive_reset_clears_state_between_turns():
+    """`/reset` mid-session must clear running state — otherwise NMM
+    state would silently leak across what the user asked to be a fresh
+    context. Verify by sending one prompt, /reset, then /quit:
+    the state returned at exit must be None (reset's value), not the
+    state from the first prompt's evaluation."""
+    from generate import _run_interactive_loop
+    cfg, model = _tiny_model_real_vocab()
+    model.eval()
+    out = io.StringIO()
+    final_state = _run_interactive_loop(
+        model, Tokenizer(), initial_nmm_states=None,
+        max_new_tokens=2, temperature=0, top_k=1, int8_kv_cache=False,
+        input_fn=_scripted_input([
+            "hi",
+            "",
+            "/reset",
+            "/quit",
+        ]),
+        out_stream=out,
+    )
+    assert final_state is None
+    assert "NMM state cleared" in out.getvalue()
+
+
+def test_interactive_help_command_shows_commands_and_continues():
+    """`/help` must NOT exit the loop and must NOT clear state — it's
+    a query-only command. Verify by sending /help then /quit and
+    checking the help text appears in output."""
+    from generate import _run_interactive_loop, _INTERACTIVE_HELP
+    cfg, model = _tiny_model_real_vocab()
+    model.eval()
+    out = io.StringIO()
+    _run_interactive_loop(
+        model, Tokenizer(), initial_nmm_states=None,
+        max_new_tokens=2, temperature=0, top_k=1, int8_kv_cache=False,
+        input_fn=_scripted_input(["/help", "/quit"]),
+        out_stream=out,
+    )
+    # The help text's first line must reach the user.
+    assert "Interactive commands:" in out.getvalue()
+
+
+def test_interactive_leading_blank_lines_ignored():
+    """A user pressing Enter on an empty prompt shouldn't trigger a send
+    (would dispatch an empty prompt to the model, which is wasted compute
+    and may produce confusing EOT-only output). Leading blanks are dropped
+    until the user actually types something."""
+    from generate import _run_interactive_loop
+    cfg, model = _tiny_model_real_vocab()
+    model.eval()
+    out = io.StringIO()
+    final_state = _run_interactive_loop(
+        model, Tokenizer(), initial_nmm_states=None,
+        max_new_tokens=2, temperature=0, top_k=1, int8_kv_cache=False,
+        input_fn=_scripted_input([
+            "",          # ignored
+            "",          # ignored
+            "hello",
+            "",          # send
+            "/quit",
+        ]),
+        out_stream=out,
+    )
+    # State must be populated — implies the prompt was actually sent
+    # (otherwise loop would have returned None state directly).
+    assert final_state is not None

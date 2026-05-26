@@ -165,11 +165,113 @@ def generate(
     return text
 
 
+_INTERACTIVE_HELP = """\
+Interactive commands:
+  <text>     Type your prompt. Multi-line is fine.
+  <empty>    Empty line sends the accumulated prompt.
+  /reset     Clear the running NMM state (start a fresh session).
+  /help      Show this list.
+  /quit      Exit (Ctrl-D also works).
+NMM state threads across turns automatically — each turn's final state
+becomes the next turn's initial state, so the model 'remembers' across
+prompts within the session. (Has no effect on vanilla-GPT-2 checkpoints
+where every layer's state is None.)
+"""
+
+
+def _run_interactive_loop(
+    model,
+    tokenizer,
+    initial_nmm_states,
+    max_new_tokens: int,
+    temperature: float,
+    top_k: int,
+    int8_kv_cache: bool,
+    input_fn=input,
+    out_stream=None,
+) -> list:
+    """REPL: read multi-line prompts from `input_fn`, stream completions to
+    `out_stream`. Returns the final NMM state so the caller can persist it.
+
+    `input_fn` is injectable so tests can drive the loop with a scripted
+    line iterator instead of stdin. `out_stream` defaults to sys.stdout
+    (resolved at call time so tests can capture output).
+
+    Prompt termination: a blank line. Slash commands (/reset, /help, /quit)
+    are handled inline and don't reach the model. EOFError (Ctrl-D) exits
+    cleanly.
+    """
+    import sys as _sys
+    if out_stream is None:
+        out_stream = _sys.stdout
+
+    def emit(msg: str = "") -> None:
+        print(msg, file=out_stream, flush=True)
+
+    emit("Interactive mode. Type /help for commands. Empty line sends.")
+    running_state = initial_nmm_states
+
+    while True:
+        lines: list[str] = []
+        # Inner loop accumulates lines until blank line or command.
+        try:
+            while True:
+                prompt_marker = "> " if not lines else "  "
+                line = input_fn(prompt_marker)
+
+                stripped = line.strip()
+                if stripped == "/quit":
+                    return running_state
+                if stripped == "/help":
+                    emit(_INTERACTIVE_HELP)
+                    lines = []
+                    break
+                if stripped == "/reset":
+                    running_state = None
+                    emit("[interactive] NMM state cleared")
+                    lines = []
+                    break
+
+                if line == "":
+                    if lines:
+                        break  # send accumulated prompt
+                    continue   # ignore leading blank lines
+                lines.append(line)
+        except EOFError:
+            emit()  # newline after ^D
+            return running_state
+        except KeyboardInterrupt:
+            emit("\n[interactive] interrupted; type /quit to exit cleanly")
+            continue
+
+        if not lines:
+            continue
+
+        prompt = "\n".join(lines)
+        text, running_state = generate_with_state(
+            model, prompt, initial_nmm_states=running_state,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            tokenizer=tokenizer,
+            int8_kv_cache=int8_kv_cache,
+        )
+        emit(text)
+
+
 def _main():
     """CLI entry point. Loads a checkpoint, optionally threads NMM state
     in and out, runs generation, prints the completion.
 
-    Persistent-session usage:
+    One-shot usage (default):
+        python generate.py --checkpoint ckpts/latest.pt \\
+            --prompt "[P] passage\\nQ: ...\\nA:" \\
+            --max-new-tokens 20
+
+    Interactive REPL:
+        python generate.py --checkpoint ckpts/latest.pt --interactive
+
+    Persistent-session usage (one-shot):
         # First turn (no state file yet — starts from init):
         python generate.py --checkpoint ckpts/latest.pt \\
             --prompt "Q: The password is alpha-7-zebra." \\
@@ -224,6 +326,13 @@ def _main():
              "multiple inference processes off one shared session file "
              "without races. Ignored if --nmm-state-file is not set.",
     )
+    parser.add_argument(
+        "--interactive", action="store_true",
+        help="Drop into a REPL: read multi-line prompts from stdin (empty "
+             "line sends), stream completions back, thread NMM state "
+             "across turns. /reset clears state, /quit exits, /help "
+             "lists commands. --prompt is ignored in this mode.",
+    )
     args = parser.parse_args()
 
     # Load checkpoint and build model.
@@ -271,17 +380,30 @@ def _main():
             print(f"[nmm-state] {state_path} not found — starting from init",
                   file=sys.stderr)
 
-    # Run generation.
-    completion, final_nmm_states = generate_with_state(
-        model,
-        prompt=args.prompt,
-        initial_nmm_states=initial_nmm_states,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_k=args.top_k,
-        int8_kv_cache=args.int8_kv_cache,
-    )
-    print(completion)
+    # Run generation: interactive REPL or one-shot.
+    if args.interactive:
+        # Build the tokenizer once so the REPL loop doesn't re-construct it
+        # per turn. Same tokenizer threads through every turn for stable
+        # tokenization of multi-turn context.
+        tokenizer = Tokenizer()
+        final_nmm_states = _run_interactive_loop(
+            model, tokenizer, initial_nmm_states,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            int8_kv_cache=args.int8_kv_cache,
+        )
+    else:
+        completion, final_nmm_states = generate_with_state(
+            model,
+            prompt=args.prompt,
+            initial_nmm_states=initial_nmm_states,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            int8_kv_cache=args.int8_kv_cache,
+        )
+        print(completion)
 
     # Save final state back to the same path (unless readonly).
     if args.nmm_state_file and not args.nmm_state_readonly:
