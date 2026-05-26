@@ -250,6 +250,27 @@ cfg = TitansConfig.gpt2_small(
 #   block_size=512 -> 0.31 s/step (274x), 50k-steps in 4.3h
 ```
 
+The same knobs are exposed as `--nmm-*` flags on `train.py` and
+`scripts/finetune.py` — no need to edit the script. Equivalent invocation
+for the recipe above:
+
+```bash
+python -m train --data corpus.txt \
+    --chunk-size 1024 --batch-size 1 --grad-accum 16 \
+    --nmm-block-size 64 \
+    --nmm-state-dtype bf16 \
+    --nmm-low-rank 64 \
+    --nmm-compile-inner-loop \
+    --nmm-fused-kernel \
+    --compile-model \
+    --optim8bit
+```
+
+If you want to keep full-rank MemoryMLP (no `nmm_low_rank`), the
+escalation path is: blockwise + bf16 + 8-bit AdamW first; if still
+OOM, add `--nmm-expansion 1` (square `d×d` MemoryMLP, paper ablation)
+or `--nmm-layer-indices 0,3,6,9` (NMM on a subset of blocks).
+
 ---
 
 ## Long-context generation drift

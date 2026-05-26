@@ -56,6 +56,8 @@ def main():
              "Pass 0 or a negative value to disable pruning.",
     )
     parser.add_argument("--seed", type=int, default=42)
+    from scripts._nmm_cli import add_nmm_args, nmm_kwargs_from_args
+    add_nmm_args(parser)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -65,7 +67,11 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     autocast_dtype = torch.bfloat16 if device.type == "cuda" else None
 
-    config = build_finetune_config(args.size, chunk_size=args.chunk_size)
+    config = build_finetune_config(
+        args.size,
+        chunk_size=args.chunk_size,
+        **nmm_kwargs_from_args(args),
+    )
     model = TitansMAGGPT2(config).to(device)
     load_pretrained(model, config)
     optimizer = build_optimizer(model)

@@ -794,6 +794,8 @@ def main():
              "`pip install bitsandbytes`. Trained quality is empirically "
              "close to fp32 AdamW; small drift possible at long horizons.",
     )
+    from scripts._nmm_cli import add_nmm_args, nmm_kwargs_from_args
+    add_nmm_args(parser)
     args = parser.parse_args()
 
     # Device selection — LOCAL_RANK aware under torchrun.
@@ -824,6 +826,7 @@ def main():
             finetune_mode=False,
             chunk_size=args.chunk_size,
             block_size=args.chunk_size,  # match so all wpe positions train (G163)
+            **nmm_kwargs_from_args(args),
         )
 
         # Seed BEFORE model so all ranks build identical params, then re-seed

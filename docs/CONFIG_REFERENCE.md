@@ -124,6 +124,43 @@ TitansConfig.gpt2_small(
 )
 ```
 
+### CLI flags (`train.py` / `scripts/finetune.py`)
+
+The NMM perf/memory knobs are also exposed as `--nmm-*` CLI flags on both
+training entry points (registered via `scripts/_nmm_cli.py::add_nmm_args`).
+Omit a flag to keep the factory default; only the flags you set get
+passed to `TitansConfig`. Quick reference:
+
+| Flag | Type | Effect |
+|---|---|---|
+| `--nmm-block-size N` | int | Blockwise NMM aggregation (1 = paper-strict per-token; ≥16 engages TC) |
+| `--nmm-state-dtype {fp32,bf16,int8}` | str | Storage dtype for (M, S). int8 requires `--nmm-block-size > 1` |
+| `--nmm-low-rank R` | int | Factor MemoryMLP weights as A @ B with rank R |
+| `--nmm-expansion N` | int | MemoryMLP hidden-dim multiplier (paper default 4; set 1 for ~4× smaller state at minor capacity cost) |
+| `--nmm-layer-indices I,J,K` | csv ints | Subset of blocks that get NMM (others become plain GPT-2 blocks) |
+| `--nmm-detach-state-between-blocks` | flag | Truncated BPTT at block boundaries (requires `--nmm-block-size > 1`) |
+| `--nmm-compile-inner-loop` | flag | torch.compile the inner loop (~1.7× speedup, 30-60s first-step warm-up) |
+| `--nmm-fused-kernel` | flag | Analytical inner gradient (~5-15% on top of `--nmm-compile-inner-loop`) |
+| `--nmm-compile-ns5` | flag | Fused NS5 via torch.compile (no effect when `--nmm-compile-inner-loop` is set) |
+
+Recommended invocation for T=1024 on a 16 GiB consumer card:
+
+```bash
+python -m train --data corpus.txt \
+    --chunk-size 1024 --batch-size 1 --grad-accum 16 \
+    --nmm-block-size 64 \
+    --nmm-state-dtype bf16 \
+    --nmm-low-rank 64 \
+    --nmm-compile-inner-loop \
+    --nmm-fused-kernel \
+    --compile-model \
+    --optim8bit
+```
+
+If you want to avoid `nmm_low_rank` (keep full-rank MemoryMLP), drop
+`--nmm-low-rank 64` and add `--nmm-expansion 1` or
+`--nmm-layer-indices 0,3,6,9` if you hit OOM.
+
 ---
 
 ## Inner-loop speed knobs (G264, G264a)
