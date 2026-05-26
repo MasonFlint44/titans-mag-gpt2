@@ -251,25 +251,31 @@ cfg = TitansConfig.gpt2_small(
 ```
 
 The same knobs are exposed as `--nmm-*` flags on `train.py` and
-`scripts/finetune.py` — no need to edit the script. Equivalent invocation
-for the recipe above:
+`scripts/finetune.py` — no need to edit the script. The recommended
+**consumer-GPU default** (full-rank, 16 GiB VRAM, T=1024) is:
 
 ```bash
 python -m train --data corpus.txt \
     --chunk-size 1024 --batch-size 1 --grad-accum 16 \
     --nmm-block-size 64 \
     --nmm-state-dtype bf16 \
-    --nmm-low-rank 64 \
-    --nmm-compile-inner-loop \
-    --nmm-fused-kernel \
+    --nmm-detach-state-between-blocks \
     --compile-model \
     --optim8bit
 ```
 
-If you want to keep full-rank MemoryMLP (no `nmm_low_rank`), the
-escalation path is: blockwise + bf16 + 8-bit AdamW first; if still
-OOM, add `--nmm-expansion 1` (square `d×d` MemoryMLP, paper ablation)
-or `--nmm-layer-indices 0,3,6,9` (NMM on a subset of blocks).
+Measured on RTX 5070 Ti: ~1.11 s/step, 8.5 GiB peak.
+(`--nmm-compile-inner-loop` and `--nmm-fused-kernel` are no-ops on the
+blockwise path used here; the config validator warns if set.) The `--nmm-detach-state-between-blocks`
+flag is what makes full-rank fit at T=1024 — it bounds the backward
+graph to a single block. Tradeoff: outer NMM-related params learn from
+64-token windows instead of full-chunk BPTT. For standard LM training
+this is fine; truncated BPTT is long-established practice.
+
+If you find detach materially hurts your task, the alternatives are:
+- `--nmm-low-rank 64` (factor MemoryMLP weights, lose some capacity)
+- `--nmm-layer-indices 3,8` (NMM on a subset of blocks)
+- a 24 GiB+ GPU (eliminates the constraint entirely)
 
 ---
 

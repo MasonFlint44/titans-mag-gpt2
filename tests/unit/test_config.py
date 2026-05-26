@@ -165,6 +165,35 @@ def test_from_scratch_equal_chunk_does_not_warn():
 
 
 # ---------------------------------------------------------------------------
+# Sequential-path flags warn when set with blockwise path (no-op there).
+# Bench confirmed: nmm_compile_inner_loop / nmm_fused_kernel have zero
+# effect on the blockwise path, and compile_inner_loop costs ~20s of
+# warm-up. Warn so users don't pay that cost for nothing.
+# ---------------------------------------------------------------------------
+
+def test_compile_inner_loop_with_blockwise_warns():
+    with pytest.warns(UserWarning, match="sequential path"):
+        TitansConfig(nmm_block_size=64, nmm_compile_inner_loop=True)
+
+
+def test_fused_kernel_with_blockwise_warns():
+    with pytest.warns(UserWarning, match="sequential path"):
+        TitansConfig(nmm_block_size=64, nmm_fused_kernel=True)
+
+
+def test_compile_inner_loop_with_sequential_does_not_warn():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        TitansConfig(nmm_block_size=1, nmm_compile_inner_loop=True)
+
+
+def test_fused_kernel_with_sequential_does_not_warn():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        TitansConfig(nmm_block_size=1, nmm_fused_kernel=True)
+
+
+# ---------------------------------------------------------------------------
 # Validation survives `python -O` (G190)
 # ---------------------------------------------------------------------------
 

@@ -143,23 +143,118 @@ passed to `TitansConfig`. Quick reference:
 | `--nmm-fused-kernel` | flag | Analytical inner gradient (~5-15% on top of `--nmm-compile-inner-loop`) |
 | `--nmm-compile-ns5` | flag | Fused NS5 via torch.compile (no effect when `--nmm-compile-inner-loop` is set) |
 
-Recommended invocation for T=1024 on a 16 GiB consumer card:
+### Recommended consumer-GPU recipe (T=1024, full-rank, 16 GiB card)
+
+This is the default we recommend for training on a single consumer GPU
+(RTX 5070 Ti / 4080 / 3090 class — 16 GiB VRAM). Keeps paper-faithful
+full-rank MemoryMLP on all 12 transformer blocks; pays for that with
+truncated BPTT at block boundaries (`--nmm-detach-state-between-blocks`).
 
 ```bash
 python -m train --data corpus.txt \
     --chunk-size 1024 --batch-size 1 --grad-accum 16 \
     --nmm-block-size 64 \
     --nmm-state-dtype bf16 \
-    --nmm-low-rank 64 \
-    --nmm-compile-inner-loop \
-    --nmm-fused-kernel \
+    --nmm-detach-state-between-blocks \
     --compile-model \
     --optim8bit
 ```
 
-If you want to avoid `nmm_low_rank` (keep full-rank MemoryMLP), drop
-`--nmm-low-rank 64` and add `--nmm-expansion 1` or
-`--nmm-layer-indices 0,3,6,9` if you hit OOM.
+**Measured on RTX 5070 Ti (15.5 GiB VRAM):**
+
+| Metric | Value |
+|---|---|
+| Step time (B=1, T=1024) | **~1.11 s** |
+| Peak VRAM | **8.5 GiB** (7.0 GiB headroom) |
+| Throughput | **~920 tok/s** |
+| Effective batch (`--grad-accum 16`) | 16 |
+| Optimizer step wall-clock | ~17.8 s |
+| 1k optimizer steps | ~5 h |
+| 50k optimizer steps | ~10 days |
+
+**What each flag buys you:**
+
+1. `--nmm-block-size 64` — blockwise NMM; engages tensor cores via batched
+   matmul. 16 memory updates per T=1024 chunk (vs paper's 1024).
+2. `--nmm-detach-state-between-blocks` — truncated BPTT at block boundaries.
+   Backward graph spans one block instead of all 16; without this the
+   full-rank MemoryMLP overflows 15.5 GiB. Tradeoff: outer NMM params learn
+   from 64-token windows, not full 1024-token windows.
+3. `--nmm-state-dtype bf16` — half-precision recurrent state. Composes
+   with NS5 fp32 invariant (G226).
+4. `--compile-model` — full-model `torch.compile`. ~13% speedup + ~1.2 GiB
+   memory savings (fused kernels). 1-3 min warm-up on first step.
+5. `--optim8bit` — 8-bit AdamW from `bitsandbytes`. ~1.2 GiB optimizer
+   state savings on this model. Requires `pip install bitsandbytes`.
+
+**Note on `--nmm-compile-inner-loop` / `--nmm-fused-kernel`:** these flags
+only affect the per-token sequential path (`block_size=1`); they're
+silent no-ops on the blockwise path used here, and `--nmm-compile-inner-loop`
+in particular adds ~20 s of compile warm-up for zero runtime gain. Don't
+include them with this recipe — the config validator warns if you do.
+
+**What you give up:** truncated BPTT (the `--nmm-detach-state-between-blocks`
+flag) means outer NMM-related parameters (`k_proj`, `q_proj`, `v_proj`,
+W_theta, W_eta, W_alpha, gamma_mem, MemoryMLP init weights) only see
+gradient signal within a single 64-token block. The inner-loop NMM
+update — the "memorize at test time" mechanism — is unaffected. For
+standard LM training this works well; truncated BPTT is decades-old
+practice for long-sequence RNN training.
+
+### Speed-priority recipe (larger `block_size`, can fit B=2)
+
+If `block_size=64` is too slow for your patience, the cleanest speed win
+is a larger `block_size`. Each block aggregates more tokens into a single
+memory update — fewer but bigger updates per chunk. Tradeoff: less
+within-chunk recurrence (e.g., `block=256` = 4 updates per T=1024 chunk
+instead of 16). Memory drops too, so you can fit B=2 in physical batch.
+
+```bash
+# Speed-priority: ~1 s/optimizer-step at effective batch 4.
+python -m train --data corpus.txt \
+    --chunk-size 1024 --batch-size 2 --grad-accum 2 \
+    --nmm-block-size 512 \
+    --nmm-state-dtype bf16 \
+    --nmm-detach-state-between-blocks \
+    --compile-model \
+    --optim8bit
+```
+
+Measured menu (RTX 5070 Ti, T=1024, 12 NMM layers full-rank, `+detach +compile-model +optim8bit +bf16`):
+
+| `block_size` | B | step time | peak VRAM | grad_accum=N → eff. batch | optimizer-step time |
+|---|---|---|---|---|---|
+| 64  | 1 | 1110 ms | 8.5 GiB | 16 → 16 | 17.8 s |
+| 64  | 1 | 1110 ms | 8.5 GiB | 4 → 4   | 4.4 s |
+| 128 | 1 | 628 ms  | 7.2 GiB | 4 → 4   | 2.5 s |
+| 128 | 2 | 1142 ms | 12.4 GiB | 2 → 4  | 2.3 s |
+| 256 | 1 | 397 ms  | 6.7 GiB | 4 → 4   | 1.6 s |
+| 256 | 2 | 706 ms  | 11.4 GiB | 2 → 4  | **1.4 s** |
+| 512 | 1 | 272 ms  | 6.4 GiB | 4 → 4   | 1.1 s |
+| 512 | 2 | 477 ms  | 10.8 GiB | 2 → 4  | **0.95 s** ← under 1 s/opt-step |
+
+### Other variants
+
+```python
+# No-detach, but accept low_rank instead.
+TitansConfig.gpt2_small(
+    chunk_size=1024, block_size=1024,
+    nmm_state_dtype="bf16",
+    nmm_block_size=64,
+    nmm_low_rank=64,                          # ~10x smaller state
+    # No detach needed; backward graph spans all 16 blocks.
+)
+# Measured: 1.88 s/step, 9.8 GiB. Slower than detach+full-rank.
+
+# NMM on subset of blocks (linear NMM-time/memory reduction).
+TitansConfig.gpt2_small(
+    chunk_size=1024, block_size=1024,
+    nmm_state_dtype="bf16",
+    nmm_block_size=64,
+    nmm_detach_state_between_blocks=True,
+    nmm_layer_indices=[3, 8],                 # 2 NMM layers, ~214 ms/step
+)
+```
 
 ---
 

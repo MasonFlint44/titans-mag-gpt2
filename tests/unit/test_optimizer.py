@@ -193,10 +193,13 @@ def test_8bit_optimizer_step_runs():
     import importlib.util
     if importlib.util.find_spec("bitsandbytes") is None:
         pytest.skip("bitsandbytes not installed; skipping")
-    model = _tiny_model()
+    if not torch.cuda.is_available():
+        pytest.skip("bnb.optim.AdamW8bit requires CUDA tensors; skipping")
+    device = torch.device("cuda")
+    model = _tiny_model().to(device)
     opt = build_optimizer(model, use_8bit=True)
     # Run a forward + backward + step to exercise the optimizer.
-    idx = torch.randint(0, 32, (2, 16))
+    idx = torch.randint(0, 32, (2, 16), device=device)
     logits, _ = model(idx)
     loss = logits.pow(2).sum()
     loss.backward()

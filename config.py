@@ -502,6 +502,29 @@ class TitansConfig:
                 "engagement) or set nmm_detach_state_between_blocks=False."
             )
 
+        # nmm_compile_inner_loop / nmm_fused_kernel only affect
+        # `_run_inner_loop`, which is the SEQUENTIAL path (`block_size=1`).
+        # On the blockwise path (`_forward_chunk_blockwise`) they're silent
+        # no-ops — bench-confirmed: all four combinations within 1% at
+        # block_size=64. The compile flag also costs ~20s of warm-up on the
+        # first step. Warn (not raise) so existing configs keep working;
+        # users can drop the flags or move to the sequential path.
+        if self.nmm_block_size > 1:
+            wasted = []
+            if self.nmm_compile_inner_loop:
+                wasted.append("nmm_compile_inner_loop")
+            if self.nmm_fused_kernel:
+                wasted.append("nmm_fused_kernel")
+            if wasted:
+                warnings.warn(
+                    f"{', '.join(wasted)} only affect the sequential path "
+                    f"(nmm_block_size=1) — at nmm_block_size={self.nmm_block_size} "
+                    f"the blockwise path is taken and these flag(s) have no "
+                    f"effect. Drop them to skip the torch.compile warm-up cost.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
         # nmm_per_head_learned_params=False meaningless at n_heads=1: nothing
         # to share. Loud rather than silent.
         if (not self.nmm_per_head_learned_params) and self.nmm_n_heads <= 1:
