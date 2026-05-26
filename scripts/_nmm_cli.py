@@ -134,6 +134,16 @@ def add_nmm_args(parser: argparse.ArgumentParser) -> None:
              "your data before lowering.",
     )
     group.add_argument(
+        "--vanilla-gpt2",
+        action="store_true",
+        help="Vanilla GPT-2 control mode: every block becomes a plain GPT-2 "
+             "block (attn + MLP only, no NMM, no persistent prefix, no MAG "
+             "gate). Implemented as nmm_layer_indices=[]. Mutually exclusive "
+             "with --nmm-layer-indices: use this flag to mean 'no NMM at all', "
+             "not the empty subset. Useful as a control condition for "
+             "experiments measuring the NMM's contribution.",
+    )
+    group.add_argument(
         "--nmm-use-gram-ns5",
         action="store_true",
         help="Replace stock Newton-Schulz with Tri Dao's Gram-Newton-Schulz "
@@ -149,7 +159,13 @@ def add_nmm_args(parser: argparse.ArgumentParser) -> None:
 
 def nmm_kwargs_from_args(args: argparse.Namespace) -> dict:
     """Convert parsed args to a TitansConfig kwargs dict. Only includes
-    fields the user explicitly set (i.e. not None / not False)."""
+    fields the user explicitly set (i.e. not None / not False).
+
+    Raises:
+        argparse.ArgumentTypeError if --vanilla-gpt2 is combined with
+        --nmm-layer-indices. The two flags both write `nmm_layer_indices`
+        and silently dropping one would mask a config bug.
+    """
     kwargs = {}
     if args.nmm_block_size is not None:
         kwargs["nmm_block_size"] = args.nmm_block_size
@@ -159,7 +175,19 @@ def nmm_kwargs_from_args(args: argparse.Namespace) -> dict:
         kwargs["nmm_low_rank"] = args.nmm_low_rank
     if args.nmm_expansion is not None:
         kwargs["nmm_expansion"] = args.nmm_expansion
-    if args.nmm_layer_indices is not None:
+    if getattr(args, "vanilla_gpt2", False) and args.nmm_layer_indices is not None:
+        raise argparse.ArgumentTypeError(
+            "--vanilla-gpt2 and --nmm-layer-indices are mutually exclusive: "
+            "both write nmm_layer_indices. Use --vanilla-gpt2 alone for the "
+            "no-NMM control, or --nmm-layer-indices alone for a subset of "
+            "blocks with NMM."
+        )
+    if getattr(args, "vanilla_gpt2", False):
+        # Empty list = every block is a PlainGPT2Block — no NMM, no persistent
+        # prefix, no MAG gate. The config validator accepts [] (no items to
+        # validate); the model treats nmm_idx_set = set() correctly.
+        kwargs["nmm_layer_indices"] = []
+    elif args.nmm_layer_indices is not None:
         kwargs["nmm_layer_indices"] = args.nmm_layer_indices
     if args.nmm_detach_state_between_blocks:
         kwargs["nmm_detach_state_between_blocks"] = True

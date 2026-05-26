@@ -45,8 +45,13 @@ tb_logs/
 # (the data/ module IS tracked — only ignore downloaded datasets)
 datasets/
 corpus/
+corpora/
 *.tokens
 *.bin.idx
+
+# Experiment outputs (eval JSON + plots; regenerable from checkpoints)
+results/
+docs/figures/
 
 # Editor / OS
 .DS_Store
