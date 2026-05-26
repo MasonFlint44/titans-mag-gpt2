@@ -21,6 +21,25 @@ from scripts.load_pretrained import load_pretrained
 pytestmark = [pytest.mark.gpu, pytest.mark.slow]
 
 
+@pytest.fixture(autouse=True)
+def _disable_tf32():
+    """Parity vs HF GPT-2 is verified at full fp32 precision.
+
+    Why: conftest.py enables TF32 (`set_float32_matmul_precision("high")`)
+    to match training-time behavior. TF32 trades fp32 precision for
+    tensor-core speed — across 12 layers of fp32 matmuls in the gpt2_small
+    backbone, that accumulates to ~1.8e-4 relative error in the logits,
+    blowing past this test's `2e-6 * logit_max` tolerance. The tolerance
+    is intentional: it's "bit-level fp32 noise," not "TF32 noise," because
+    the invariant we're locking is that our model performs the same fp32
+    arithmetic as HF's, not a looser numerical-equivalence claim.
+    """
+    prev = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    yield
+    torch.set_float32_matmul_precision(prev)
+
+
 def _gpu_or_skip():
     if not torch.cuda.is_available():
         pytest.skip("GPU required")
