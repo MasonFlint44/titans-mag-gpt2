@@ -32,7 +32,9 @@ def build_finetune_config(size: str, **overrides):
     return _FACTORY[size](finetune_mode=True, **overrides)
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the finetune CLI parser. Extracted from main() so tests
+    can inspect flags + defaults without invoking the training loop."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--size", default="small", choices=list(_FACTORY))
     parser.add_argument("--data", required=True, help="path to a text corpus")
@@ -56,8 +58,37 @@ def main():
              "Pass 0 or a negative value to disable pruning.",
     )
     parser.add_argument("--seed", type=int, default=42)
-    from scripts._nmm_cli import add_nmm_args, nmm_kwargs_from_args
+    # Mirror train.py G277 / G278 so the consumer-GPU recipe documented in
+    # README.md actually works against finetune.py (not only train.py).
+    parser.add_argument(
+        "--compile-model",
+        action="store_true",
+        help="Wrap the full model in torch.compile after construction (G277). "
+             "Traces the entire forward (embedding + N transformer blocks + LN "
+             "+ LM head) into one Inductor graph per shape. Composes with "
+             "nmm_compile_inner_loop (the inner compile is taken first; the "
+             "outer compile then traces around it). Adds 1-3 minutes of "
+             "warm-up compile time on the first training step. Should give "
+             "10-20%% throughput on top of the inner-loop compile alone.",
+    )
+    parser.add_argument(
+        "--optim8bit",
+        action="store_true",
+        help="Use bitsandbytes' 8-bit AdamW for optimizer state (G278). Cuts "
+             "optimizer memory ~4x (8-byte fp32 moments -> 2-byte 8-bit "
+             "moments). Requires `bitsandbytes` package; install via "
+             "`pip install bitsandbytes` (or `uv sync --extra optim8bit`). "
+             "Trained quality is empirically close to fp32 AdamW; small drift "
+             "possible at long horizons.",
+    )
+    from scripts._nmm_cli import add_nmm_args
     add_nmm_args(parser)
+    return parser
+
+
+def main():
+    from scripts._nmm_cli import nmm_kwargs_from_args
+    parser = build_parser()
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -74,7 +105,16 @@ def main():
     )
     model = TitansMAGGPT2(config).to(device)
     load_pretrained(model, config)
-    optimizer = build_optimizer(model)
+
+    # G277 — full-forward torch.compile. Wrap AFTER load_pretrained (so the
+    # compile sees post-pretrained-init weights, not the random init) and
+    # BEFORE build_optimizer (so param groups are derived from the unwrapped
+    # model's named_parameters() — _unwrap strips both `_orig_mod.` compile
+    # prefixes and any DDP `module.` prefixes at save/load time).
+    if args.compile_model:
+        model = torch.compile(model, mode="default", dynamic=False)
+
+    optimizer = build_optimizer(model, use_8bit=args.optim8bit)
 
     # Tokenize corpus (whole-file-as-one-document; users can swap in an HF
     # streaming reader for FineWebEdu-scale runs).
