@@ -184,6 +184,7 @@ def _main():
     import sys
     from pathlib import Path
 
+    from config import TitansConfig
     from model.titans_gpt2 import TitansMAGGPT2
     from train import load_checkpoint
     from scripts.nmm_state_io import (
@@ -234,12 +235,24 @@ def _main():
             f"Cannot rebuild the model architecture; pass a checkpoint "
             f"saved by `save_checkpoint` from train.py."
         )
-    config = ckpt["config"]
+    # save_checkpoint stores config as dataclasses.asdict(config) — rebuild
+    # the TitansConfig from the dict (same pattern as test_checkpoint.py
+    # and scripts.eval_qa_recall._load_model).
+    config = TitansConfig(**ckpt["config"])
     model = TitansMAGGPT2(config).to(device)
     # state_dict keys may have _orig_mod./module. prefixes from
     # torch.compile / DDP wrapping at save time. _unwrap strips them.
+    # train.py saves under "state_dict"; accept "model" too for any
+    # historical checkpoints that used the older key name.
     from model import _unwrap
-    model.load_state_dict(_unwrap(ckpt["model"]))
+    state = ckpt.get("state_dict", ckpt.get("model"))
+    if state is None:
+        raise SystemExit(
+            f"Checkpoint {args.checkpoint} has neither 'state_dict' nor "
+            f"'model' keys. Pass a checkpoint saved by save_checkpoint "
+            f"from train.py."
+        )
+    model.load_state_dict(_unwrap(state))
     model.eval()
 
     # Load NMM state if requested and the file exists.
