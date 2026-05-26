@@ -146,6 +146,35 @@ memory adapts to whatever you're feeding it right now.
 > See [`diagrams/inference_sequence.mmd`](diagrams/inference_sequence.mmd) for
 > the full inference flow including the conv-window mitigation.
 
+### Persistent sessions (memory across calls)
+
+By default each `generate.py` call starts the NMM from the trained init weights —
+nothing persists between separate processes. To make the model "remember"
+across calls, point `--nmm-state-file` at a path. The file is auto-managed:
+load on entry if it exists, save on exit (atomic rename).
+
+```bash
+# Turn 1 — file doesn't exist yet; starts from init, saves at end.
+uv run python generate.py --checkpoint ckpts/latest.pt \
+    --prompt "The password is alpha-7-zebra." \
+    --max-new-tokens 0 \
+    --nmm-state-file session.pt
+
+# Turn 2 — loads session.pt, runs, overwrites session.pt with the new state.
+uv run python generate.py --checkpoint ckpts/latest.pt \
+    --prompt "What's the password?" \
+    --max-new-tokens 20 \
+    --nmm-state-file session.pt
+```
+
+Add `--nmm-state-readonly` to load a state without overwriting it (useful
+for A/B testing multiple prompts from the same saved session).
+
+State files include a config fingerprint and refuse to load into a model with
+mismatched shape (different `n_embd`, `nmm_low_rank`, etc.) — fails loud
+rather than silently producing garbage. Typical file size at `gpt2_small`
+full-rank bf16: ~336 MiB.
+
 ## Test
 
 ```bash

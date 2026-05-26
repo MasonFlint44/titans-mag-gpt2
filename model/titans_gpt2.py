@@ -248,7 +248,10 @@ class TitansMAGGPT2(nn.Module):
         }
 
     def prepare_decode_chunked(
-        self, prompt_idx: torch.Tensor, int8_kv_cache: bool = False,
+        self,
+        prompt_idx: torch.Tensor,
+        initial_nmm_states=None,
+        int8_kv_cache: bool = False,
     ) -> dict:
         """Prepare a decode cache for ANY prompt length (short or long).
 
@@ -269,6 +272,13 @@ class TitansMAGGPT2(nn.Module):
         Caller still owns the `max_new` cap, since the appropriate value
         depends on what they want to do with the cache.
 
+        `initial_nmm_states`: optional starting NMM state — used by
+        `generate.py`'s `--nmm-state-file` persistent-session flow. When
+        provided, the NMM remembers context from a previous session: the
+        prompt chunks update on top of this state instead of starting from
+        the model's init weights. Default `None` = init from scratch
+        (existing behavior; backward compatible).
+
         Same eval-mode contract as prepare_decode (G243): asserted up front
         so the long-prompt prefix chunks don't run their dropout-different
         forward path before the final prepare_decode would have rejected the
@@ -283,12 +293,16 @@ class TitansMAGGPT2(nn.Module):
         block_size = self.config.block_size
         prompt_len = prompt_idx.size(1)
         if prompt_len <= block_size:
-            return self.prepare_decode(prompt_idx, int8_kv_cache=int8_kv_cache)
+            return self.prepare_decode(
+                prompt_idx,
+                initial_nmm_states=initial_nmm_states,
+                int8_kv_cache=int8_kv_cache,
+            )
 
         # Long-prompt path: chunk prefix through forward() so the NMM sees
         # every token; then prepare_decode on the trailing block_size tokens.
         tail_start = prompt_len - block_size
-        nmm_states = None
+        nmm_states = initial_nmm_states
         for start in range(0, tail_start, block_size):
             end = min(start + block_size, tail_start)
             chunk = prompt_idx[:, start:end]
