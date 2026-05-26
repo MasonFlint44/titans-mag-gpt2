@@ -194,6 +194,55 @@ def test_fused_kernel_with_sequential_does_not_warn():
 
 
 # ---------------------------------------------------------------------------
+# nmm_ns5_steps — opt-in speed/quality knob, default 5
+# ---------------------------------------------------------------------------
+
+def test_ns5_steps_default_is_5():
+    cfg = TitansConfig()
+    assert cfg.nmm_ns5_steps == 5
+
+
+def test_ns5_steps_accepts_valid_range():
+    for n in (1, 3, 4, 5, 10):
+        cfg = TitansConfig(nmm_ns5_steps=n)
+        assert cfg.nmm_ns5_steps == n
+
+
+def test_ns5_steps_rejects_zero():
+    with pytest.raises(ValueError, match="nmm_ns5_steps"):
+        TitansConfig(nmm_ns5_steps=0)
+
+
+def test_ns5_steps_rejects_negative():
+    with pytest.raises(ValueError, match="nmm_ns5_steps"):
+        TitansConfig(nmm_ns5_steps=-1)
+
+
+def test_ns5_steps_rejects_excessive():
+    """10 is the sanity upper bound — past that, the iteration is wasting
+    compute since convergence is exponential."""
+    with pytest.raises(ValueError, match="nmm_ns5_steps"):
+        TitansConfig(nmm_ns5_steps=11)
+
+
+def test_ns5_steps_rejects_non_int():
+    with pytest.raises(ValueError, match="nmm_ns5_steps"):
+        TitansConfig(nmm_ns5_steps=3.5)
+
+
+def test_ns5_steps_propagates_to_nmm():
+    """The config field must actually flow through to NeuralMemoryModule."""
+    from model.titans_gpt2 import TitansMAGGPT2
+    cfg = TitansConfig.gpt2_small(
+        n_layer=1, nmm_block_size=64,
+        nmm_detach_state_between_blocks=True,
+        nmm_ns5_steps=3,
+    )
+    m = TitansMAGGPT2(cfg)
+    assert m.blocks[0].nmm.ns5_steps == 3
+
+
+# ---------------------------------------------------------------------------
 # Validation survives `python -O` (G190)
 # ---------------------------------------------------------------------------
 

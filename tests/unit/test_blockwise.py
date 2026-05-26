@@ -1278,8 +1278,10 @@ def test_config_compile_ns5_propagates():
 
 
 def test_compile_ns5_resolves_to_compiled_function():
-    """When compile_ns5=True, self._ns5_fn is bound to the compiled variant
-    instead of the plain `newton_schulz5` reference."""
+    """When compile_ns5=True, self._ns5_fn dispatches to the compiled
+    variant instead of the plain `newton_schulz5` reference. The actual
+    `_ns5_fn` attribute is a lambda that binds `steps` so call sites can
+    stay `self._ns5_fn(g)` — we inspect the closure's captured base function."""
     nmm_plain = NeuralMemoryModule(
         n_embd=16, expansion=2, kernel_size=2,
         spectral_norm=True, finetune_mode=False,
@@ -1290,8 +1292,11 @@ def test_compile_ns5_resolves_to_compiled_function():
         compile_ns5=True,
     )
     from model import nmm as _nmm
-    assert nmm_plain._ns5_fn is _nmm.newton_schulz5
-    assert nmm_compiled._ns5_fn is not _nmm.newton_schulz5
+    # __defaults__ on the lambda holds (_f=base_ns5, _s=steps).
+    plain_base = nmm_plain._ns5_fn.__defaults__[0]
+    compiled_base = nmm_compiled._ns5_fn.__defaults__[0]
+    assert plain_base is _nmm.newton_schulz5
+    assert compiled_base is not _nmm.newton_schulz5
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="torch.compile + CUDA required")

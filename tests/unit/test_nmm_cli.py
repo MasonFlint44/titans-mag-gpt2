@@ -118,23 +118,37 @@ def test_compile_ns5_round_trip():
     assert nmm_kwargs_from_args(args) == {"nmm_compile_ns5": True}
 
 
+def test_ns5_steps_round_trip():
+    args = _parse("--nmm-ns5-steps", "3")
+    assert nmm_kwargs_from_args(args) == {"nmm_ns5_steps": 3}
+
+
+def test_ns5_steps_omitted_stays_default():
+    """Omitting --nmm-ns5-steps must leave the field at the paper default
+    of 5 (not 0 or some sentinel)."""
+    args = _parse()
+    cfg = TitansConfig.gpt2_small(**nmm_kwargs_from_args(args))
+    assert cfg.nmm_ns5_steps == 5
+
+
 def test_full_recipe_round_trip():
     """The recommended T=1024 consumer-GPU recipe must produce a kwargs dict
-    that splats cleanly into TitansConfig.gpt2_small."""
+    that splats cleanly into TitansConfig.gpt2_small. Uses the blockwise
+    path so compile_inner_loop / fused_kernel are intentionally omitted —
+    they're no-ops on the blockwise path and adding them costs ~20s of
+    torch.compile warm-up for zero runtime gain (the config validator warns)."""
     args = _parse(
         "--nmm-block-size", "64",
         "--nmm-state-dtype", "bf16",
         "--nmm-low-rank", "64",
-        "--nmm-compile-inner-loop",
-        "--nmm-fused-kernel",
+        "--nmm-detach-state-between-blocks",
     )
     kwargs = nmm_kwargs_from_args(args)
     assert kwargs == {
         "nmm_block_size": 64,
         "nmm_state_dtype": "bf16",
         "nmm_low_rank": 64,
-        "nmm_compile_inner_loop": True,
-        "nmm_fused_kernel": True,
+        "nmm_detach_state_between_blocks": True,
     }
     # Construct the config — catches any rename/typo that would only surface
     # at first training run.
@@ -144,8 +158,7 @@ def test_full_recipe_round_trip():
     assert cfg.nmm_block_size == 64
     assert cfg.nmm_state_dtype == "bf16"
     assert cfg.nmm_low_rank == 64
-    assert cfg.nmm_compile_inner_loop is True
-    assert cfg.nmm_fused_kernel is True
+    assert cfg.nmm_detach_state_between_blocks is True
 
 
 def test_low_rank_omitted_stays_none():
@@ -157,15 +170,16 @@ def test_low_rank_omitted_stays_none():
 
 
 def test_recipe_without_low_rank_constructs():
-    """The user-requested 'T=1024 without low_rank' recipe."""
+    """The documented consumer-GPU recipe: T=1024 + block=64 + detach,
+    no low_rank. Full-rank with truncated BPTT."""
     args = _parse(
         "--nmm-block-size", "64",
         "--nmm-state-dtype", "bf16",
-        "--nmm-compile-inner-loop",
-        "--nmm-fused-kernel",
+        "--nmm-detach-state-between-blocks",
     )
     cfg = TitansConfig.gpt2_small(
         chunk_size=1024, block_size=1024, **nmm_kwargs_from_args(args),
     )
     assert cfg.nmm_low_rank is None
     assert cfg.nmm_block_size == 64
+    assert cfg.nmm_detach_state_between_blocks is True

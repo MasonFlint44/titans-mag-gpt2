@@ -592,6 +592,7 @@ class NeuralMemoryModule(nn.Module):
         per_param_lr_modulation: bool = False,
         momentum_order: int = 1,
         compile_ns5: bool = False,
+        ns5_steps: int = 5,
     ):
         super().__init__()
         self.n_embd = n_embd
@@ -650,11 +651,20 @@ class NeuralMemoryModule(nn.Module):
         # variant. No effect when compile_inner_loop=True (the inner-
         # loop compile already wraps NS5 transitively).
         self.compile_ns5 = bool(compile_ns5)
+        # Number of Newton-Schulz iterations. 5 = paper-faithful (Muon
+        # coefficients tuned for this fixed point); lower drifts the
+        # spectral norm away from 1 (see config.nmm_ns5_steps docstring).
+        if not isinstance(ns5_steps, int) or ns5_steps < 1:
+            raise ValueError(f"ns5_steps must be a positive int (got {ns5_steps!r})")
+        self.ns5_steps = int(ns5_steps)
         # Resolved NS5 callable — used by every path that applies NS5.
-        # Default (uncompiled) preserves existing behavior bit-for-bit;
-        # opt-in switches every call site to the compiled variant in one
-        # place rather than scattering branches.
-        self._ns5_fn = _get_compiled_ns5() if self.compile_ns5 else newton_schulz5
+        # Bind `steps` here so call sites stay `self._ns5_fn(g)` with no
+        # extra argument threading. Default (uncompiled) preserves existing
+        # behavior bit-for-bit; opt-in switches every call site to the
+        # compiled variant in one place rather than scattering branches.
+        _ns5_base = _get_compiled_ns5() if self.compile_ns5 else newton_schulz5
+        _steps = self.ns5_steps
+        self._ns5_fn = lambda g, _f=_ns5_base, _s=_steps: _f(g, steps=_s)
         # Paper Eq. 15: y_t = M(q_t) where M is M_{t-1} (read-then-write).
         # Default False = lucidrains "write-then-read" (retrieve from M_t).
         self.retrieval_from_M_prev = retrieval_from_M_prev
@@ -1562,6 +1572,7 @@ class MultiHeadNMM(nn.Module):
         per_param_lr_modulation: bool = False,
         momentum_order: int = 1,
         compile_ns5: bool = False,
+        ns5_steps: int = 5,
         per_head_learned_params: bool = True,
     ):
         super().__init__()
@@ -1604,6 +1615,7 @@ class MultiHeadNMM(nn.Module):
                 per_param_lr_modulation=per_param_lr_modulation,
                 momentum_order=momentum_order,
                 compile_ns5=compile_ns5,
+                ns5_steps=ns5_steps,
             )
             for _ in range(n_heads)
         ])

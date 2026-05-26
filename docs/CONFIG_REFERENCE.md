@@ -142,6 +142,7 @@ passed to `TitansConfig`. Quick reference:
 | `--nmm-compile-inner-loop` | flag | torch.compile the inner loop (~1.7× speedup, 30-60s first-step warm-up) |
 | `--nmm-fused-kernel` | flag | Analytical inner gradient (~5-15% on top of `--nmm-compile-inner-loop`) |
 | `--nmm-compile-ns5` | flag | Fused NS5 via torch.compile (no effect when `--nmm-compile-inner-loop` is set) |
+| `--nmm-ns5-steps N` | int | Newton-Schulz iteration count (default 5). **Lowering speeds up training significantly but drifts the spectral norm of NS5(g) — measured at gpt2_small: steps=4 ~16% faster + ~12% LR drift; steps=3 ~33% faster + ~20% LR drift.** Validate convergence on your data before lowering. |
 
 ### Recommended consumer-GPU recipe (T=1024, full-rank, 16 GiB card)
 
@@ -192,6 +193,26 @@ only affect the per-token sequential path (`block_size=1`); they're
 silent no-ops on the blockwise path used here, and `--nmm-compile-inner-loop`
 in particular adds ~20 s of compile warm-up for zero runtime gain. Don't
 include them with this recipe — the config validator warns if you do.
+
+### Speed-quality tradeoff: `--nmm-ns5-steps`
+
+Profiling shows NS5's fp32 matmuls dominate at ~75% of CUDA time. Reducing
+the iteration count gives real wall-clock savings, but the Muon coefficients
+are tuned for the steps=5 fixed point — fewer steps means NS5(g) no longer
+has unit spectral norm, scaling every memory update.
+
+Measured on RTX 5070 Ti at the recommended recipe:
+
+| `--nmm-ns5-steps` | Step time | Speedup | `|sv−1|` drift |
+|---|---|---|---|
+| 5 (default, paper) | 1.11 s | 1.0× | ~0 |
+| 4 | 0.92 s | 1.20× | ~0.12 |
+| 3 | 0.74 s | 1.49× | ~0.20 |
+
+The same magnitude of spectral-norm drift broke training under bf16 NS5
+(G226), so don't drop below 5 without verifying convergence on your data.
+For short fine-tunes where eval loss can be sanity-checked, lowering to 4
+is a safe-feeling experiment. For long pre-training, stay at 5.
 
 **What you give up:** truncated BPTT (the `--nmm-detach-state-between-blocks`
 flag) means outer NMM-related parameters (`k_proj`, `q_proj`, `v_proj`,

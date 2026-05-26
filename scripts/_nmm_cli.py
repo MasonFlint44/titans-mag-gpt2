@@ -121,6 +121,18 @@ def add_nmm_args(parser: argparse.ArgumentParser) -> None:
              "traces NS5 transitively). Useful for the sequential / per-token "
              "NS5 paths.",
     )
+    group.add_argument(
+        "--nmm-ns5-steps",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Newton-Schulz iteration count. Default 5 (Muon coefficients "
+             "tuned for this fixed point). Lower is faster but the spectral "
+             "norm of NS5(g) drifts away from 1, scaling every memory update. "
+             "Measured at gpt2_small: steps=4 ~16%% faster + ~12%% LR drift; "
+             "steps=3 ~33%% faster + ~20%% LR drift. Validate convergence on "
+             "your data before lowering.",
+    )
 
 
 def nmm_kwargs_from_args(args: argparse.Namespace) -> dict:
@@ -145,4 +157,6 @@ def nmm_kwargs_from_args(args: argparse.Namespace) -> dict:
         kwargs["nmm_fused_kernel"] = True
     if args.nmm_compile_ns5:
         kwargs["nmm_compile_ns5"] = True
+    if args.nmm_ns5_steps is not None:
+        kwargs["nmm_ns5_steps"] = args.nmm_ns5_steps
     return kwargs

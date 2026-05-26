@@ -230,6 +230,26 @@ class TitansConfig:
     # Affects: every path. Validated to be >= 1.
     nmm_momentum_order: int = 1
 
+    # nmm_ns5_steps: number of Newton-Schulz iterations applied to the
+    # surprise gradient before each memory update (paper Eq 16).
+    #
+    # Default 5 matches Jordan et al. (Muon / nanogpt). The polynomial
+    # coefficients (a=3.4445, b=-4.7750, c=2.0315) are TUNED for the
+    # fp32 fixed point reached in 5 iterations — at fewer steps, the
+    # spectral norm of NS5(g) drifts away from 1, scaling every memory
+    # update by the same factor. Concretely (measured at gpt2_small
+    # dims on random Gaussian gradients):
+    #   - steps=5: |sv_max - 1| ~ 0 (converged, paper-faithful)
+    #   - steps=4: |sv_max - 1| ~ 0.12 (~12% LR drift)
+    #   - steps=3: |sv_max - 1| ~ 0.20 (~20% LR drift)
+    #
+    # Speed wins are large at gpt2_small (NS5 fp32 GEMMs are ~75% of
+    # CUDA time at block_size=64): steps=4 ≈ -16% step time, steps=3 ≈
+    # -33%. But the LR drift is the same scale that broke training
+    # under bf16 NS5 (G226), so do NOT lower this without a convergence
+    # study on your own data. Sanity bounds: [1, 10].
+    nmm_ns5_steps: int = 5
+
     # nmm_compile_ns5 (G274 — fused Newton-Schulz via torch.compile): when
     # True, every NS5 call in this NMM's forward paths goes through a
     # torch.compile-wrapped variant. The 5 NS5 iterations execute as 10
@@ -534,6 +554,16 @@ class TitansConfig:
                 "when there are multiple heads; with n_heads=1 there's nothing "
                 "to share. Either set nmm_n_heads > 1 to use multi-head NMM, "
                 "or leave nmm_per_head_learned_params=True (default)."
+            )
+
+        # nmm_ns5_steps: paper default is 5; sanity bounds [1, 10].
+        if not isinstance(self.nmm_ns5_steps, int) or not (1 <= self.nmm_ns5_steps <= 10):
+            raise ValueError(
+                f"nmm_ns5_steps must be an int in [1, 10] (got "
+                f"{self.nmm_ns5_steps!r}). Default is 5 (paper-faithful, "
+                f"Jordan/Muon coefficients tuned for this fixed point). "
+                f"Lower values speed up training but the spectral norm of "
+                f"NS5(g) drifts away from 1, scaling every memory update."
             )
 
         # nmm_softclamp_max: must be positive if set.
