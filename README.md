@@ -74,22 +74,42 @@ Requirements pinned by `uv.lock`: Python ≥ 3.12, PyTorch ≥ 2.3 (for
 `torch.func.grad` + `vmap` in the inner gradient; ≥ 2.8 enables the
 optional Phase 6 associative scan).
 
-## Fine-tune GPT-2 with the NMM
+## Fine-tune GPT-2 with the NMM (consumer GPU)
+
+The recommended recipe for a 16 GiB consumer card (RTX 5070 Ti / 4080 /
+3090 class), T=1024, full-rank MemoryMLP, 12 NMM layers:
 
 ```bash
+# Optional: install Gram-Newton-Schulz for ~15% step-time + 2 GiB memory
+# savings. Requires Hopper/Blackwell GPU + CUDA 12.9+ + PyTorch 2.7+.
+uv pip install gram-newton-schulz
+
 uv run python scripts/finetune.py \
     --size small \
     --data /path/to/corpus.txt \
-    --chunk-size 512 \
-    --batch-size 4 \
-    --grad-accum 4 \
+    --chunk-size 1024 \
+    --batch-size 1 --grad-accum 16 \
+    --nmm-block-size 64 \
+    --nmm-state-dtype bf16 \
+    --nmm-detach-state-between-blocks \
+    --nmm-use-gram-ns5 \
+    --compile-model \
+    --optim8bit \
     --max-steps 5000
 ```
 
 This loads pretrained `openai-community/gpt2`, splices in the NMM with
-`out_scale=0` (so initial logits exactly match HF), and starts training. At
-step 0 perplexity should equal vanilla GPT-2; from there it decreases as the
-memory contribution ramps up.
+`out_scale=0` (so initial logits exactly match HF), and starts training.
+At step 0 perplexity should equal vanilla GPT-2; from there it decreases
+as the memory contribution ramps up.
+
+Measured on RTX 5070 Ti: **~940 ms/step, 6.5 GiB peak, ~1080 tok/s**.
+Effective batch = 16 via `--grad-accum`; one optimizer step takes ~15 s.
+Drop `--nmm-use-gram-ns5` if you can't install the optional dep — adds
+~15% step time and ~2 GiB peak memory.
+
+See [`docs/CONFIG_REFERENCE.md`](docs/CONFIG_REFERENCE.md) for what each
+flag does, the speed/memory tradeoff space, and alternative recipes.
 
 ## Train from scratch (multi-GPU)
 
