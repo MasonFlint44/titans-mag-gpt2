@@ -178,7 +178,7 @@ def test_compute_nmm_norm_increases_when_M_is_larger():
     states = [block.nmm.init_state(2, torch.device("cpu")) for block in model.blocks]
     norms1 = compute_nmm_norm(states)
     # Scale all M entries by 2.0.
-    for M, S in states:
+    for M, S, _ in states:
         for k in M:
             M[k] = M[k] * 2.0
     norms2 = compute_nmm_norm(states)

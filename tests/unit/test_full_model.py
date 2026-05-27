@@ -141,12 +141,23 @@ def test_out_scale_preserved_at_zero_in_finetune_init():
 
 
 def test_persistent_mem_init_scale_not_clobbered():
-    """persistent_mem inits to randn*0.02; _apply_gpt2_init must not touch it
-    (Parameters aren't Modules, so named_modules() never visits them)."""
-    cfg = _tiny_cfg(n_embd=128, nmm_n_persistent=4)
-    model = TitansMAGGPT2(cfg)
-    s = model.blocks[0].persistent_mem.std().item()
-    assert 0.005 < s < 0.05, f"persistent_mem.std()={s} unexpectedly large/small"
+    """persistent_mem inits to randn*0.02; _apply_gpt2_init must not touch
+    it (Parameters aren't Modules, so named_modules() never visits them).
+
+    Verifies the invariant in BOTH modes — model_wide puts persistent_mem
+    on the model itself, per_block puts it on each TitansMAGBlock."""
+    for mode, get_param in [
+        ("model_wide", lambda m: m.persistent_mem),
+        ("per_block",  lambda m: m.blocks[0].persistent_mem),
+    ]:
+        cfg = _tiny_cfg(
+            n_embd=128, nmm_n_persistent=4, persistent_prefix_mode=mode,
+        )
+        model = TitansMAGGPT2(cfg)
+        s = get_param(model).std().item()
+        assert 0.005 < s < 0.05, (
+            f"mode={mode}: persistent_mem.std()={s} unexpectedly large/small"
+        )
 
 
 def test_renaming_self_nmm_does_not_break_id_skip_pattern():
@@ -273,7 +284,7 @@ def test_doc_boundaries_all_true_isolates_positions_from_earlier_input_changes()
     # contribution was reset away before position 1's update). Note: this
     # holds only for the NMM STATE — attention still sees both versions
     # of position 0 differently, so the model's LOGITS would differ.
-    for (M_a, S_a), (M_b, S_b) in zip(states_a, states_b):
+    for (M_a, S_a, _), (M_b, S_b, _) in zip(states_a, states_b):
         for key in M_a:
             md = (M_a[key] - M_b[key]).abs().max().item()
             sd = (S_a[key] - S_b[key]).abs().max().item()
@@ -312,7 +323,7 @@ def test_doc_boundaries_no_reset_path_DOES_propagate_position_zero_changes():
 
     # SOMETHING must differ.
     differs = False
-    for (M_a, _), (M_b, _) in zip(states_a, states_b):
+    for (M_a, _, _), (M_b, _, _) in zip(states_a, states_b):
         for key in M_a:
             if (M_a[key] - M_b[key]).abs().max().item() > 1e-6:
                 differs = True
@@ -351,7 +362,7 @@ def test_doc_boundaries_all_true_state_differs_from_no_reset_path():
 
     # At least one M entry must differ — otherwise resets had no effect.
     differs = False
-    for (M_r, _), (M_n, _) in zip(states_reset, states_no_reset):
+    for (M_r, _, _), (M_n, _, _) in zip(states_reset, states_no_reset):
         for key in M_r:
             if (M_r[key] - M_n[key]).abs().max().item() > 1e-6:
                 differs = True

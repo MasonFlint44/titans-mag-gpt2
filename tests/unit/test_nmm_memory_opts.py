@@ -79,7 +79,7 @@ def test_forward_chunk_preserves_state_dtype():
     nmm = _tiny_nmm(state_dtype="bf16")
     state = nmm.init_state(B=2, device=torch.device("cpu"))
     x = torch.randn(2, 4, 8)
-    _, (M_new, S_new) = nmm.forward_chunk(x, state, None)
+    _, (M_new, S_new, _) = nmm.forward_chunk(x, state, None)
     for k, v in M_new.items():
         assert v.dtype == torch.bfloat16, f"M[{k}] upcast to {v.dtype}"
     for k, v in S_new.items():
@@ -193,6 +193,9 @@ def test_expansion_1_trains_end_to_end():
     logits.sum().backward()
     for n, p in m.named_parameters():
         if p.requires_grad:
+            if p.numel() == 0:
+                # Empty params (e.g. model_wide persistent_mem at N_p=0).
+                continue
             assert p.grad is not None and torch.isfinite(p.grad).all(), f"bad grad on {n}"
 
 
@@ -353,6 +356,10 @@ def test_layer_indices_full_model_backward_propagates_through_mixed_stack():
     logits.sum().backward()
     for n, p in m.named_parameters():
         if p.requires_grad:
+            if p.numel() == 0:
+                # Empty parameters (e.g. model-wide persistent_mem at
+                # nmm_n_persistent=0) have no entries to gradient on.
+                continue
             assert p.grad is not None, f"{n} no grad"
             assert torch.isfinite(p.grad).all(), f"{n} non-finite grad"
 
@@ -424,7 +431,7 @@ def test_low_rank_state_init_shapes_match_factored_layout():
     )
     from model.titans_gpt2 import TitansMAGGPT2
     m = TitansMAGGPT2(cfg)
-    M, _S = m.blocks[0].nmm.init_state(B=2, device=torch.device("cpu"))
+    M, _S, _ = m.blocks[0].nmm.init_state(B=2, device=torch.device("cpu"))
     expected = {
         "W1_a.weight":     (2, r, d),
         "W1_b.weight":     (2, h, r),
@@ -486,6 +493,10 @@ def test_low_rank_trains_end_to_end():
     logits.sum().backward()
     for n, p in m.named_parameters():
         if p.requires_grad:
+            if p.numel() == 0:
+                # Empty parameters (e.g. model-wide persistent_mem at
+                # nmm_n_persistent=0) have no entries to gradient on.
+                continue
             assert p.grad is not None, f"{n} no grad"
             assert torch.isfinite(p.grad).all(), f"{n} non-finite grad"
 
@@ -504,7 +515,7 @@ def test_low_rank_composes_with_bf16_state():
     block = TitansMAGBlock(cfg)
     state = block.nmm.init_state(B=2, device=torch.device("cpu"))
     # State must be bf16 with low-rank.
-    M, _ = state
+    M, _, _ = state
     for v in M.values():
         assert v.dtype == torch.bfloat16
     x = torch.randn(2, 8, 16, requires_grad=True)

@@ -34,15 +34,17 @@ def test_call_site_v_not_l2_normalized():
 
 def test_no_silu_inside_module():
     """If SiLU were inside NMMProjection, call-site silu(proj(x)) would be silu(silu(x))
-    — different from silu(x) for non-zero input. Set linear=I and conv=identity to
-    isolate: proj(x) must equal x exactly.
+    — different from silu(x) for non-zero input. Set linear=I, depthwise conv=identity,
+    and pointwise=I to isolate: proj(x) must equal x exactly.
     """
     proj = NMMProjection(n_embd=4, kernel_size=1)
     with torch.no_grad():
         proj.linear.weight.copy_(torch.eye(4))
-        proj.conv.conv.weight.fill_(0)
-        # depthwise conv weights shape [out=4, in=1, k=1]; set to 1 so output == input
+        # Depthwise conv weights shape [out=4, in=1, k=1]; 1.0 makes conv(x) == x.
         proj.conv.conv.weight.fill_(1.0)
+        # Pointwise (added in the batch-3 depthwise-separable change) — set to
+        # identity so the chain linear -> conv -> pointwise leaves x unchanged.
+        proj.pointwise.weight.copy_(torch.eye(4))
     x = torch.tensor([[[-1.0, -0.5, 0.5, 1.0]]])
     y = proj(x)
     assert torch.allclose(y, x), f"proj(x) should equal x exactly, got {y}"

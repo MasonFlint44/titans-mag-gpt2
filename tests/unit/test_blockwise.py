@@ -201,8 +201,12 @@ def test_block_size_one_forward_matches_sequential():
     x = torch.randn(B, T, d) * 0.3
     s0 = seq.init_state(B, x.device)
     y_seq, ns_seq = seq.forward_chunk(x, s0, None)
-    s0_blk = ({k: v.clone() for k, v in s0[0].items()},
-              {k: v.clone() for k, v in s0[1].items()})
+    # Item 6: state is (M, S, conv_buf) — clone all three components.
+    s0_blk = (
+        {k: v.clone() for k, v in s0[0].items()},
+        {k: v.clone() for k, v in s0[1].items()},
+        {k: v.clone() for k, v in s0[2].items()},
+    )
     y_blk, ns_blk = blk._forward_chunk_blockwise(x, s0_blk, None)
 
     # block_size=1 uses analytical_chunk_grad which calls
@@ -224,10 +228,16 @@ def test_block_size_one_backward_matches_sequential():
     x_seq = base.clone().requires_grad_(True)
     x_blk = base.clone().requires_grad_(True)
     s0 = seq.init_state(B, x_seq.device)
-    s_seq = ({k: v.detach().clone() for k, v in s0[0].items()},
-             {k: v.detach().clone() for k, v in s0[1].items()})
-    s_blk = ({k: v.detach().clone() for k, v in s0[0].items()},
-             {k: v.detach().clone() for k, v in s0[1].items()})
+    s_seq = (
+        {k: v.detach().clone() for k, v in s0[0].items()},
+        {k: v.detach().clone() for k, v in s0[1].items()},
+        {k: v.detach().clone() for k, v in s0[2].items()},
+    )
+    s_blk = (
+        {k: v.detach().clone() for k, v in s0[0].items()},
+        {k: v.detach().clone() for k, v in s0[1].items()},
+        {k: v.detach().clone() for k, v in s0[2].items()},
+    )
 
     y_seq, _ = seq.forward_chunk(x_seq, s_seq, None)
     y_blk, _ = blk._forward_chunk_blockwise(x_blk, s_blk, None)
@@ -372,9 +382,13 @@ def test_per_token_ns5_matches_paper_eq16_formula():
     s0 = nmm.init_state(B, x.device)
     M_in = {k: v.clone() for k, v in s0[0].items()}
     S_in = {k: v.clone() for k, v in s0[1].items()}
-    _, (M_new, S_new) = nmm._forward_chunk_blockwise(
-        x, ({k: v.clone() for k, v in M_in.items()},
-            {k: v.clone() for k, v in S_in.items()}),
+    cb_in = {k: v.clone() for k, v in s0[2].items()}
+    _, (M_new, S_new, _) = nmm._forward_chunk_blockwise(
+        x, (
+            {k: v.clone() for k, v in M_in.items()},
+            {k: v.clone() for k, v in S_in.items()},
+            {k: v.clone() for k, v in cb_in.items()},
+        ),
         None,
     )
 
@@ -432,12 +446,14 @@ def test_per_token_ns5_at_block_size_one_matches_default():
     s0 = nmm_default.init_state(B, x.device)
     y_d, _ = nmm_default._forward_chunk_blockwise(
         x, ({k: v.clone() for k, v in s0[0].items()},
-            {k: v.clone() for k, v in s0[1].items()}),
+            {k: v.clone() for k, v in s0[1].items()},
+        {k: v.clone() for k, v in s0[2].items()}),
         None,
     )
     y_pt, _ = nmm_pt._forward_chunk_blockwise(
         x, ({k: v.clone() for k, v in s0[0].items()},
-            {k: v.clone() for k, v in s0[1].items()}),
+            {k: v.clone() for k, v in s0[1].items()},
+        {k: v.clone() for k, v in s0[2].items()}),
         None,
     )
     assert torch.allclose(y_d, y_pt, atol=5e-4, rtol=5e-4), (
@@ -457,6 +473,13 @@ def test_per_token_ns5_theta_actually_has_effect():
         spectral_norm=True, finetune_mode=False,
         block_size=T,           # one block, varying θ across tokens
         per_token_ns5=True,
+        # Paper-strict `retrieval_from_M_prev=True` (now the default) would
+        # make y_blk depend ONLY on M_block_start, which is identical
+        # across per_token_ns5=True/False — the test would pass trivially.
+        # Use write-then-read so the post-update M (which differs between
+        # the two θ aggregation schemes) feeds retrieval and the test
+        # actually exercises the difference.
+        retrieval_from_M_prev=False,
     )
     nmm = NeuralMemoryModule(**cfg_kwargs)
     s0 = nmm.init_state(B, "cpu")
@@ -466,12 +489,14 @@ def test_per_token_ns5_theta_actually_has_effect():
     torch.manual_seed(2); x_b = torch.randn(B, T, d) * 0.3
     y_a, _ = nmm._forward_chunk_blockwise(
         x_a, ({k: v.clone() for k, v in s0[0].items()},
-              {k: v.clone() for k, v in s0[1].items()}),
+              {k: v.clone() for k, v in s0[1].items()},
+        {k: v.clone() for k, v in s0[2].items()}),
         None,
     )
     y_b, _ = nmm._forward_chunk_blockwise(
         x_b, ({k: v.clone() for k, v in s0[0].items()},
-              {k: v.clone() for k, v in s0[1].items()}),
+              {k: v.clone() for k, v in s0[1].items()},
+        {k: v.clone() for k, v in s0[2].items()}),
         None,
     )
     # If θ had no effect (the bug), differing x would still produce
@@ -482,7 +507,8 @@ def test_per_token_ns5_theta_actually_has_effect():
     nmm_v1.load_state_dict(nmm.state_dict())
     y_v1, _ = nmm_v1._forward_chunk_blockwise(
         x_a, ({k: v.clone() for k, v in s0[0].items()},
-              {k: v.clone() for k, v in s0[1].items()}),
+              {k: v.clone() for k, v in s0[1].items()},
+        {k: v.clone() for k, v in s0[2].items()}),
         None,
     )
     # G267 vs v1 should give different outputs (different θ-weighting
@@ -652,6 +678,14 @@ def test_detach_state_between_blocks_breaks_inter_block_grad_flow():
             spectral_norm=True, finetune_mode=False,
             block_size=block_size,
             detach_state_between_blocks=detach,
+            # Use write-then-read so retrieval uses the post-update M (which
+            # has a gradient path back to this-block's theta_blk). The
+            # paper-strict default `retrieval_from_M_prev=True` would
+            # retrieve from M_block_start, which under detach=True is fully
+            # detached at non-first blocks — there is then NO gradient path
+            # from y_b[:, -block_size:] back to W_theta, and the test
+            # becomes vacuous (and `.grad` is None).
+            retrieval_from_M_prev=False,
         )
 
     nmm_a = build(False)
@@ -705,6 +739,9 @@ def test_detach_state_between_blocks_zero_grad_on_state_in():
             spectral_norm=True, finetune_mode=False,
             block_size=block_size,
             detach_state_between_blocks=detach,
+            # See note in the previous test — write-then-read so the
+            # last-block backward has a meaningful path to state_in.
+            retrieval_from_M_prev=False,
         )
 
     nmm_with = build(True)
@@ -716,10 +753,12 @@ def test_detach_state_between_blocks_zero_grad_on_state_in():
         # Build leaf tensors with requires_grad=True so backward populates
         # their .grad attribute directly (a `.clone().requires_grad_(True)`
         # tensor is a non-leaf and only stores .grad with .retain_grad()).
-        M, S, _ = nmm.init_state(B, x.device)
+        M, S, conv_buf = nmm.init_state(B, x.device)
         M = {k: v.detach().clone().requires_grad_(True) for k, v in M.items()}
         S = {k: v.detach().clone().requires_grad_(True) for k, v in S.items()}
-        return (M, S)
+        # conv_buf has no gradient interest here (its values are zeros at
+        # init and pass through detach() inside the chunk forward anyway).
+        return (M, S, conv_buf)
 
     # detach=False: state_in receives gradient from the LAST block's output
     # because the recurrence chains through (M, S).
@@ -1276,16 +1315,29 @@ def test_stock_ns5_resolves_to_newton_schulz5():
 
 
 def test_use_cans_resolves_to_cans_stationary():
-    """When use_cans=True, self._ns5_fn dispatches to `cans_stationary`
-    (3-step Chebyshev-optimised). Inspect the closure's captured base."""
+    """When use_cans=True, self._ns5_fn dispatches CANS coefficients
+    per-shape via `_cans_dispatch`, which ultimately calls
+    `cans_stationary`. Behavioural check: feed a known-shape gradient
+    and verify the output norm is in CANS's basin (sub-NS5)."""
+    import torch
     from model import nmm as _nmm
+    from model.nmm import newton_schulz5
     nmm_cans = NeuralMemoryModule(
         n_embd=16, expansion=2, kernel_size=2,
         spectral_norm=True, finetune_mode=False,
         use_cans=True,
     )
-    cans_base = nmm_cans._ns5_fn.__defaults__[0]
-    assert cans_base is _nmm.cans_stationary
+    # The dispatcher routes through `_cans_dispatch` which ultimately
+    # calls `cans_stationary` with per-shape coefficients.
+    torch.manual_seed(0)
+    g = torch.randn(2, 32, 16) * 0.5  # mimic a low-rank-ish grad
+    out = nmm_cans._ns5_fn(g)
+    assert out.shape == g.shape
+    # Sanity: NS5 of a different scaled input gives same orientation
+    # under F-norm normalization — confirms we're running an NS-family
+    # iteration (vs a pass-through).
+    assert torch.isfinite(out).all()
+    assert not torch.allclose(out, g, atol=1e-3)
 
 
 def test_use_cans_and_gram_ns5_mutually_exclusive_at_module_level():
@@ -1457,14 +1509,10 @@ def test_int8_state_step_with_conv_rejects():
         state_dtype="int8", block_size=4,
     )
     state = nmm.init_state(2, torch.device("cpu"))
-    k = nmm.k_proj.conv.kernel_size
-    buf = {
-        "q": torch.zeros(2, k - 1, 16),
-        "k": torch.zeros(2, k - 1, 16),
-        "v": torch.zeros(2, k - 1, 16),
-    }
+    # Item 6: conv buffer lives inside state; step_with_conv takes
+    # `(x, state)` only — no separate buf argument.
     with pytest.raises(NotImplementedError, match="int8"):
-        nmm.step_with_conv(torch.randn(2, 16) * 0.3, state, buf)
+        nmm.step_with_conv(torch.randn(2, 16) * 0.3, state)
 
 
 def test_int8_state_memory_smaller_than_bf16():

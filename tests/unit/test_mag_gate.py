@@ -7,11 +7,17 @@ from model.block import TitansMAGBlock
 
 
 def _cfg(finetune_mode):
+    # `persistent_prefix_mode="per_block"` keeps the persistent_mem
+    # Parameter on the BLOCK (where this file's tests probe it). The
+    # post-batch-3 default `"model_wide"` would move the parameter to
+    # `TitansMAGGPT2.persistent_mem` and tests that read
+    # `block.persistent_mem` would fail with AttributeError.
     return TitansConfig(
         n_layer=1, n_head=2, n_embd=8, vocab_size=16,
         block_size=64, chunk_size=8, dropout=0.0,
         nmm_expansion=2, nmm_n_persistent=2,
         finetune_mode=finetune_mode,
+        persistent_prefix_mode="per_block",
     )
 
 

@@ -65,8 +65,8 @@ def test_save_load_round_trip_preserves_state_tensors(tmp_path):
     assert len(loaded) == len(nmm_states)
     for layer_a, layer_b in zip(nmm_states, loaded):
         # Single-head NMM: (M_dict, S_dict).
-        M_a, S_a = layer_a
-        M_b, S_b = layer_b
+        M_a, S_a, _ = layer_a
+        M_b, S_b, _ = layer_b
         assert set(M_a.keys()) == set(M_b.keys())
         for k in M_a:
             assert torch.equal(M_a[k], M_b[k]), f"M[{k}] diverged across round-trip"
@@ -177,8 +177,8 @@ def test_save_overwrites_existing_file(tmp_path):
 
     loaded = load_nmm_state(path, cfg, device=torch.device("cpu"))
     # The second save's states should be in the file now.
-    M_loaded, _ = loaded[0]
-    M_expected, _ = states_first[0]
+    M_loaded, _, _ = loaded[0]
+    M_expected, _, _ = states_first[0]
     for k in M_loaded:
         assert torch.equal(M_loaded[k], M_expected[k])
 
@@ -219,11 +219,11 @@ def test_prepare_decode_chunked_honors_initial_nmm_states():
     # Build a deliberately non-init state.
     custom_states = []
     for block in model.blocks:
-        M, S, _ = block.nmm.init_state(B=1, device=torch.device("cpu"))
+        M, S, conv_buf = block.nmm.init_state(B=1, device=torch.device("cpu"))
         # Perturb M so it's distinguishable from init.
         for k in M:
             M[k] = M[k] + torch.full_like(M[k], 7.0)
-        custom_states.append((M, S))
+        custom_states.append((M, S, conv_buf))
 
     prompt = torch.randint(0, cfg.vocab_size, (1, 8))
     cache = model.prepare_decode_chunked(prompt, initial_nmm_states=custom_states)
@@ -232,8 +232,8 @@ def test_prepare_decode_chunked_honors_initial_nmm_states():
     # what you'd get with init state. Compare against a fresh-init run.
     cache_fresh = model.prepare_decode_chunked(prompt)
 
-    M_custom, _ = cache["nmm_states"][0]
-    M_fresh, _ = cache_fresh["nmm_states"][0]
+    M_custom, _, _ = cache["nmm_states"][0]
+    M_fresh, _, _ = cache_fresh["nmm_states"][0]
     diffs = [(M_custom[k] - M_fresh[k]).abs().max().item() for k in M_custom]
     assert max(diffs) > 1e-4, (
         f"initial_nmm_states did not propagate through prepare_decode_chunked — "
@@ -268,7 +268,7 @@ def test_generate_with_state_returns_state_with_correct_structure():
     assert len(state) == cfg.n_layer
     # Each layer (under default single-head) is (M_dict, S_dict_or_tuple).
     for layer_state in state:
-        M, _S = layer_state
+        M, _S, _ = layer_state
         assert isinstance(M, dict)
         assert all(isinstance(v, torch.Tensor) for v in M.values())
 
