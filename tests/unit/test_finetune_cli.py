@@ -139,24 +139,25 @@ def test_resume_compatible_with_recipe_flags():
 
 
 def test_config_size_label_helper_round_trips():
-    """`_config_size_label` powers the resume-mode "ignored --size" warning.
-    Must correctly identify each preset by its (n_layer, n_embd) signature."""
-    from scripts.finetune import _config_size_label
+    """`config_size_label` powers the resume-mode "ignored --size" warning.
+    Must correctly identify each preset by its (n_layer, n_embd) signature.
+    Lives in train.py (shared between train.py and scripts/finetune.py)."""
+    from train import config_size_label
     from config import TitansConfig
-    assert _config_size_label(TitansConfig.gpt2_small()) == "small"
-    assert _config_size_label(TitansConfig.gpt2_medium()) == "medium"
-    assert _config_size_label(TitansConfig.gpt2_large()) == "large"
-    assert _config_size_label(TitansConfig.gpt2_xl()) == "xl"
+    assert config_size_label(TitansConfig.gpt2_small()) == "small"
+    assert config_size_label(TitansConfig.gpt2_medium()) == "medium"
+    assert config_size_label(TitansConfig.gpt2_large()) == "large"
+    assert config_size_label(TitansConfig.gpt2_xl()) == "xl"
 
 
 def test_config_size_label_handles_custom_dims():
     """For custom configs not matching any factory, return 'custom' rather
     than guessing — the warning would otherwise be misleading."""
-    from scripts.finetune import _config_size_label
+    from train import config_size_label
     from config import TitansConfig
     custom = TitansConfig(
         n_layer=4, n_head=2, n_embd=8, vocab_size=16,
         block_size=32, chunk_size=16, dropout=0.0,
         nmm_expansion=2, nmm_n_persistent=2,
     )
-    assert _config_size_label(custom) == "custom"
+    assert config_size_label(custom) == "custom"

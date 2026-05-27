@@ -5,6 +5,7 @@ import math
 import os
 import re
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -14,6 +15,36 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from tqdm.auto import tqdm
+
+
+# --- Resume-flow shared constants and helpers ----------------------------------
+# These are used by both `train.py` (from-scratch / DDP) and
+# `scripts/finetune.py` (single-GPU finetune) so the two entry points have
+# matching behavior on `--resume-from`. Adding a new backend-only NMM flag?
+# Append to RESUME_OVERRIDABLE_BACKEND_FLAGS so both paths honor it.
+
+# NMM CLI flags that can be overridden when resuming a checkpoint. These
+# select the NS5 implementation backend without changing any parameter
+# shape or graph topology — safe to flip mid-run when one backend OOMs
+# or breaks under a newer torch.
+RESUME_OVERRIDABLE_BACKEND_FLAGS = frozenset({
+    "nmm_use_gram_ns5",
+    "nmm_use_cans",
+    "nmm_ns5_steps",
+})
+
+# Scaffolding flags persisted into the checkpoint at save time. On resume,
+# we compare the user's CLI values against these and warn on disagreement
+# — catches "forgot --grad-accum 16, now I'm OOMing" before training
+# starts. The user still controls the final values (extending --max-steps
+# is a legitimate, common case), the warning is purely informational.
+SAVED_TRAINING_ARGS = (
+    "batch_size",
+    "grad_accum",
+    "warmup_steps",
+    "max_steps",
+    "save_every",
+)
 
 
 # G282 — graph-break suppression for the NMM's `bool(doc_boundaries.any())`
@@ -323,6 +354,7 @@ def save_checkpoint(
     optimizer: AdamW,
     step: int,
     config,
+    training_args: dict | None = None,
 ) -> None:
     """Save model state_dict + optimizer state + step + config to a single file.
 
@@ -332,6 +364,12 @@ def save_checkpoint(
     structure to construct, producing state_dict mismatch errors or silently-
     wrong inits.
 
+    `training_args` (optional) records the scaffolding CLI flags
+    (batch_size, grad_accum, warmup_steps, max_steps, save_every) the run
+    was using at save time. On resume, the loader compares these against
+    the current CLI values and warns on disagreement — prevents silent OOM
+    when the user forgets to re-pass --grad-accum / --batch-size.
+
     NMM states are intentionally NOT saved — they're per-sequence
     accumulators, not model state. Resume re-initializes from
     memory_mlp.W*.weight.
@@ -340,15 +378,15 @@ def save_checkpoint(
     # the saved state_dict is portable across wrapping choices on resume.
     from model import _unwrap
 
-    torch.save(
-        {
-            "state_dict": _unwrap(model).state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "step": step,
-            "config": dataclasses.asdict(config),
-        },
-        path,
-    )
+    payload = {
+        "state_dict": _unwrap(model).state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "step": step,
+        "config": dataclasses.asdict(config),
+    }
+    if training_args is not None:
+        payload["training_args"] = dict(training_args)
+    torch.save(payload, path)
 
 
 def load_checkpoint(path, device: torch.device) -> dict:
@@ -363,6 +401,104 @@ def load_checkpoint(path, device: torch.device) -> dict:
     handled by the caller (G219).
     """
     return torch.load(path, map_location=device, weights_only=False)
+
+
+def config_size_label(config) -> str:
+    """Map a config's backbone dims back to the closest factory name for
+    use in --resume-from's architecture-mismatch warning."""
+    if config.n_embd == 768 and config.n_layer == 12:
+        return "small"
+    if config.n_embd == 1024 and config.n_layer == 24:
+        return "medium"
+    if config.n_embd == 1280 and config.n_layer == 36:
+        return "large"
+    if config.n_embd == 1600 and config.n_layer == 48:
+        return "xl"
+    return "custom"
+
+
+def training_args_from_namespace(args) -> dict:
+    """Pluck the scaffolding flags listed in SAVED_TRAINING_ARGS out of an
+    argparse Namespace into a plain dict (for persistence into checkpoints).
+    Missing attributes are silently skipped so this stays usable from
+    notebooks / tests that don't go through the full CLI."""
+    return {k: getattr(args, k) for k in SAVED_TRAINING_ARGS if hasattr(args, k)}
+
+
+def apply_resume_overrides_and_warn(
+    config, args, nmm_kwargs: dict, *, log_prefix: str, rank: int = 0,
+) -> None:
+    """On --resume-from, apply NMM backend overrides to `config` (mutates in
+    place) and warn on rank 0 about any architecture-affecting CLI flags
+    that are being ignored. Shared between train.py and finetune.py so the
+    two entry points behave identically.
+
+    `nmm_kwargs` is the dict returned by `nmm_kwargs_from_args(args)` —
+    only flags the user explicitly set. `--size` and `--chunk-size` are
+    handled separately because they don't come through that helper."""
+    overrides = {
+        k: v for k, v in nmm_kwargs.items()
+        if k in RESUME_OVERRIDABLE_BACKEND_FLAGS
+    }
+    for k, v in overrides.items():
+        setattr(config, k, v)
+    ignored = {
+        k: v for k, v in nmm_kwargs.items()
+        if k not in RESUME_OVERRIDABLE_BACKEND_FLAGS
+    }
+    # --size default is "small"; only flag if the user passed a value that
+    # actually disagrees with the checkpoint.
+    ckpt_size = config_size_label(config)
+    if args.size != ckpt_size and args.size != "small":
+        ignored["size"] = args.size
+    # --chunk-size: default is 1024 (matches the consumer-GPU recipe). Only
+    # warn if a non-default value disagrees with the checkpoint.
+    if args.chunk_size != config.chunk_size and args.chunk_size != 1024:
+        ignored["chunk_size"] = args.chunk_size
+
+    if rank != 0:
+        return
+    if overrides:
+        print(
+            f"{log_prefix} --resume-from: applying non-architecture "
+            f"overrides ({sorted(overrides.keys())}) to the saved config.",
+            file=sys.stderr,
+        )
+    if ignored:
+        print(
+            f"{log_prefix} --resume-from: ignoring architecture-affecting "
+            f"CLI flags ({sorted(ignored.keys())}) — checkpoint's saved "
+            f"config is authoritative. Drop them from the command line "
+            f"to silence this warning.",
+            file=sys.stderr,
+        )
+
+
+def warn_training_arg_drift(
+    ckpt: dict, args, *, log_prefix: str, rank: int = 0,
+) -> None:
+    """If the checkpoint persisted `training_args`, compare them against the
+    current CLI values and warn on disagreement. No-op for older checkpoints
+    that predate this field. Emits on rank 0 only."""
+    if rank != 0:
+        return
+    saved = ckpt.get("training_args")
+    if not saved:
+        return
+    current = training_args_from_namespace(args)
+    diffs = []
+    for k in SAVED_TRAINING_ARGS:
+        if k in saved and k in current and saved[k] != current[k]:
+            diffs.append((k, saved[k], current[k]))
+    if not diffs:
+        return
+    body = ", ".join(f"{k}: {old} -> {new}" for k, old, new in diffs)
+    print(
+        f"{log_prefix} --resume-from: scaffolding flags differ from "
+        f"checkpoint ({body}). Continuing with the CLI values; re-pass the "
+        f"checkpoint's values explicitly to silence this warning.",
+        file=sys.stderr,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +561,7 @@ def save_checkpoint_rotating(
     step: int,
     config,
     keep_last_n: int = 3,
+    training_args: dict | None = None,
 ) -> Path:
     """Save a step checkpoint into `save_dir` and prune oldest beyond `keep_last_n`.
 
@@ -449,7 +586,10 @@ def save_checkpoint_rotating(
     save_dir.mkdir(parents=True, exist_ok=True)
 
     step_path = save_dir / f"step_{step:07d}.pt"
-    save_checkpoint(step_path, model, optimizer, step, config)
+    save_checkpoint(
+        step_path, model, optimizer, step, config,
+        training_args=training_args,
+    )
 
     # Mirror to latest.pt. Atomic replace (write to .tmp then rename) so a
     # mid-save crash never leaves latest.pt half-written.
@@ -508,6 +648,7 @@ def run_training(
     is_distributed: bool = False,
     show_progress: bool = True,
     start_step: int = 0,
+    batch_size: int | None = None,
 ) -> None:
     """Top-level training loop covering both Phase 4.4 (fine-tune) and 4.5
     (from-scratch). One optimizer.step per accumulation cycle of `accum_steps`
@@ -578,6 +719,20 @@ def run_training(
             f"nothing to train. Increase max_steps past the checkpoint's step "
             f"to continue training."
         )
+
+    # Snapshot the scaffolding flags so save_checkpoint can persist them
+    # alongside `config`. Resume-time drift detection compares these
+    # against the resumed CLI invocation. batch_size is the one value
+    # that doesn't already live in `config`; the rest mirror this
+    # function's parameters.
+    training_args = {
+        "grad_accum": accum_steps,
+        "warmup_steps": warmup_steps,
+        "max_steps": max_steps,
+        "save_every": save_every,
+    }
+    if batch_size is not None:
+        training_args["batch_size"] = batch_size
 
     base_lrs = base_lrs_from_constants()
     model.train()
@@ -759,6 +914,7 @@ def run_training(
                     saved_path = save_checkpoint_rotating(
                         save_dir, model, optimizer, step, config,
                         keep_last_n=keep_last_n,
+                        training_args=training_args,
                     )
                     if show_progress:
                         tqdm.write(f"  saved {saved_path}")
@@ -907,11 +1063,11 @@ def main():
         rank, world_size = 0, 1
 
     try:
-        # Resume vs fresh. Resume: load config + state from checkpoint;
-        # architecture-affecting CLI flags are ignored (silently — train.py
-        # tolerates them rather than raising, since DDP launches all ranks
-        # with the same argv and may pre-existing scripts pass them
-        # uniformly).
+        # Resume vs fresh. Resume: load config + state from checkpoint and
+        # apply backend overrides via the shared helper so train.py and
+        # scripts/finetune.py have matching behavior. Architecture-affecting
+        # CLI flags are ignored with a rank-0 warning; backend-only flags
+        # listed in RESUME_OVERRIDABLE_BACKEND_FLAGS are applied.
         if args.resume_from is not None:
             ckpt = load_checkpoint(args.resume_from, device=device)
             if "config" not in ckpt:
@@ -919,6 +1075,13 @@ def main():
                     f"Checkpoint {args.resume_from} lacks a 'config' key."
                 )
             config = TitansConfig.from_dict(ckpt["config"])
+            apply_resume_overrides_and_warn(
+                config, args, nmm_kwargs_from_args(args),
+                log_prefix="[train]", rank=rank,
+            )
+            warn_training_arg_drift(
+                ckpt, args, log_prefix="[train]", rank=rank,
+            )
         else:
             # Config BEFORE loader (loader reads chunk_size) — G205.
             factory = {
@@ -977,23 +1140,33 @@ def main():
 
         optimizer = build_optimizer(model, use_8bit=args.optim8bit)
 
-        if args.resume_from is not None and "optimizer" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer"])
-        # The saved `step` is the value of the counter at the save call
-        # site, BEFORE the `step += 1` increment — so `step=N` records
-        # model state after N+1 completed cycles. Resume must add 1 to
-        # avoid re-doing the saved cycle.
         if args.resume_from is not None:
+            if "optimizer" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer"])
+            # The saved `step` is the value of the counter at the save call
+            # site, BEFORE the `step += 1` increment — so `step=N` records
+            # model state after N+1 completed cycles. Resume must add 1 to
+            # avoid re-doing the saved cycle.
             start_step = int(ckpt.get("step", -1)) + 1
+            saved_step_for_log = ckpt.get("step")
+            # Drop the checkpoint dict — its state_dict and optimizer-state
+            # tensors sit on GPU otherwise (~3 GiB at gpt2_small). Holding
+            # them past load time would double-up with the freshly-instantiated
+            # `model` + `optimizer` and push the first compile pass over the
+            # VRAM budget. `load_state_dict` copied (not aliased) the data we
+            # need, so this is safe.
+            del ckpt, state
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            if rank == 0:
+                print(
+                    f"[train] resumed from {args.resume_from} "
+                    f"(saved at step {saved_step_for_log}, "
+                    f"continuing from cycle {start_step})",
+                    flush=True,
+                )
         else:
             start_step = 0
-        if args.resume_from is not None and rank == 0:
-            print(
-                f"[train] resumed from {args.resume_from} "
-                f"(saved at step {ckpt.get('step')}, "
-                f"continuing from cycle {start_step})",
-                flush=True,
-            )
 
         tok = Tokenizer()
         with open(args.data, "r", encoding="utf-8") as f:
@@ -1027,6 +1200,7 @@ def main():
             rank=rank,
             is_distributed=is_distributed,
             start_step=start_step,
+            batch_size=args.batch_size,
         )
     finally:
         # G225/G227 — NCCL cleanup on exception path. Consistent 4-space indent.

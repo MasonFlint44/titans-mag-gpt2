@@ -114,12 +114,15 @@ def main():
     autocast_dtype = torch.bfloat16 if device.type == "cuda" else None
 
     # Resume vs fresh: in resume mode, the checkpoint's saved config is
-    # authoritative. Architecture-affecting CLI flags are ignored — pinning
-    # them at the checkpoint's values prevents the user from accidentally
-    # changing the model shape mid-run (which would silently corrupt
-    # `optimizer.load_state_dict`).
+    # authoritative. Architecture-affecting CLI flags are ignored (with a
+    # warning); backend-only flags listed in train.RESUME_OVERRIDABLE_BACKEND_FLAGS
+    # are applied. Shared with train.py so both entry points behave identically.
     if args.resume_from is not None:
-        from train import load_checkpoint
+        from train import (
+            apply_resume_overrides_and_warn,
+            load_checkpoint,
+            warn_training_arg_drift,
+        )
         from model import _unwrap
         ckpt = load_checkpoint(args.resume_from, device=device)
         if "config" not in ckpt:
@@ -129,47 +132,13 @@ def main():
                 f"by save_checkpoint from train.py."
             )
         config = TitansConfig.from_dict(ckpt["config"])
-        # Warn loudly if architecture-affecting flags were passed — silently
-        # ignoring them would mask a configuration bug.
-        nmm_kwargs = nmm_kwargs_from_args(args)
-        # Backend toggles that don't change parameter shapes / graph
-        # topology — safe to override on resume.  These flags select the
-        # NS5 *implementation* (which polynomial/coefficients/kernels)
-        # without changing any saved weight or optimizer state.  Useful
-        # when a chosen backend turns out to OOM or break under newer
-        # library versions and we want to fall back without re-training.
-        _RESUME_OVERRIDABLE = {
-            "nmm_use_gram_ns5",
-            "nmm_use_cans",
-            "nmm_ns5_steps",
-        }
-        overrides = {k: v for k, v in nmm_kwargs.items() if k in _RESUME_OVERRIDABLE}
-        for k, v in overrides.items():
-            setattr(config, k, v)
-        ignored = {k: v for k, v in nmm_kwargs.items() if k not in _RESUME_OVERRIDABLE}
-        # `--size` defaults to "small" but might mismatch the checkpoint;
-        # only flag it if it actually disagrees.
-        ckpt_size = _config_size_label(config)
-        if args.size != ckpt_size and args.size != "small":
-            ignored["size"] = args.size
-        # chunk_size in the checkpoint config IS the authoritative chunk
-        # size; warn if the user tried to change it.
-        if args.chunk_size != config.chunk_size and args.chunk_size != 512:
-            ignored["chunk_size"] = args.chunk_size
-        if overrides:
-            print(
-                f"[finetune] --resume-from: applying non-architecture "
-                f"overrides ({sorted(overrides.keys())}) to the saved config.",
-                file=sys.stderr,
-            )
-        if ignored:
-            print(
-                f"[finetune] --resume-from: ignoring architecture-affecting "
-                f"CLI flags ({sorted(ignored.keys())}) — checkpoint's saved "
-                f"config is authoritative. Drop them from the command line "
-                f"to silence this warning.",
-                file=sys.stderr,
-            )
+        apply_resume_overrides_and_warn(
+            config, args, nmm_kwargs_from_args(args),
+            log_prefix="[finetune]", rank=0,
+        )
+        warn_training_arg_drift(
+            ckpt, args, log_prefix="[finetune]", rank=0,
+        )
         model = TitansMAGGPT2(config).to(device)
         # Skip load_pretrained — the checkpoint already has trained weights.
         # G277 — wrap with torch.compile BEFORE load_state_dict so the
@@ -210,9 +179,19 @@ def main():
         # saved AFTER `N+1` completed cycles. To resume without re-doing
         # the most recent cycle, set `start_step = N + 1`.
         start_step = int(ckpt.get("step", -1)) + 1
+        saved_step_for_log = ckpt.get("step")
+        # Drop the checkpoint dict — its state_dict and optimizer-state
+        # tensors sit on GPU otherwise (~3 GiB at gpt2_small). Holding them
+        # past load time would double-up with the freshly-instantiated
+        # `model` + `optimizer` and push the first compile pass over the
+        # VRAM budget. `load_state_dict` copied (not aliased) the data we
+        # need, so this is safe.
+        del ckpt, state
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         print(
             f"[finetune] resumed from {args.resume_from} "
-            f"(saved at step {ckpt.get('step')}, "
+            f"(saved at step {saved_step_for_log}, "
             f"continuing from cycle {start_step})",
             file=sys.stderr,
         )
@@ -265,21 +244,8 @@ def main():
         config=config,
         autocast_dtype=autocast_dtype,
         start_step=start_step,
+        batch_size=args.batch_size,
     )
-
-
-def _config_size_label(config: TitansConfig) -> str:
-    """Map a config's backbone dims back to the closest factory name for
-    use in --resume-from's architecture-mismatch warning."""
-    if config.n_embd == 768 and config.n_layer == 12:
-        return "small"
-    if config.n_embd == 1024 and config.n_layer == 24:
-        return "medium"
-    if config.n_embd == 1280 and config.n_layer == 36:
-        return "large"
-    if config.n_embd == 1600 and config.n_layer == 48:
-        return "xl"
-    return "custom"
 
 
 if __name__ == "__main__":
