@@ -60,14 +60,14 @@ def _tiny_nmm(state_dtype="fp32"):
 
 def test_init_state_dtype_is_fp32_by_default():
     nmm = _tiny_nmm(state_dtype="fp32")
-    M, S = nmm.init_state(B=2, device=torch.device("cpu"))
+    M, S, _ = nmm.init_state(B=2, device=torch.device("cpu"))
     for v in {**M, **S}.values():
         assert v.dtype == torch.float32
 
 
 def test_init_state_dtype_is_bf16_when_configured():
     nmm = _tiny_nmm(state_dtype="bf16")
-    M, S = nmm.init_state(B=2, device=torch.device("cpu"))
+    M, S, _ = nmm.init_state(B=2, device=torch.device("cpu"))
     for v in {**M, **S}.values():
         assert v.dtype == torch.bfloat16
 
@@ -143,7 +143,7 @@ def test_expansion_1_state_shapes_are_square_dxd():
     from model.titans_gpt2 import TitansMAGGPT2
     m = TitansMAGGPT2(cfg)
     state = m.blocks[0].nmm.init_state(B=2, device=torch.device("cpu"))
-    M, S = state
+    M, S, _ = state
     # All three weights are square [2, 8, 8] at expansion=1.
     for k, v in M.items():
         assert tuple(v.shape) == (2, 8, 8), f"{k} shape {tuple(v.shape)} != (2,8,8)"
@@ -265,7 +265,7 @@ def test_layer_indices_detach_states_tolerates_None_entries():
     detached = detach_states(states)
     assert detached[0] is None and detached[2] is None
     # detached[1] is a (M, S) tuple of dicts of detached tensors.
-    M, S = detached[1]
+    M, S, _ = detached[1]
     for v in {**M, **S}.values():
         assert v.requires_grad is False
 
@@ -370,10 +370,13 @@ def test_layer_indices_decode_path_works_with_mixed_blocks():
     m = TitansMAGGPT2(cfg).eval()
     prompt = torch.randint(0, cfg.vocab_size, (1, 4))
     cache = m.prepare_decode(prompt)
-    # Plain block's conv buffer slot is None; NMM block's is a dict.
-    assert cache["nmm_conv_buffers"][0] is None
-    assert isinstance(cache["nmm_conv_buffers"][1], dict)
-    assert cache["nmm_conv_buffers"][2] is None
+    # Item 6: conv buffer is now part of nmm_states (not a separate cache
+    # entry). Plain blocks have None state slots; NMM blocks have
+    # (M, S, conv_buf) triples.
+    assert cache["nmm_states"][0] is None  # plain block
+    assert len(cache["nmm_states"][1]) == 3  # NMM block: (M, S, conv_buf)
+    assert isinstance(cache["nmm_states"][1][2], dict)
+    assert cache["nmm_states"][2] is None  # plain block
     # One step of decode should run end-to-end and produce finite logits.
     next_tok = torch.tensor([[0]])
     logits, _ = m.forward_step(next_tok, cache)

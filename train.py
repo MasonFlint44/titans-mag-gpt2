@@ -87,8 +87,12 @@ GRAD_CLIP = 1.0
 #   persistent -- persistent_mem (learned prefix; decay reduces capacity)
 NO_DECAY_SUBSTRINGS = ("bias", "ln", "norm", "out_scale", "gamma", "persistent")
 
-# Substring set for NMM routing. Catches every param that should get the NMM LR.
-NMM_SUBSTRINGS = ("nmm", "gamma", "persistent", "ln_nmm")
+# Substring set for NMM routing. Paper-strict: only the NMM module's own
+# parameters get the 3× learning rate. `gamma_mem` / `gamma_attn` and
+# `persistent_mem` are block-level params not specified by the paper as
+# fast-LR; they route to the backbone (1×) group. `ln_nmm` is the NMM
+# pre-norm and still routes via the leading "nmm" hit on its full path.
+NMM_SUBSTRINGS = ("nmm",)
 
 
 def _is_no_decay(name: str) -> bool:
@@ -316,15 +320,23 @@ def _layer_norm_M(layer_state):
     three shapes:
       - None: returns None. Plain (non-NMM) blocks have None state slots
         when `nmm_layer_indices` is set (G261).
-      - single-head: `(M, S)` tuple of dicts.
-      - multi-head: `[(M_h, S_h), ...]` list (G254) — returns per-head mean.
+      - single-head: `(M, S, conv_buf)` tuple — item 6.
+      - multi-head: `[(M_h, S_h, conv_buf_h), ...]` list (G254) — returns
+        per-head mean.
+
+    `_qs` int8 scale companions in M are filtered out so they don't
+    contribute to the norm. `conv_buf` is the rolling cross-chunk conv
+    state; ignored for this metric.
     """
     if layer_state is None:
         return None
     if isinstance(layer_state, list):
         return sum(_layer_norm_M(s) for s in layer_state) / len(layer_state)
-    M, _S = layer_state
-    sq_sum = sum((v.float() ** 2).sum(dim=(-2, -1)) for v in M.values())  # [B]
+    M = layer_state[0]
+    sq_sum = sum(
+        (v.float() ** 2).sum(dim=tuple(range(1, v.ndim)))
+        for k, v in M.items() if not k.endswith("_qs")
+    )
     return sq_sum.sqrt().mean().detach().item()
 
 

@@ -17,7 +17,7 @@ def test_reset_state_unmasked_entries_byte_identical():
     init_M = nmm._build_init_M(B=4, device=torch.device("cpu"))
 
     # Mutate state[0] (M) so it differs from init.
-    M, S = state
+    M, S, _ = state
     for k in M:
         M[k] = M[k] + 1.0
         S[k] = S[k] + 0.5
@@ -58,10 +58,13 @@ def test_reset_state_all_true_mask_returns_init_everywhere():
     state = nmm.init_state(B=2, device=torch.device("cpu"))
     init_M = nmm._build_init_M(B=2, device=torch.device("cpu"))
     mask = torch.tensor([True, True])
-    new_M, new_S = reset_state(state, mask, init_M)
+    new_M, new_S, new_cb = reset_state(state, mask, init_M)
     for k in new_M:
         assert torch.equal(new_M[k], init_M[k])
         assert torch.all(new_S[k] == 0.0)
+    # conv_buf entries are zeroed for masked rows (item 6).
+    for k in new_cb:
+        assert torch.all(new_cb[k] == 0.0)
 
 
 def test_reset_state_all_false_mask_is_passthrough():
@@ -69,10 +72,12 @@ def test_reset_state_all_false_mask_is_passthrough():
     state = nmm.init_state(B=2, device=torch.device("cpu"))
     init_M = nmm._build_init_M(B=2, device=torch.device("cpu"))
     mask = torch.tensor([False, False])
-    new_M, new_S = reset_state(state, mask, init_M)
+    new_M, new_S, new_cb = reset_state(state, mask, init_M)
     for k in new_M:
         assert torch.equal(new_M[k], state[0][k])
         assert torch.equal(new_S[k], state[1][k])
+    for k in new_cb:
+        assert torch.equal(new_cb[k], state[2][k])
 
 
 # ---------------------------------------------------------------------------
@@ -85,19 +90,28 @@ def test_detach_states_passes_None_through():
 
 
 def test_detach_states_severs_grad_tape():
-    """Detached tensors must have requires_grad=False and no grad_fn."""
+    """Detached tensors must have requires_grad=False and no grad_fn.
+
+    State is `(M, S, conv_buf)` triple per item 6."""
     M = {"W1.weight": torch.randn(2, 4, requires_grad=True)}
     S = {"W1.weight": torch.randn(2, 4, requires_grad=True)}
+    cb = {"q": torch.randn(2, 3, 4, requires_grad=True),
+          "k": torch.randn(2, 3, 4, requires_grad=True),
+          "v": torch.randn(2, 3, 4, requires_grad=True)}
     op_M = {k: v * 2.0 for k, v in M.items()}  # gives them a grad_fn
     op_S = {k: v * 2.0 for k, v in S.items()}
-    states = [(op_M, op_S)]
+    op_cb = {k: v * 2.0 for k, v in cb.items()}
+    states = [(op_M, op_S, op_cb)]
     detached = detach_states(states)
-    for M_d, S_d in detached:
+    for M_d, S_d, cb_d in detached:
         for v in M_d.values():
             assert v.requires_grad is False
             assert v.grad_fn is None
         for v in S_d.values():
             assert v.requires_grad is False
+        for v in cb_d.values():
+            assert v.requires_grad is False
+            assert v.grad_fn is None
 
 
 def test_detach_states_preserves_values_bitwise():

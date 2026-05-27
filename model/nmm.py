@@ -111,63 +111,90 @@ def _quant_dict(d: dict, state_keys: tuple) -> dict:
     return out
 
 
-def reset_state(state: tuple, mask: torch.Tensor, init_M: dict) -> tuple:
-    """Reset masked batch entries to init values (autograd-safe via torch.where).
+def _where_dict(mask: torch.Tensor, new_dict: dict, old_dict: dict) -> dict:
+    """Per-batch torch.where over matching dict tensors.
 
-    In-place index assignment on tensors in the autograd graph raises
-    RuntimeError. torch.where is non-mutating and differentiable.
-
-    mask: [B] bool. Where True, the entry gets init_M / zeros_S; where False,
-    it keeps its current value bit-identically.
-
-    State structure:
-      - momentum_order == 1: S is a single dict (current default).
-      - momentum_order  > 1: S is a tuple/list of N dicts (G272). Reset
-        applies to each level independently — every level resets to zero.
+    `mask` [B] bool: True → take from new_dict; False → keep old_dict.
+    Returns a fresh dict; tensors are autograd-friendly (no in-place writes).
     """
-    M, S = state
+    out = {}
+    for k, new_v in new_dict.items():
+        old_v = old_dict[k]
+        m = mask.view(mask.shape[0], *([1] * (old_v.ndim - 1)))
+        out[k] = torch.where(m, new_v, old_v)
+    return out
 
-    def _where_dict(new_dict, old_dict):
-        out = {}
-        for k, new_v in new_dict.items():
-            old_v = old_dict[k]
-            m = mask.view(mask.shape[0], *([1] * (old_v.ndim - 1)))
-            out[k] = torch.where(m, new_v, old_v)
-        return out
 
-    M_new = _where_dict(init_M, M)
+def _reset_M_S(M: dict, S, mask: torch.Tensor, init_M: dict):
+    """Reset masked batch entries of (M, S). Does NOT touch conv_buf —
+    used by the inner per-token loop where conv_buf is irrelevant (the
+    conv ran once at chunk start; the inner loop iterates over already-
+    convolved k_hat / q_hat / v values).
+
+    Returns (M_new, S_new) — note 2-tuple, not state."""
+    M_new = _where_dict(mask, init_M, M)
     if isinstance(S, (list, tuple)):
         S_new = tuple(
-            _where_dict({k: torch.zeros_like(v) for k, v in S_lvl.items()}, S_lvl)
+            _where_dict(mask, {k: torch.zeros_like(v) for k, v in S_lvl.items()}, S_lvl)
             for S_lvl in S
         )
     else:
-        S_new = _where_dict({k: torch.zeros_like(v) for k, v in S.items()}, S)
-    return (M_new, S_new)
+        S_new = _where_dict(mask, {k: torch.zeros_like(v) for k, v in S.items()}, S)
+    return M_new, S_new
+
+
+def reset_state(state: tuple, mask: torch.Tensor, init_M: dict) -> tuple:
+    """Reset masked batch entries of a full per-layer state.
+
+    Handles both shapes:
+      - 2-tuple `(M, S)` — returns `(M_new, S_new)`. Used by callers that
+        only track M/S (e.g. the per-token inner loop).
+      - 3-tuple `(M, S, conv_buf)` — returns `(M_new, S_new, conv_buf_new)`.
+        Used by the chunk-level reset.
+
+    `mask`: [B] bool. True → init values for that batch row; False → keep.
+
+    Inner-loop callers that operate on (M, S) directly should call
+    `_reset_M_S` to avoid an unused conv_buf round-trip.
+    """
+    if len(state) == 2:
+        M, S = state
+        return _reset_M_S(M, S, mask, init_M)
+    M, S, conv_buf = state
+    M_new, S_new = _reset_M_S(M, S, mask, init_M)
+    cb_new = _where_dict(
+        mask, {k: torch.zeros_like(v) for k, v in conv_buf.items()}, conv_buf,
+    )
+    return (M_new, S_new, cb_new)
 
 
 def _detach_per_layer(layer_state):
     """Detach a single per-layer NMM state. Handles all shapes:
       - None: pass through (plain non-NMM block, G261).
-      - single-head, momentum_order=1: `(M, S_dict)` tuple of dicts.
-      - single-head, momentum_order>1: `(M, S_tuple)` where S_tuple is
-        a tuple/list of N dicts (G272).
-      - multi-head: `[(M_h, S_h), ...]` (G254).
+      - single-head, momentum_order=1: `(M, S_dict, conv_buf)` triple.
+      - single-head, momentum_order>1: `(M, S_tuple, conv_buf)` where S_tuple
+        is a tuple/list of N dicts (G272).
+      - multi-head: `[(M_h, S_h, conv_buf_h), ...]` (G254).
       - int8 state (G275): dicts may carry `_qs` scale companion entries
         alongside value entries. `dict.items()` returns both;
         `.detach()` is dtype-agnostic so detaching both is safe.
+
+    `conv_buf` is the last-k-1 Q/K/V linear projections carried across
+    chunk boundaries (item 6). Always detached at chunk boundary so the
+    backward graph does not extend across chunks.
     """
     if layer_state is None:
         return None
     if isinstance(layer_state, list):
         return [_detach_per_layer(s) for s in layer_state]
-    M, S = layer_state
+    M, S, conv_buf = layer_state
     M_det = {k: v.detach() for k, v in M.items()}
     if isinstance(S, (list, tuple)):
         S_det = tuple({k: v.detach() for k, v in S_lvl.items()} for S_lvl in S)
     else:
         S_det = {k: v.detach() for k, v in S.items()}
-    return (M_det, S_det)
+    cb_det = {k: v.detach() for k, v in conv_buf.items()}
+    return (M_det, S_det, cb_det)
 
 
 def detach_states(states):
@@ -388,41 +415,169 @@ def newton_schulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.
 # minimax-optimised for the *actual* post-F-norm singular value range of the
 # inputs, instead of NS5's coefficients which are tuned for an idealised
 # fixed-point. Cheaper (3 iterations vs 5) and ~4.6× better orthogonalisation
-# error than NS5-5 at our NMM shapes.
+# error than NS5-5 at the NMM shapes the coefficients were tuned for.
 #
-# Coefficients derived via scipy.differential_evolution minimising
-# max|f^3(σ) - 1| over σ ∈ [0.0228, 0.0542] — the p10..max singular value
-# range observed on (768, 3072) and (3072, 768) post-F-norm-normalised
-# gradients (gpt2_small NMM MemoryMLP, full-rank). See
-# scripts/benchmark_ns5.py for the derivation script.
-#
-# Caveat: these coefficients are tuned for the gpt2_small NMM shape. At
-# larger d / different expansion / low-rank configurations the sv range
-# shifts and the polynomial may converge less cleanly — re-derive via
-# scripts/benchmark_ns5.py if you change the shape regime.
-_CANS_STATIONARY_3STEP_COEFS = (3.8641, -9.7196, 9.7101)
+# Per-shape derivation: the singular value range of a F-norm-normalised
+# random matrix depends on the matrix shape (Marchenko-Pastur). Baking a
+# single (a, b, c) tuned for one shape gives an OK answer at other shapes
+# but is sub-optimal — and at very different aspect ratios (e.g. low-rank
+# factors) the polynomial may not even converge. We derive coefficients
+# per shape at NMM construction and cache them in a module-level dict
+# keyed by `(max(rows, cols), min(rows, cols))`.
 _CANS_STATIONARY_3STEP_STEPS = 3
 
+# Fallback coefficients — gpt2_small full-rank NMM MemoryMLP (W1 shape
+# 3072×768, sv range [0.0228, 0.0542]). Used if `_derive_cans_coefficients`
+# is called with a shape that hasn't been pre-cached AND the live derivation
+# fails. Kept as a guard rather than as a primary path.
+_CANS_STATIONARY_3STEP_FALLBACK = (3.8641, -9.7196, 9.7101)
 
-def cans_stationary(G: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
-    """3-step CANS-stationary iteration: same shape as NS5 but with
-    Chebyshev-optimised coefficients for the gpt2_small NMM sv range.
+# Module-level cache of per-shape CANS coefficients. Key: normalised shape
+# tuple `(max_dim, min_dim)`. Value: (a, b, c). Shared across all
+# NeuralMemoryModule instances in the process — every layer at the same
+# model size derives the same coefficients, so caching by shape avoids
+# redundant scipy.DE runs.
+_CANS_COEFFICIENT_CACHE: dict[tuple[int, int], tuple[float, float, float]] = {}
 
-    Step count (3) is baked into the coefficients — they're the LP-derived
-    minimax-optimal triple for *exactly* 3 iterations over the measured sv
-    range. Running for more or fewer steps with these coefficients is not
-    "CANS-k for k != 3"; it's CANS-3 truncated/extended, which performs
-    *worse* than NS5 (see scripts/benchmark_ns5.py).
+
+def _derive_cans_coefficients(
+    rows: int,
+    cols: int,
+    n_steps: int = _CANS_STATIONARY_3STEP_STEPS,
+    n_samples: int = 8,
+    pct_lo: float = 10.0,
+    n_grid: int = 400,
+    seed: int = 42,
+) -> tuple[float, float, float]:
+    """Derive CANS-stationary (a, b, c) for a given matrix shape.
+
+    Algorithm:
+      1. Sample `n_samples` random Gaussian matrices of shape (rows, cols),
+         F-norm normalise, take singular values.
+      2. SV range = [p10, max] across all samples (the p10 floor excludes
+         near-zero SVs that no polynomial can orthogonalise in finite steps).
+      3. Differential-evolution minimise max|f^n_steps(σ) - 1| over the SV
+         range, where f(σ) = aσ + bσ³ + cσ⁵.
+
+    Cached in `_CANS_COEFFICIENT_CACHE` keyed by (max(rows, cols),
+    min(rows, cols)). The SV distribution depends only on the aspect ratio
+    after F-norm normalisation, so swapping rows/cols hits the same cache
+    entry (legitimate — NS5/CANS transpose tall matrices anyway).
+
+    Pure-CPU numpy + scipy; ~1-5s per unique shape. Pre-warm at NMM
+    construction so the first training step doesn't pay this latency.
+    """
+    import numpy as np
+    from scipy.optimize import differential_evolution
+
+    key = (max(rows, cols), min(rows, cols))
+    if key in _CANS_COEFFICIENT_CACHE:
+        return _CANS_COEFFICIENT_CACHE[key]
+
+    rng = np.random.default_rng(seed)
+    all_svs: list[float] = []
+    for _ in range(n_samples):
+        G = rng.standard_normal((rows, cols))
+        # F-norm normalise to match the NS5/CANS prologue.
+        G = G / (np.linalg.norm(G) + 1e-7)
+        sv = np.linalg.svd(G, compute_uv=False)
+        all_svs.extend(sv.tolist())
+    sv_arr = np.asarray(all_svs)
+    sv_min = float(np.percentile(sv_arr, pct_lo))
+    sv_max = float(np.max(sv_arr))
+
+    sigmas = np.linspace(sv_min, sv_max, n_grid)
+
+    def objective(params):
+        a, b, c = params
+        x = sigmas.copy()
+        for _ in range(n_steps):
+            x = a * x + b * x ** 3 + c * x ** 5
+            x = np.clip(x, 0.0, 5.0)
+        return float(np.max(np.abs(x - 1.0)))
+
+    result = differential_evolution(
+        objective,
+        bounds=[(1.0, 20.0), (-80.0, 0.0), (0.0, 70.0)],
+        seed=seed, maxiter=3000, tol=1e-12,
+        polish=True, init="latinhypercube",
+    )
+    coeffs = tuple(float(v) for v in result.x)
+    _CANS_COEFFICIENT_CACHE[key] = coeffs
+    return coeffs
+
+
+def _cans_dispatch(G: torch.Tensor) -> torch.Tensor:
+    """Per-call dispatcher used by NMM's `_ns5_fn` when `use_cans=True`.
+
+    Reads the cached coefficients for the input's transposed-shape key and
+    forwards to `cans_stationary`. The cache is pre-warmed at NMM
+    construction in `_prewarm_cans_coefficients`, so the cache miss path
+    (live derivation in `cans_stationary`) is a safety net only.
+    """
+    rows = G.shape[-2]
+    cols = G.shape[-1]
+    if rows > cols:
+        # NS5/CANS transpose tall to wide; the cache is keyed by the
+        # post-transpose shape so we mirror that here.
+        rows, cols = cols, rows
+    coefs = _CANS_COEFFICIENT_CACHE.get(
+        (cols, rows), _CANS_STATIONARY_3STEP_FALLBACK,
+    )
+    return cans_stationary(G, coefs=coefs)
+
+
+def _prewarm_cans_coefficients(n_embd: int, expansion: int, low_rank=None) -> None:
+    """Pre-derive `(a, b, c)` for every unique recurrent-weight shape an
+    NMM with these hyperparameters will produce, populating the module-
+    level `_CANS_COEFFICIENT_CACHE`. Idempotent (cached entries are skipped
+    inside `_derive_cans_coefficients`).
+
+    Full-rank produces ONE unique gradient shape: `(expansion * n_embd, n_embd)`.
+    Low-rank produces TWO: `(n_embd, r)` and `(expansion * n_embd, r)`.
+    """
+    h = n_embd * expansion
+    if low_rank is None:
+        shapes = [(h, n_embd)]
+    else:
+        r = int(low_rank)
+        shapes = [(n_embd, r), (h, r)]
+    for rows, cols in shapes:
+        _derive_cans_coefficients(rows, cols)
+
+
+def cans_stationary(
+    G: torch.Tensor,
+    coefs: tuple[float, float, float] | None = None,
+    eps: float = 1e-7,
+) -> torch.Tensor:
+    """3-step CANS-stationary iteration.
+
+    `coefs`: explicit `(a, b, c)` tuple. When provided, used directly —
+    this is the production path (NMM passes its pre-derived per-shape
+    coefficients via the `_ns5_fn` closure). When `None`, looks up the
+    cache by the input's transposed-shape key; falls back to the
+    gpt2_small full-rank coefficients if the cache misses.
+
+    Step count (3) is baked into the coefficients — they're DE-derived for
+    *exactly* 3 iterations over the input's SV range. Running for more or
+    fewer steps degrades convergence sharply.
 
     Same fp32 autocast guard and transpose guard as `newton_schulz5`.
     """
-    a, b, c = _CANS_STATIONARY_3STEP_COEFS
     orig_dtype = G.dtype
     with torch.amp.autocast(device_type=G.device.type, enabled=False):
         G = G.float()
         should_transpose = G.shape[-2] > G.shape[-1]
         if should_transpose:
             G = G.mT
+        if coefs is None:
+            rows, cols = G.shape[-2], G.shape[-1]
+            key = (max(rows, cols), min(rows, cols))
+            coefs = _CANS_COEFFICIENT_CACHE.get(
+                key, _CANS_STATIONARY_3STEP_FALLBACK,
+            )
+        a, b, c = coefs
         G = G / (G.norm(dim=(-2, -1), keepdim=True) + eps)
         for _ in range(_CANS_STATIONARY_3STEP_STEPS):
             A = G @ G.mT
@@ -570,7 +725,14 @@ def gram_newton_schulz(G: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
 
         if should_transpose:
             X = X.mT
-        X = X.view(orig_shape)
+        # `.reshape` (not `.view`) because the final `.mT` above leaves X as a
+        # non-contiguous view of a contiguous matmul output. `.view` would
+        # error on the 4-D path (`per_token_ns5`: [B, T, h, d]) where we need
+        # to unflatten the leading dim back to (B, T). `.reshape` returns the
+        # existing tensor when strides happen to be compatible (the 2-D / 3-D
+        # cases hit this fast path) and falls back to a contiguous copy only
+        # on the path that genuinely needs one.
+        X = X.reshape(orig_shape)
 
     return X.to(orig_dtype)
 
@@ -630,14 +792,24 @@ class CausalDepthwiseConv1d(nn.Module):
 
 
 class NMMProjection(nn.Module):
-    """Q/K/V projection: Linear -> CausalDepthwiseConv1d, no activation.
+    """Q/K/V projection: Linear -> CausalDepthwiseConv1d -> Pointwise (1x1).
+
+    Implements depthwise-separable convolution per paper §4.4 in the
+    stricter reading where the Q/K/V `linear` is logically distinct from
+    the (depthwise + pointwise) separable conv. Note: the leading
+    `linear` is also a per-token channel mix and could in principle play
+    the pointwise role on its own (looser reading); we keep both so the
+    paper-text "depthwise-separable" is satisfied verbatim. Adds ~d²
+    params per Q/K/V per layer; in our consumer-GPU recipe (d=768,
+    n_layer=12) that's ~21M extra params total, modest vs the model's
+    ~150M backbone.
 
     SiLU + L2-norm are applied at the call site, not inside the module —
     putting SiLU inside would silently produce silu(silu(x)) at the call site.
 
-    Submodule names `linear` and `conv` are load-bearing for §4.1 optimizer
-    routing: param paths like `blocks.X.nmm.k_proj.linear.weight` get into
-    the NMM decay group via the `'nmm'` substring; renaming to anything
+    Submodule names `linear`, `conv`, `pointwise` are load-bearing for §4.1
+    optimizer routing: param paths like `blocks.X.nmm.k_proj.linear.weight`
+    get into the NMM group via the `'nmm'` substring; renaming to anything
     containing `'norm'`, `'bias'`, or `'gamma'` would misroute to no_decay.
     """
 
@@ -645,9 +817,10 @@ class NMMProjection(nn.Module):
         super().__init__()
         self.linear = nn.Linear(n_embd, n_embd, bias=False)
         self.conv = CausalDepthwiseConv1d(n_embd, kernel_size)
+        self.pointwise = nn.Linear(n_embd, n_embd, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(self.linear(x))
+        return self.pointwise(self.conv(self.linear(x)))
 
 
 class MemoryMLP(nn.Module):
@@ -738,7 +911,7 @@ class NeuralMemoryModule(nn.Module):
         kernel_size: int = 4,
         spectral_norm: bool = True,
         finetune_mode: bool = True,
-        retrieval_from_M_prev: bool = False,
+        retrieval_from_M_prev: bool = True,
         state_dtype: str = "fp32",
         low_rank=None,
         softclamp_max=None,
@@ -828,9 +1001,19 @@ class NeuralMemoryModule(nn.Module):
         # The `_s` slot lets introspection tests inspect the bound step
         # count even when the callable itself ignores it.
         if self.use_cans:
-            _ns5_base = cans_stationary
+            # Pre-derive per-shape coefficients for every recurrent-weight
+            # gradient this NMM will see. We resolve `state_keys` to their
+            # `memory_mlp` params (built immediately below — but ordering is
+            # safe because the params already exist via __init__'s call
+            # chain). Caching is module-level and shape-keyed, so multiple
+            # NMM instances at the same model size share the cache.
+            #
+            # Deferred to a post-memory_mlp-build pre-warm helper so the
+            # order-of-init in this __init__ stays linear and readable. See
+            # `_prewarm_cans_coefficients` below; it's invoked after the
+            # memory_mlp construction further down.
             _steps = _CANS_STATIONARY_3STEP_STEPS
-            self._ns5_fn = lambda g, _f=_ns5_base, _s=_steps: _f(g)
+            self._ns5_fn = lambda g, _s=_steps: _cans_dispatch(g)
         elif self.use_gram_ns5:
             _ns5_base = gram_newton_schulz
             _steps = len(_POLAR_EXPRESS_COEFFICIENTS)
@@ -883,6 +1066,15 @@ class NeuralMemoryModule(nn.Module):
         # the recurrent state. Architecture is full-rank or low-rank
         # depending on the `low_rank` flag.
         self.memory_mlp = MemoryMLP(n_embd, expansion, low_rank=low_rank)
+
+        # CANS pre-warm: now that we know the recurrent-weight shapes, derive
+        # per-shape coefficients before the first forward. Without this,
+        # `_cans_dispatch` would call `cans_stationary` with the fallback
+        # coefficients (gpt2_small tuning) on the first call until the cache
+        # is lazily populated. Pre-warming is ~1-5s per unique shape, paid
+        # once per model size per process.
+        if self.use_cans:
+            _prewarm_cans_coefficients(n_embd, expansion, low_rank=low_rank)
         # Xavier-uniform every recurrent weight, both full-rank (W1, W_gate,
         # W2) and low-rank (W*_a, W*_b).
         for name, p in self.memory_mlp.named_parameters():
@@ -976,127 +1168,128 @@ class NeuralMemoryModule(nn.Module):
                 S = _quant_dict(S, self.state_keys)
             else:
                 S = tuple(_quant_dict(s, self.state_keys) for s in S)
-        return (M, S)
+        # Conv buffer: last (k-1) linear projections of Q/K/V from the
+        # previous chunk, used to seed the depthwise conv at the current
+        # chunk's start so it sees a full k-token window across the chunk
+        # boundary (paper §4.4 conv loses context at chunk boundaries
+        # otherwise). At fresh-init the buffer is zeros — equivalent to
+        # the legacy left-pad-with-zeros behavior. Dtype matches
+        # `state_dtype`; the forward paths cast to the current chunk's
+        # dtype if it differs.
+        conv_buf = self._init_conv_buf(B, device)
+        return (M, S, conv_buf)
 
-    def step(self, x_t: torch.Tensor, state: tuple) -> tuple:
-        """Process a single token. Inference-time path.
+    def _project_qkv_with_buf(self, x_chunk: torch.Tensor, conv_buf: dict):
+        """Apply Q/K/V projections (linear -> buffer-aware conv -> pointwise).
 
-        Do NOT call in a training loop — the conv (kernel_size=4) only sees a
-        1-token window per call (3 of 4 weights are masked by left-pad). The
-        training path is `_forward_chunk_sequential` which pre-projects the
-        full chunk so the conv sees up-to-k context.
+        Item 6: the chunk-path conv used to left-pad each chunk with k-1
+        zeros, losing context at chunk boundaries. Now we maintain a
+        rolling buffer of the last k-1 linear projections and prepend
+        them to the chunk's linear projections before the conv runs.
 
-        x_t: [B, d]; state: (M_prev, S_prev), each dict of [B, h, d] / [B, d, h].
-        Returns: (y_t, new_state) where y_t: [B, d].
+        `conv_buf`: dict {"q","k","v"} of [B, k-1, d] linear projections
+        from the previous chunk's tail. At fresh init the entries are
+        zeros (matches legacy left-pad).
+
+        Returns `(q_pw, k_pw, v_pw, new_conv_buf)` where:
+          - q_pw/k_pw/v_pw are post-pointwise outputs [B, T, d] (caller
+            still applies silu + L2 as needed).
+          - new_conv_buf is the rolled buffer for the NEXT chunk: the last
+            (k-1) linear projections produced HERE, detached for TBPTT.
         """
-        if self.nmm_spectral_norm != self._spectral_norm_at_init:
-            raise RuntimeError(
-                "nmm_spectral_norm was mutated after construction "
-                f"(init={self._spectral_norm_at_init}, "
-                f"now={self.nmm_spectral_norm}). The cached "
-                "per_sample_grad_fn's reduction is locked at __init__; "
-                "rebuild the module to change spectral_norm."
-            )
-        if self.int8_state:
-            raise NotImplementedError(
-                "step() does not support nmm_state_dtype='int8'. "
-                "Single-token decode would dequantize/requantize at every "
-                "call; use the blockwise forward path for training."
-            )
-        M_prev, S_prev = state
+        k_sz = self.k_proj.conv.kernel_size
 
-        x_seq = x_t.unsqueeze(1)
-        k_raw = self.k_proj(x_seq).squeeze(1)
-        q_raw = self.q_proj(x_seq).squeeze(1)
-        v_raw = self.v_proj(x_seq).squeeze(1)
-        k_hat = F.normalize(F.silu(k_raw), dim=-1)
-        q_hat = F.normalize(F.silu(q_raw), dim=-1)
-        v = F.silu(v_raw)
-
-        theta_t = _project_theta(
-            self.W_theta, x_t, self.state_keys, self.per_param_lr_modulation,
-        )
-        eta_t = torch.sigmoid(self.W_eta(x_t))  # [B, momentum_order]
-        if self.momentum_order == 1:
-            eta_t = eta_t.squeeze(-1)            # back to [B] (paper default)
-        alpha_t = torch.sigmoid(self.W_alpha(x_t)).squeeze(-1)
-
-        # Cast inputs to state_dtype so per_sample_grad_fn's overridden
-        # weights (state_dtype) match input dtype — see forward_chunk note.
-        if self.state_dtype != k_hat.dtype:
-            k_hat = k_hat.to(self.state_dtype)
-            q_hat = q_hat.to(self.state_dtype)
-            v = v.to(self.state_dtype)
-            if isinstance(theta_t, dict):
-                theta_t = {k: v_.to(self.state_dtype) for k, v_ in theta_t.items()}
+        def _one(projection: NMMProjection, buf_x: torch.Tensor):
+            lin = projection.linear(x_chunk)  # [B, T, d]
+            # Buffer may be stored in `state_dtype` (e.g. fp32) while the
+            # current chunk's Linear output is bf16 under autocast. Cast
+            # so `torch.cat` doesn't error.
+            if buf_x.dtype != lin.dtype:
+                buf_x = buf_x.to(lin.dtype)
+            if k_sz <= 1:
+                # No conv context to maintain — k=1 has no kernel reach.
+                conv_out = lin
+                new_buf = lin.new_zeros(lin.shape[0], 0, lin.shape[2])
             else:
-                theta_t = theta_t.to(self.state_dtype)
-            eta_t = eta_t.to(self.state_dtype)
-            alpha_t = alpha_t.to(self.state_dtype)
+                combined = torch.cat([buf_x, lin], dim=1)  # [B, T+k-1, d]
+                # Apply the underlying nn.Conv1d directly (no left-pad)
+                # since the buffer already provides the k-1 context. The
+                # public conv.forward would left-pad with zeros, defeating
+                # the whole point.
+                combined_t = combined.transpose(1, 2)  # [B, d, T+k-1]
+                conv_out = projection.conv.conv(combined_t).transpose(1, 2)
+                # New buf: last (k-1) of THIS chunk's linear projections.
+                # Detached so the autograd graph doesn't span chunks.
+                if lin.shape[1] >= k_sz - 1:
+                    new_buf = lin[:, -(k_sz - 1):, :].detach()
+                else:
+                    # Edge case: chunk shorter than k-1 (rare). Take from
+                    # the combined buffer's tail.
+                    new_buf = combined[:, -(k_sz - 1):, :].detach()
+            pw_out = projection.pointwise(conv_out)
+            return pw_out, new_buf
 
-        g_t = self.per_sample_grad_fn(M_prev, k_hat, v)
-        if self.softclamp_max is not None:
-            g_t = {key: softclamp_grad_norm(g, self.softclamp_max) for key, g in g_t.items()}
-        if self.nmm_spectral_norm:
-            g_tilde = {key: self._ns5_fn(g) for key, g in g_t.items()}
-        else:
-            g_tilde = g_t
+        q_pw, new_q = _one(self.q_proj, conv_buf["q"])
+        k_pw, new_k = _one(self.k_proj, conv_buf["k"])
+        v_pw, new_v = _one(self.v_proj, conv_buf["v"])
+        return q_pw, k_pw, v_pw, {"q": new_q, "k": new_k, "v": new_v}
 
-        # Momentum + memory update; theta POST-NS so the scale survives Frobenius division.
-        S_t = _step_momentum(S_prev, g_tilde, theta_t, eta_t, self.momentum_order)
-        # Use the deepest momentum level (S_N) for the M update.
-        M_t = _dict_add(_scale(1.0 - alpha_t, M_prev), _S_top(S_t, self.momentum_order))
+    @staticmethod
+    def _reset_conv_buf_at_chunk_start(
+        conv_buf: dict, doc_boundaries
+    ) -> dict:
+        """Zero per-batch conv_buf entries whose chunk starts at a doc
+        boundary. The buffer's only consumption point is chunk start (sub-
+        chunk 0); mid-chunk boundaries don't affect it. So we only check
+        `doc_boundaries[:, 0]`.
 
-        # Retrieval source per config: M_prev (paper Eq. 15, read-then-write)
-        # or M_t (lucidrains default, write-then-read).
-        M_for_retrieval = M_prev if self.retrieval_from_M_prev else M_t
-        y_t = self.out_scale * self._batched_retrieve(M_for_retrieval, q_hat)
-        return y_t, (M_t, S_t)
-
-    def init_conv_buffer_from_prompt(self, x_chunk: torch.Tensor) -> dict:
-        """Seed conv buffers from the last (k-1) tokens of a warm-up prompt.
-
-        At decode time, step_with_conv needs the last (k-1) Linear-projected
-        values for each of q/k/v so the conv can see a full k-token window
-        (instead of T=1 step()'s zero-padded 1-token window). This helper
-        re-projects the prompt's tail; cheaper than threading buffer capture
-        through forward_chunk's batched projection path.
-
-        x_chunk: [B, T, d] — post-ln_nmm prompt input.
-        Returns dict {'q', 'k', 'v'} each [B, k-1, d]. Left-padded with
-        zeros if T < k-1.
-        """
-        k = self.k_proj.conv.kernel_size
-        pad_size = k - 1
-        B, T, d = x_chunk.shape
-        if T >= pad_size:
-            last = x_chunk[:, -pad_size:, :]
-        else:
-            zero_pad = torch.zeros(
-                B, pad_size - T, d,
-                device=x_chunk.device, dtype=x_chunk.dtype,
-            )
-            last = torch.cat([zero_pad, x_chunk], dim=1)
+        Returns the conv_buf dict, possibly with entries replaced via
+        `torch.where` (autograd-safe; doesn't break the rolling
+        cross-chunk path)."""
+        if doc_boundaries is None:
+            return conv_buf
+        bdry_at_0 = doc_boundaries[:, 0]
+        if not bool(bdry_at_0.any()):
+            return conv_buf
+        mask = bdry_at_0.view(bdry_at_0.shape[0], 1, 1)
         return {
-            "q": self.q_proj.linear(last),
-            "k": self.k_proj.linear(last),
-            "v": self.v_proj.linear(last),
+            k: torch.where(mask, torch.zeros_like(v), v)
+            for k, v in conv_buf.items()
         }
+
+    def _init_conv_buf(self, B: int, device) -> dict:
+        """Zero-init conv buffer, shape `{q, k, v: [B, k-1, n_embd]}`."""
+        k_sz = self.k_proj.conv.kernel_size
+        dt = self.state_dtype if not self.int8_state else torch.float32
+        if k_sz <= 1:
+            shape = (B, 0, self.n_embd)
+        else:
+            shape = (B, k_sz - 1, self.n_embd)
+        return {
+            "q": torch.zeros(shape, device=device, dtype=dt),
+            "k": torch.zeros(shape, device=device, dtype=dt),
+            "v": torch.zeros(shape, device=device, dtype=dt),
+        }
+
 
     def step_with_conv(
         self,
         x_t: torch.Tensor,
         state: tuple,
-        conv_buffer: dict,
     ) -> tuple:
-        """Decode-path single-token step that uses a conv buffer so the
-        depthwise conv sees a full k-token window (vs. step()'s T=1 with
-        zero-padding which silently disables 3 of 4 kernel weights).
+        """Decode-path single-token step.
 
-        x_t: [B, d]; state: (M_prev, S_prev); conv_buffer: dict {q, k, v}
-        each [B, k-1, d] of prior Linear projections.
+        Item 6: the conv buffer now lives INSIDE the state tuple as the
+        third element. The previous separate `conv_buffer` parameter is
+        gone; callers pass `state = (M, S, conv_buf)` and receive the
+        same shape back.
 
-        Returns (y_t [B, d], new_state, new_conv_buffer).
+        x_t: [B, d]; state: (M, S, conv_buf) where `conv_buf` is a dict
+        `{"q","k","v"}` each `[B, k-1, d]` of prior Linear projections.
+
+        Returns `(y_t [B, d], new_state)` where new_state has the rolled
+        conv_buf (new entry: this token's linear projection appended,
+        oldest dropped).
         """
         if self.nmm_spectral_norm != self._spectral_norm_at_init:
             raise RuntimeError(
@@ -1109,7 +1302,7 @@ class NeuralMemoryModule(nn.Module):
                 "step_with_conv() does not support nmm_state_dtype='int8'."
             )
 
-        M_prev, S_prev = state
+        M_prev, S_prev, conv_buffer = state
         x_unsq = x_t.unsqueeze(1)  # [B, 1, d]
 
         # Linear projection only (no conv yet, no activation).
@@ -1117,20 +1310,36 @@ class NeuralMemoryModule(nn.Module):
         k_lin = self.k_proj.linear(x_unsq)
         v_lin = self.v_proj.linear(x_unsq)
 
+        # Cast buffer to lin dtype if needed (e.g. fp32 state buf vs bf16
+        # current token under autocast).
+        cb_q = conv_buffer["q"]
+        cb_k = conv_buffer["k"]
+        cb_v = conv_buffer["v"]
+        if cb_q.dtype != q_lin.dtype:
+            cb_q = cb_q.to(q_lin.dtype)
+            cb_k = cb_k.to(k_lin.dtype)
+            cb_v = cb_v.to(v_lin.dtype)
+
         # Concat with buffer (last k-1 prior linear projections) -> length-k
         # input. Run conv; take the LAST position (conv at that position uses
         # the full [buffer | new] context).
-        q_input = torch.cat([conv_buffer["q"], q_lin], dim=1)  # [B, k, d]
-        k_input = torch.cat([conv_buffer["k"], k_lin], dim=1)
-        v_input = torch.cat([conv_buffer["v"], v_lin], dim=1)
+        q_input = torch.cat([cb_q, q_lin], dim=1)  # [B, k, d]
+        k_input = torch.cat([cb_k, k_lin], dim=1)
+        v_input = torch.cat([cb_v, v_lin], dim=1)
         q_conv = self.q_proj.conv(q_input)[:, -1, :]  # [B, d]
         k_conv = self.k_proj.conv(k_input)[:, -1, :]
         v_conv = self.v_proj.conv(v_input)[:, -1, :]
+        # Apply the pointwise component of the depthwise-separable conv,
+        # matching the full NMMProjection.forward chain (linear -> conv ->
+        # pointwise). Without this, decode would diverge from training.
+        q_pw = self.q_proj.pointwise(q_conv)
+        k_pw = self.k_proj.pointwise(k_conv)
+        v_pw = self.v_proj.pointwise(v_conv)
 
-        # Call-site SiLU + L2 (same as step()).
-        k_hat = F.normalize(F.silu(k_conv), dim=-1)
-        q_hat = F.normalize(F.silu(q_conv), dim=-1)
-        v = F.silu(v_conv)
+        # Call-site SiLU + L2 (same pattern as the chunked forward path).
+        k_hat = F.normalize(F.silu(k_pw), dim=-1)
+        q_hat = F.normalize(F.silu(q_pw), dim=-1)
+        v = F.silu(v_pw)
 
         theta_t = _project_theta(
             self.W_theta, x_t, self.state_keys, self.per_param_lr_modulation,
@@ -1167,13 +1376,15 @@ class NeuralMemoryModule(nn.Module):
         M_for_retrieval = M_prev if self.retrieval_from_M_prev else M_t
         y_t = self.out_scale * self._batched_retrieve(M_for_retrieval, q_hat)
 
-        # Update conv buffer: drop oldest, append the new linear projection.
-        new_buffer = {
-            "q": torch.cat([conv_buffer["q"][:, 1:, :], q_lin], dim=1),
-            "k": torch.cat([conv_buffer["k"][:, 1:, :], k_lin], dim=1),
-            "v": torch.cat([conv_buffer["v"][:, 1:, :], v_lin], dim=1),
+        # Roll conv buffer: drop oldest, append the new linear projection.
+        # Use the casted `cb_*` tensors so the buffer dtype matches what
+        # we actually fed to the conv this step.
+        new_conv_buf = {
+            "q": torch.cat([cb_q[:, 1:, :], q_lin], dim=1),
+            "k": torch.cat([cb_k[:, 1:, :], k_lin], dim=1),
+            "v": torch.cat([cb_v[:, 1:, :], v_lin], dim=1),
         }
-        return y_t, (M_t, S_t), new_buffer
+        return y_t, (M_t, S_t, new_conv_buf)
 
     def _run_inner_loop(
         self,
@@ -1336,10 +1547,21 @@ class NeuralMemoryModule(nn.Module):
             )
 
         B, T, _ = x_chunk.shape
-        # Full-chunk projection — conv sees up-to-k tokens per output.
-        k_hat_chunk = F.normalize(F.silu(self.k_proj(x_chunk)), dim=-1)
-        q_hat_chunk = F.normalize(F.silu(self.q_proj(x_chunk)), dim=-1)
-        v_chunk = F.silu(self.v_proj(x_chunk))
+        # Unpack state including the rolling conv buffer (item 6). Reset
+        # the buffer per-batch where chunk position 0 hits a doc boundary —
+        # otherwise the previous document's tail would leak across the
+        # boundary via the conv context.
+        M_dict, S_state, conv_buf = state_in
+        conv_buf = self._reset_conv_buf_at_chunk_start(conv_buf, doc_boundaries)
+
+        # Full-chunk projection — conv sees up-to-k tokens per output via
+        # the buffer of the previous chunk's tail (or zeros at fresh init).
+        q_pw, k_pw, v_pw, new_conv_buf = self._project_qkv_with_buf(
+            x_chunk, conv_buf,
+        )
+        k_hat_chunk = F.normalize(F.silu(k_pw), dim=-1)
+        q_hat_chunk = F.normalize(F.silu(q_pw), dim=-1)
+        v_chunk = F.silu(v_pw)
         # Keep the LAST dim of theta/eta (no squeeze): shape is
         # [B, T, n_theta] / [B, T, momentum_order]. _run_inner_loop reads
         # the right slice per token based on `per_param_lr_modulation`
@@ -1373,7 +1595,7 @@ class NeuralMemoryModule(nn.Module):
         if self.lookahead_value:
             v_chunk, theta_chunk = _apply_lookahead_v(v_chunk, theta_chunk)
 
-        M_dict, S_state = state_in
+        # M_dict, S_state were unpacked above (along with conv_buf).
 
         # init_M is built only when a doc boundary fires anywhere in the
         # chunk (zero-cost on the common no-boundary chunk).
@@ -1423,7 +1645,11 @@ class NeuralMemoryModule(nn.Module):
                 dict(zip(self.state_keys, S_flat[lvl * K : (lvl + 1) * K]))
                 for lvl in range(N)
             )
-        new_state = (dict(zip(self.state_keys, M_flat)), S_out)
+        new_state = (
+            dict(zip(self.state_keys, M_flat)),
+            S_out,
+            new_conv_buf,  # item 6: thread the rolling conv buffer forward
+        )
         return y_chunk, new_state
 
     def _forward_chunk_blockwise(
@@ -1456,11 +1682,16 @@ class NeuralMemoryModule(nn.Module):
           per T=1024 chunk at block_size=64 is negligible loop overhead vs
           the per-block matmul time).
 
-        Doc-boundary resets are honored per-block: if ANY position within
-        a block has a boundary, the WHOLE block's pre-state is reset
-        (coarser than per-token reset but consistent with the block being
-        the atomic update unit). At `block_size = 1` this matches per-token
-        reset exactly.
+        Doc-boundary handling: the chunk is pre-split at boundary positions
+        (union across batch) into sub-chunks with no internal boundary.
+        `reset_state` fires once at each sub-chunk start, masked by the
+        per-batch boundary indicator at that exact position. Tokens before
+        a boundary keep their pre-boundary M; tokens at-or-after the
+        boundary run against init_M for batches that hit the boundary at
+        that position. This restores per-token-correct reset semantics
+        without per-token loop overhead. The trade-off: boundary-containing
+        chunks produce smaller block matmuls at the sub-chunk seams, which
+        gives up some TC engagement near the seam.
         """
         if self.nmm_spectral_norm != self._spectral_norm_at_init:
             raise RuntimeError(
@@ -1476,12 +1707,20 @@ class NeuralMemoryModule(nn.Module):
         # chunk, so the NMM-effective T = chunk_size + n_persistent, which
         # rarely divides evenly. Handle the trailing block specially below.
 
+        # Unpack state including the rolling conv buffer (item 6); reset
+        # per-batch at chunk pos 0 if a doc boundary fires there.
+        M, S, conv_buf = state_in
+        conv_buf = self._reset_conv_buf_at_chunk_start(conv_buf, doc_boundaries)
+
         # Project k, q, v + adaptive params once across the full chunk.
         # Keep the trailing dim of theta/eta (no squeeze) so per_param_lr
         # (n_theta=K) and momentum_order>1 (N>1) paths can slice in.
-        k_hat_chunk = F.normalize(F.silu(self.k_proj(x_chunk)), dim=-1)
-        q_hat_chunk = F.normalize(F.silu(self.q_proj(x_chunk)), dim=-1)
-        v_chunk = F.silu(self.v_proj(x_chunk))
+        q_pw, k_pw, v_pw, new_conv_buf = self._project_qkv_with_buf(
+            x_chunk, conv_buf,
+        )
+        k_hat_chunk = F.normalize(F.silu(k_pw), dim=-1)
+        q_hat_chunk = F.normalize(F.silu(q_pw), dim=-1)
+        v_chunk = F.silu(v_pw)
         theta_chunk = torch.sigmoid(self.W_theta(x_chunk))   # [B, T, n_theta]
         eta_chunk = torch.sigmoid(self.W_eta(x_chunk))       # [B, T, N]
         alpha_chunk = torch.sigmoid(self.W_alpha(x_chunk)).squeeze(-1)
@@ -1505,7 +1744,7 @@ class NeuralMemoryModule(nn.Module):
         norm_eps = self.memory_mlp.norm.eps
         reduction = "sum" if self.nmm_spectral_norm else "mean"
 
-        M, S = state_in
+        # M, S, conv_buf were unpacked at the top of this function.
         N = self.momentum_order
         # G275 int8 state: dequantize on entry. Within the block the math
         # runs in the standard state_dtype (fp32 here); at chunk end we
@@ -1521,149 +1760,179 @@ class NeuralMemoryModule(nn.Module):
                 S = tuple(_dequant_dict(s, self.state_keys) for s in S)
             else:
                 S = _dequant_dict(S, self.state_keys)
-        # init_M built lazily only if needed for doc-boundary resets.
+        # Sub-chunk pre-split at doc boundaries. Each sub-chunk has no
+        # internal boundary by construction; reset_state fires once at
+        # sub-chunk start (per-batch via the boundary mask at that exact
+        # position). This restores per-token-correct semantics — tokens
+        # BEFORE a boundary keep their pre-boundary M, tokens AT-OR-AFTER
+        # the boundary run against init_M for batches that hit the
+        # boundary.
+        #
+        # Common case (no boundary in chunk): exactly one sub-chunk, zero
+        # overhead. Boundary-containing chunks pay smaller block matmuls
+        # at the sub-chunk seams, which costs some TC engagement; the
+        # alternative was the retroactive-reset bug.
         any_boundary = (
             doc_boundaries is not None and bool(doc_boundaries.any())
         )
         init_M = self._build_init_M(B, x_chunk.device) if any_boundary else None
 
+        if any_boundary:
+            bdry_any = doc_boundaries.any(dim=0)             # [T] bool
+            bdry_positions = bdry_any.nonzero(as_tuple=True)[0].tolist()
+        else:
+            bdry_positions = []
+        # sub_starts[0] is always 0; subsequent entries are boundary
+        # positions in order. A boundary at position 0 produces a (0, 0)
+        # range that's skipped, with the reset firing at sub_idx == 1.
+        sub_starts = [0] + bdry_positions
+        sub_ends = sub_starts[1:] + [T]
+
         y_blocks = []
-        # Iterate `range(0, T, block_size)` — the final block may have
-        # fewer than block_size tokens. TC won't engage on that last block
-        # if its size < 16, but the math is correct.
-        for s in range(0, T, self.block_size):
-            e = min(s + self.block_size, T)
+        for sub_idx, (sub_s, sub_e) in enumerate(zip(sub_starts, sub_ends)):
+            if sub_e <= sub_s:
+                continue  # boundary at position 0 (or duplicate); skip empty range.
 
-            # G268 truncated BPTT.
-            if self.detach_state_between_blocks and s > 0:
-                M = {k: v.detach() for k, v in M.items()}
-                if isinstance(S, (list, tuple)):
-                    S = tuple(
-                        {k: v.detach() for k, v in S_lvl.items()} for S_lvl in S
+            # Reset at sub-chunk start. `sub_idx == 0` is the chunk's
+            # leading sub-chunk (starts at position 0); no prior state to
+            # reset against, so we never reset here. For sub_idx > 0 the
+            # sub-chunk starts at a boundary position; reset_state masks
+            # by `doc_boundaries[:, sub_s]` so only the batches that have
+            # the boundary at exactly this position get reset.
+            if sub_idx > 0:
+                M, S = reset_state((M, S), doc_boundaries[:, sub_s], init_M)
+
+            # Inner loop: block_size-aligned partition of [sub_s, sub_e).
+            # No boundary checks inside — the sub-chunk has none by
+            # construction.
+            for s in range(sub_s, sub_e, self.block_size):
+                e = min(s + self.block_size, sub_e)
+
+                # G268 truncated BPTT — detach at every block boundary
+                # across the whole chunk. Redundant right after a reset
+                # (init_M is already detached) but harmless.
+                if self.detach_state_between_blocks and s > 0:
+                    M = {k: v.detach() for k, v in M.items()}
+                    if isinstance(S, (list, tuple)):
+                        S = tuple(
+                            {k: v.detach() for k, v in S_lvl.items()} for S_lvl in S
+                        )
+                    else:
+                        S = {k: v.detach() for k, v in S.items()}
+
+                k_blk = k_hat_chunk[:, s:e]                          # [B, block, D]
+                q_blk = q_hat_chunk[:, s:e]
+                v_blk = v_chunk[:, s:e]
+                # Block-aggregate scalars: mean over the block's T dim.
+                # theta_chunk: [B, T, n_theta] -> [B, n_theta] after T-mean.
+                # eta_chunk:   [B, T, N]       -> [B, N]      after T-mean.
+                # Squeeze when the trailing dim is 1 (default scalar case).
+                theta_blk_full = theta_chunk[:, s:e].mean(dim=1)     # [B, n_theta]
+                eta_blk_full   = eta_chunk[:, s:e].mean(dim=1)       # [B, N]
+                if self.per_param_lr_modulation:
+                    # Per-key dict; consumed by `_scale_per_key` downstream.
+                    theta_blk = {
+                        k: theta_blk_full[:, i]
+                        for i, k in enumerate(self.state_keys)
+                    }
+                else:
+                    theta_blk = theta_blk_full.squeeze(-1)           # [B]
+                eta_blk = eta_blk_full if N > 1 else eta_blk_full.squeeze(-1)
+                alpha_blk = alpha_chunk[:, s:e].mean(dim=-1)
+
+                M_block_start = M
+                # Per-token θ (block-local). Shape [B, block, n_theta]; for
+                # default n_theta=1 the unsqueezed form is fine when fed
+                # into `_scale_per_key` and per-token NS5 path's einsum
+                # (which operates on a 2D scalar tensor — squeeze when
+                # n_theta=1).
+                theta_chunk_slice = theta_chunk[:, s:e]              # [B, block, n_theta]
+                if self.per_param_lr_modulation:
+                    theta_per_token = {
+                        k: theta_chunk_slice[..., i]
+                        for i, k in enumerate(self.state_keys)
+                    }
+                else:
+                    theta_per_token = theta_chunk_slice.squeeze(-1)   # [B, block]
+
+                if self.per_token_ns5:
+                    # G267 paper-faithful: per-token NS5 then per-token θ
+                    # weighting then sum. Matches paper Eq 16's
+                    # `Σ_t θ_t · NS5(∇_t)`.
+                    per_token_grad = _fused.analytical_per_token_grad(
+                        M, k_blk, v_blk, norm_w, norm_b, norm_eps, reduction,
                     )
+                    if self.softclamp_max is not None:
+                        per_token_grad = {
+                            key: softclamp_grad_norm(g, self.softclamp_max)
+                            for key, g in per_token_grad.items()
+                        }
+                    if self.nmm_spectral_norm:
+                        per_token_tilde = {
+                            key: self._ns5_fn(g)
+                            for key, g in per_token_grad.items()
+                        }
+                    else:
+                        per_token_tilde = per_token_grad
+                    # Σ_t θ_t · NS5(∇_t) — per-token θ weighting OUTSIDE NS5.
+                    # When per_param_lr is on, theta_per_token is a per-key
+                    # dict; otherwise a shared [B, block] tensor.
+                    if isinstance(theta_per_token, dict):
+                        chunk_theta_grad = {
+                            key: torch.einsum("bt,bthd->bhd", theta_per_token[key], g)
+                            for key, g in per_token_tilde.items()
+                        }
+                    else:
+                        chunk_theta_grad = {
+                            key: torch.einsum("bt,bthd->bhd", theta_per_token, g)
+                            for key, g in per_token_tilde.items()
+                        }
+                    # S/M update via _step_momentum (handles N>=1).
+                    # Per-token NS5 path treats theta as "already-applied"
+                    # in chunk_theta_grad; pass a unit-θ to _step_momentum
+                    # so the surprise term is chunk_theta_grad as-is.
+                    # Concretely: re-do the recurrence by hand here since
+                    # we already have θ-weighted grads. For N=1:
+                    #   S = η·S - chunk_theta_grad
+                    # For N>1: feed chunk_theta_grad as the level-0 surprise.
+                    if N == 1:
+                        S = _dict_sub(_scale(eta_blk, S), chunk_theta_grad)
+                    else:
+                        eta_levels = [eta_blk[..., k] for k in range(N)]
+                        S_new = []
+                        S_new.append(_dict_sub(_scale(eta_levels[0], S[0]), chunk_theta_grad))
+                        for k in range(1, N):
+                            S_new.append(_dict_add(_scale(eta_levels[k], S[k]), S_new[k-1]))
+                        S = tuple(S_new)
+                    M = _dict_add(_scale(1.0 - alpha_blk, M_block_start), _S_top(S, N))
                 else:
-                    S = {k: v.detach() for k, v in S.items()}
+                    # Cheap blockwise (no per-token θ refinement): NS5 on
+                    # the plain aggregate, mean θ scaling. At block_size=1
+                    # this is bit-equivalent to the sequential recurrence.
+                    grad_blk = _fused.analytical_chunk_grad(
+                        M, k_blk, v_blk, norm_w, norm_b, norm_eps, reduction,
+                    )
+                    if self.softclamp_max is not None:
+                        grad_blk = {
+                            key: softclamp_grad_norm(g, self.softclamp_max)
+                            for key, g in grad_blk.items()
+                        }
+                    if self.nmm_spectral_norm:
+                        grad_tilde = {
+                            key: self._ns5_fn(g) for key, g in grad_blk.items()
+                        }
+                    else:
+                        grad_tilde = grad_blk
+                    S = _step_momentum(S, grad_tilde, theta_blk, eta_blk, N)
+                    M = _dict_add(_scale(1.0 - alpha_blk, M_block_start), _S_top(S, N))
 
-            k_blk = k_hat_chunk[:, s:e]                          # [B, block, D]
-            q_blk = q_hat_chunk[:, s:e]
-            v_blk = v_chunk[:, s:e]
-            # Block-aggregate scalars: mean over the block's T dim.
-            # theta_chunk: [B, T, n_theta] -> [B, n_theta] after T-mean.
-            # eta_chunk:   [B, T, N]       -> [B, N]      after T-mean.
-            # Squeeze when the trailing dim is 1 (default scalar case).
-            theta_blk_full = theta_chunk[:, s:e].mean(dim=1)     # [B, n_theta]
-            eta_blk_full   = eta_chunk[:, s:e].mean(dim=1)       # [B, N]
-            if self.per_param_lr_modulation:
-                # Per-key dict; consumed by `_scale_per_key` downstream.
-                theta_blk = {
-                    k: theta_blk_full[:, i]
-                    for i, k in enumerate(self.state_keys)
-                }
-            else:
-                theta_blk = theta_blk_full.squeeze(-1)           # [B]
-            eta_blk = eta_blk_full if N > 1 else eta_blk_full.squeeze(-1)
-            alpha_blk = alpha_chunk[:, s:e].mean(dim=-1)
-
-            # Doc-boundary reset: if any token within this block triggers
-            # a boundary, reset the whole block's pre-state. Coarser than
-            # per-token; matches block-as-update granularity.
-            if (doc_boundaries is not None
-                and bool(doc_boundaries[:, s:e].any())):
-                blk_db = doc_boundaries[:, s:e].any(dim=-1)      # [B]
-                M, S = reset_state((M, S), blk_db, init_M)
-
-            M_block_start = M
-            # Per-token θ (block-local). Shape [B, block, n_theta]; for
-            # default n_theta=1 the unsqueezed form is fine when fed into
-            # `_scale_per_key` and per-token NS5 path's einsum (which
-            # operates on a 2D scalar tensor — squeeze when n_theta=1).
-            theta_chunk_slice = theta_chunk[:, s:e]              # [B, block, n_theta]
-            if self.per_param_lr_modulation:
-                theta_per_token = {
-                    k: theta_chunk_slice[..., i]
-                    for i, k in enumerate(self.state_keys)
-                }
-            else:
-                theta_per_token = theta_chunk_slice.squeeze(-1)   # [B, block]
-
-            if self.per_token_ns5:
-                # G267 paper-faithful: per-token NS5 then per-token θ
-                # weighting then sum. Matches paper Eq 16's
-                # `Σ_t θ_t · NS5(∇_t)`.
-                per_token_grad = _fused.analytical_per_token_grad(
-                    M, k_blk, v_blk, norm_w, norm_b, norm_eps, reduction,
-                )
-                if self.softclamp_max is not None:
-                    per_token_grad = {
-                        key: softclamp_grad_norm(g, self.softclamp_max)
-                        for key, g in per_token_grad.items()
-                    }
-                if self.nmm_spectral_norm:
-                    per_token_tilde = {
-                        key: self._ns5_fn(g)
-                        for key, g in per_token_grad.items()
-                    }
-                else:
-                    per_token_tilde = per_token_grad
-                # Σ_t θ_t · NS5(∇_t) — per-token θ weighting OUTSIDE NS5.
-                # When per_param_lr is on, theta_per_token is a per-key
-                # dict; otherwise a shared [B, block] tensor.
-                if isinstance(theta_per_token, dict):
-                    chunk_theta_grad = {
-                        key: torch.einsum("bt,bthd->bhd", theta_per_token[key], g)
-                        for key, g in per_token_tilde.items()
-                    }
-                else:
-                    chunk_theta_grad = {
-                        key: torch.einsum("bt,bthd->bhd", theta_per_token, g)
-                        for key, g in per_token_tilde.items()
-                    }
-                # S/M update via _step_momentum (handles N>=1).
-                # Per-token NS5 path treats theta as "already-applied" in
-                # chunk_theta_grad; pass a unit-θ to _step_momentum so the
-                # surprise term is chunk_theta_grad as-is.
-                # Concretely: re-do the recurrence by hand here since we
-                # already have θ-weighted grads. For N=1:
-                #   S = η·S - chunk_theta_grad
-                # For N>1: feed chunk_theta_grad as the level-0 surprise.
-                if N == 1:
-                    S = _dict_sub(_scale(eta_blk, S), chunk_theta_grad)
-                else:
-                    eta_levels = [eta_blk[..., k] for k in range(N)]
-                    S_new = []
-                    S_new.append(_dict_sub(_scale(eta_levels[0], S[0]), chunk_theta_grad))
-                    for k in range(1, N):
-                        S_new.append(_dict_add(_scale(eta_levels[k], S[k]), S_new[k-1]))
-                    S = tuple(S_new)
-                M = _dict_add(_scale(1.0 - alpha_blk, M_block_start), _S_top(S, N))
-            else:
-                # Cheap blockwise (no per-token θ refinement): NS5 on the
-                # plain aggregate, mean θ scaling. At block_size=1 this
-                # is bit-equivalent to the sequential recurrence.
-                grad_blk = _fused.analytical_chunk_grad(
-                    M, k_blk, v_blk, norm_w, norm_b, norm_eps, reduction,
-                )
-                if self.softclamp_max is not None:
-                    grad_blk = {
-                        key: softclamp_grad_norm(g, self.softclamp_max)
-                        for key, g in grad_blk.items()
-                    }
-                if self.nmm_spectral_norm:
-                    grad_tilde = {
-                        key: self._ns5_fn(g) for key, g in grad_blk.items()
-                    }
-                else:
-                    grad_tilde = grad_blk
-                S = _step_momentum(S, grad_tilde, theta_blk, eta_blk, N)
-                M = _dict_add(_scale(1.0 - alpha_blk, M_block_start), _S_top(S, N))
-
-            # Retrieval per-token within the block (all tokens see the same M).
-            M_for_retrieval = M_block_start if self.retrieval_from_M_prev else M
-            y_blk = _fused.batched_retrieve_chunk(
-                M_for_retrieval, q_blk, norm_w, norm_b, norm_eps,
-            )                                                    # [B, block, D]
-            y_blk = self.out_scale * y_blk
-            y_blocks.append(y_blk)
+                # Retrieval per-token within the block (all tokens see the same M).
+                M_for_retrieval = M_block_start if self.retrieval_from_M_prev else M
+                y_blk = _fused.batched_retrieve_chunk(
+                    M_for_retrieval, q_blk, norm_w, norm_b, norm_eps,
+                )                                                    # [B, block, D]
+                y_blk = self.out_scale * y_blk
+                y_blocks.append(y_blk)
 
         y_chunk = torch.cat(y_blocks, dim=1)
         # G275: requantize before returning so the caller-visible state
@@ -1674,7 +1943,7 @@ class NeuralMemoryModule(nn.Module):
                 S = tuple(_quant_dict(s, self.state_keys) for s in S)
             else:
                 S = _quant_dict(S, self.state_keys)
-        return y_chunk, (M, S)
+        return y_chunk, (M, S, new_conv_buf)
 
     def forward_chunk(self, x_chunk, state_in, doc_boundaries):
         """Dispatch between blockwise and sequential paths.
@@ -1714,7 +1983,7 @@ class MultiHeadNMM(nn.Module):
         kernel_size: int = 4,
         spectral_norm: bool = True,
         finetune_mode: bool = True,
-        retrieval_from_M_prev: bool = False,
+        retrieval_from_M_prev: bool = True,
         state_dtype: str = "fp32",
         low_rank=None,
         softclamp_max=None,
@@ -1849,40 +2118,21 @@ class MultiHeadNMM(nn.Module):
             new_states.append(state_h)
         return self._merge_heads(outputs), new_states
 
-    def init_conv_buffer_from_prompt(self, x_chunk: torch.Tensor) -> list:
-        """Per-head conv buffer; the block stores a list[n_heads] of buffer
-        dicts in place of the single-head dict."""
-        x_split = self._split_heads(x_chunk)
-        return [
-            head.init_conv_buffer_from_prompt(x_split[..., i, :].contiguous())
-            for i, head in enumerate(self.heads)
-        ]
+    def step_with_conv(self, x_t, state):
+        """Per-head step. `state` is a `list[n_heads]` of per-head
+        `(M, S, conv_buf)` tuples (item 6 — conv_buf is in state now).
+        x_t is [B, d_model]; split into per-head [B, head_dim] slices,
+        run each head's step_with_conv, concatenate outputs.
 
-    def step_with_conv(self, x_t, state, conv_buffer):
-        """Per-head step. x_t is [B, d_model]; split into per-head [B, head_dim]
-        slices, run each head's step_with_conv, concatenate outputs.
-        `conv_buffer` is a list[n_heads] of per-head buffer dicts."""
+        Returns (y [B, d_model], new_state) where new_state has the same
+        nested shape as state with per-head rolled conv buffers."""
         x_split = self._split_heads(x_t)  # [B, n_heads, head_dim]
         outputs = []
         new_states = []
-        new_buffers = []
         for i, head in enumerate(self.heads):
             x_h = x_split[..., i, :].contiguous()
-            y_h, s_h, b_h = head.step_with_conv(x_h, state[i], conv_buffer[i])
-            outputs.append(y_h)
-            new_states.append(s_h)
-            new_buffers.append(b_h)
-        return self._merge_heads(outputs), new_states, new_buffers
-
-    def step(self, x_t, state):
-        """Legacy single-token step (no conv buffer). Each head's step has
-        its own zero-padded conv window; per-head dispatch."""
-        x_split = self._split_heads(x_t)
-        outputs = []
-        new_states = []
-        for i, head in enumerate(self.heads):
-            x_h = x_split[..., i, :].contiguous()
-            y_h, s_h = head.step(x_h, state[i])
+            y_h, s_h = head.step_with_conv(x_h, state[i])
             outputs.append(y_h)
             new_states.append(s_h)
         return self._merge_heads(outputs), new_states
+

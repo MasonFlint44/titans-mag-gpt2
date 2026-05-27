@@ -31,37 +31,6 @@ def test_forward_chunk_at_finetune_init_returns_zero_y():
 
 
 # ---------------------------------------------------------------------------
-# G154 — pre-projection requirement: conv must see full chunk, not 1-token slices
-# ---------------------------------------------------------------------------
-
-def test_forward_chunk_NOT_equal_to_T_many_step_calls():
-    """Calling step() T times feeds the conv a 1-token window every call;
-    forward_chunk pre-projects so the conv sees the full T-token sequence.
-    The two paths must produce DIFFERENT outputs — confirms forward_chunk
-    is not silently devolving to the per-token form (G154)."""
-    nmm = NeuralMemoryModule(n_embd=8, expansion=2, finetune_mode=False)
-    x = torch.randn(2, 8, 8)
-
-    # forward_chunk path
-    state = nmm.init_state(B=2, device=torch.device("cpu"))
-    y_chunk, _ = nmm.forward_chunk(x, state, doc_boundaries=None)
-
-    # step-T-times path (the G154 footgun)
-    state = nmm.init_state(B=2, device=torch.device("cpu"))
-    y_steps = []
-    for t in range(x.shape[1]):
-        y_t, state = nmm.step(x[:, t, :], state)
-        y_steps.append(y_t)
-    y_steps = torch.stack(y_steps, dim=1)
-
-    # The two paths must diverge — proves the conv saw different windows.
-    assert not torch.allclose(y_chunk, y_steps, atol=1e-5), (
-        "forward_chunk and step-loop produced identical outputs — "
-        "conv may be running on 1-token slices in forward_chunk too."
-    )
-
-
-# ---------------------------------------------------------------------------
 # Doc boundary semantics
 # ---------------------------------------------------------------------------
 
@@ -113,8 +82,12 @@ def test_forward_chunk_resets_state_at_boundary():
     init_M = nmm._build_init_M(B=2, device=torch.device("cpu"))
 
     # Pump some non-trivial state into row 0 (mutate before calling).
-    state = ({k: state[0][k] + 1.0 for k in state[0]},
-             {k: state[1][k] + 0.5 for k in state[1]})
+    # State is now (M, S, conv_buf); we keep conv_buf untouched.
+    state = (
+        {k: state[0][k] + 1.0 for k in state[0]},
+        {k: state[1][k] + 0.5 for k in state[1]},
+        state[2],
+    )
 
     x = torch.randn(2, 4, 4)
     # Boundary at t=0 for row 0 only.
@@ -126,8 +99,11 @@ def test_forward_chunk_resets_state_at_boundary():
     nmm2 = NeuralMemoryModule(n_embd=4, expansion=2, finetune_mode=False)
     # rebuild from the same seed env so weights match
     nmm2.load_state_dict(nmm.state_dict())
-    state_noboundary = ({k: state[0][k].clone() for k in state[0]},
-                        {k: state[1][k].clone() for k in state[1]})
+    state_noboundary = (
+        {k: state[0][k].clone() for k in state[0]},
+        {k: state[1][k].clone() for k in state[1]},
+        {k: state[2][k].clone() for k in state[2]},
+    )
     y_reset, _ = nmm.forward_chunk(x, state, db)
     y_noreset, _ = nmm2.forward_chunk(x, state_noboundary, doc_boundaries=None)
     # Row 0 should differ; row 1 (no boundary) should match.

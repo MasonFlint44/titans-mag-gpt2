@@ -49,9 +49,10 @@ def test_retrieval_from_M_prev_default_is_True():
 
 
 def test_step_retrieval_from_M_prev_differs_from_default():
-    """step() with retrieval_from_M_prev=True must produce a different
-    y_t than the default (write-then-read). With the same input, weights,
-    and state, the only difference is the retrieval source (M_prev vs M_t)."""
+    """step_with_conv() with retrieval_from_M_prev=True must produce a
+    different y_t than the default (write-then-read). With the same input,
+    weights, and state, the only difference is the retrieval source
+    (M_prev vs M_t)."""
     torch.manual_seed(0)
     nmm_default = _nmm(retrieval_from_M_prev=False)
     nmm_paper = _nmm(retrieval_from_M_prev=True)
@@ -60,14 +61,16 @@ def test_step_retrieval_from_M_prev_differs_from_default():
     state = nmm_default.init_state(B=2, device=torch.device("cpu"))
     x_t = torch.randn(2, 8)
 
-    y_default, _ = nmm_default.step(x_t, state)
-    y_paper, _ = nmm_paper.step(x_t, state)
+    # Item 6: conv_buf lives inside state now; init_state seeds zeros,
+    # equivalent to the deleted step()'s implicit zero-pad behavior.
+    y_default, _ = nmm_default.step_with_conv(x_t, state)
+    y_paper, _ = nmm_paper.step_with_conv(x_t, state)
 
     # Outputs MUST differ — different retrieval source means different y.
     diff = (y_default - y_paper).abs().max().item()
     assert diff > 1e-6, (
-        f"retrieval_from_M_prev had no effect on step(): max diff = "
-        f"{diff:.3e}. The flag should swap M_t for M_prev in retrieval."
+        f"retrieval_from_M_prev had no effect on step_with_conv(): max "
+        f"diff = {diff:.3e}. The flag should swap M_t for M_prev in retrieval."
     )
 
 
@@ -83,8 +86,8 @@ def test_step_retrieval_from_M_prev_state_update_identical():
     state = nmm_default.init_state(B=2, device=torch.device("cpu"))
     x_t = torch.randn(2, 8)
 
-    _, (M_d, S_d) = nmm_default.step(x_t, state)
-    _, (M_p, S_p) = nmm_paper.step(x_t, state)
+    _, (M_d, S_d, _) = nmm_default.step_with_conv(x_t, state)
+    _, (M_p, S_p, _) = nmm_paper.step_with_conv(x_t, state)
 
     for k in M_d:
         assert torch.equal(M_d[k], M_p[k]), f"M[{k}] differs across flag values"
@@ -273,7 +276,7 @@ def test_multi_head_nmm_init_state_returns_list_of_per_head_states():
     assert isinstance(state, list)
     assert len(state) == 2
     # Each per-head state is a (M, S) tuple of dicts.
-    for M, S in state:
+    for M, S, _ in state:
         assert isinstance(M, dict)
         assert isinstance(S, dict)
         # M's W1 shape: [B, head_dim*expansion, head_dim] = [2, 8, 4] for head_dim=4, expansion=2
@@ -390,7 +393,7 @@ def test_detach_states_handles_multi_head_nested_structure():
     assert len(detached) == 1
     assert isinstance(detached[0], list)  # multi-head: per-layer is a list
     assert len(detached[0]) == 2
-    for M, S in detached[0]:
+    for M, S, _ in detached[0]:
         for v in M.values():
             assert v.requires_grad is False
         for v in S.values():
@@ -407,7 +410,7 @@ def test_detach_states_single_head_unchanged():
     assert len(detached) == 1
     # Single-head: per-layer is a (M, S) tuple, not a list.
     assert isinstance(detached[0], tuple)
-    M, S = detached[0]
+    M, S, _ = detached[0]
     assert isinstance(M, dict) and isinstance(S, dict)
 
 

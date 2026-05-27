@@ -98,24 +98,30 @@ def test_out_scale_routed_to_nmm_no_decay():
         assert any(p is q for q in nmm_no_decay)
 
 
-def test_gamma_mem_routed_to_nmm_no_decay():
+def test_gamma_mem_routed_to_gpt2_no_decay():
+    """Paper-strict routing: only NMM-internal params get the 3× LR. `gamma_*`
+    is block-level (not under `nmm`) so it routes to the backbone no-decay
+    group. The substring "gamma" still matches NO_DECAY_SUBSTRINGS so weight
+    decay stays off."""
     model = _tiny_model()
     opt = build_optimizer(model)
-    nmm_no_decay = opt.param_groups[3]["params"]
+    gpt2_no_decay = opt.param_groups[1]["params"]
     gammas = [p for name, p in model.named_parameters() if "gamma_mem" in name]
     assert len(gammas) > 0
     for p in gammas:
-        assert any(p is q for q in nmm_no_decay)
+        assert any(p is q for q in gpt2_no_decay)
 
 
-def test_persistent_mem_routed_to_nmm_no_decay():
+def test_persistent_mem_routed_to_gpt2_no_decay():
+    """Paper-strict routing: persistent prefix is block-level, not NMM-
+    internal, and routes to the backbone no-decay group."""
     model = _tiny_model()
     opt = build_optimizer(model)
-    nmm_no_decay = opt.param_groups[3]["params"]
+    gpt2_no_decay = opt.param_groups[1]["params"]
     pers = [p for name, p in model.named_parameters() if "persistent" in name]
     assert len(pers) > 0
     for p in pers:
-        assert any(p is q for q in nmm_no_decay)
+        assert any(p is q for q in gpt2_no_decay)
 
 
 def test_attn_weights_routed_to_gpt2_decay():

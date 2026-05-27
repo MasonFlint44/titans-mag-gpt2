@@ -311,9 +311,8 @@ class PlainGPT2Block(nn.Module):
         self, x_prompt: torch.Tensor, nmm_state=None, int8_kv_cache: bool = False,
     ) -> tuple:
         """Decode-cache seed for the plain block: just the KV cache. No NMM
-        conv buffer (the block has no NMM). Returned tuple shape matches
-        TitansMAGBlock's so the model's per-block decode loop is uniform —
-        the third slot is None.
+        state involvement. Signature mirrors `TitansMAGBlock.init_decode_cache`
+        so the model's per-block decode loop is uniform.
 
         `int8_kv_cache=True` returns `KVCacheInt8` containers (G279) for
         the K and V caches; the rest of the block API is dtype-agnostic.
@@ -321,7 +320,7 @@ class PlainGPT2Block(nn.Module):
         B, T, _ = x_prompt.shape
         x_norm = self.ln_1(x_prompt)
         k_cache, v_cache = self.attn.project_kv(x_norm, int8_kv_cache=int8_kv_cache)
-        return k_cache, v_cache, None
+        return k_cache, v_cache
 
     def forward_step(
         self,
@@ -329,7 +328,6 @@ class PlainGPT2Block(nn.Module):
         nmm_state,  # ignored (None)
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        nmm_conv_buffer,  # ignored (None)
     ) -> tuple:
         """Single-token decode through a plain block."""
         x_norm = self.ln_1(x_new)
@@ -340,18 +338,24 @@ class PlainGPT2Block(nn.Module):
         )
         x = x_new + y_attn
         x = x + self.mlp(self.ln_2(x))
-        return x, None, new_k_cache, new_v_cache, None
+        return x, None, new_k_cache, new_v_cache
 
 
 class TitansMAGBlock(nn.Module):
     """One transformer block with persistent prefix + NMM combined via MAG gate.
 
-    Block flow:
-      x_aug    = concat([persistent_mem, x], dim=T)
-      y_attn   = attn(ln_1(x_aug), mask=block-structured causal)[:, N_p:, :]
-      y_mem, s = nmm.forward_chunk(ln_nmm(x), nmm_state, doc_boundaries)
-      o        = MAG-gate(y_attn, y_mem)                  # mode-dependent
-      x        = x + o + mlp(ln_2(x + o))
+    Block flow (paper-strict default — `feed_persistent_to_nmm=True`):
+      x_aug      = concat([persistent_mem, x], dim=T)
+      y_attn     = attn(ln_1(x_aug), mask=block-structured causal)[:, N_p:, :]
+      y_mem_aug, s = nmm.forward_chunk(ln_nmm(x_aug), state, db_aug)
+      y_mem      = y_mem_aug[:, N_p:, :]
+      o          = MAG-gate(y_attn, y_mem)              # mode-dependent
+      x          = x + o + mlp(ln_2(x + o))
+
+    With `feed_persistent_to_nmm=False` (lucidrains-flavored) the NMM is fed
+    only `ln_nmm(x)` (real tokens) and `doc_boundaries` is passed verbatim;
+    no output slice. This is a slight memory win but updates memory only on
+    real tokens.
 
     The mask is built block-structured:
       persistent <-> persistent : open
@@ -359,10 +363,6 @@ class TitansMAGBlock(nn.Module):
       real        -> persistent : open
       real        -> real       : standard upper-triangular causal
                                   (plus banded-far-past mask when use_swa)
-
-    NMM is fed only `ln_nmm(x)` (real tokens), not the persistent-augmented
-    `x_aug`. Persistent tokens are input-independent; updating memory on
-    them would add noise without semantic benefit.
     """
 
     def __init__(self, config):
@@ -372,14 +372,26 @@ class TitansMAGBlock(nn.Module):
         self.use_swa = config.use_swa
         self.swa_window = config.swa_window
         # Paper Eq. 28 says M(x̃) — feed persistent-augmented input to NMM.
-        # Default False (our lucidrains-flavored choice): NMM sees only real
-        # tokens. True = paper-strict.
+        # Config default True = paper-strict (feed ln_nmm(x_aug) to NMM, slice
+        # the persistent prefix off the output, augment doc_boundaries with a
+        # False prefix). Flip to False for the lucidrains-flavored "real
+        # tokens only" path: NMM sees ln_nmm(x) and never updates on
+        # persistent positions.
         self.feed_persistent_to_nmm = config.feed_persistent_to_nmm
 
-        # Small init like GPT-2 wte; learned, no weight decay (routed in §4.1).
-        self.persistent_mem = nn.Parameter(
-            torch.randn(config.nmm_n_persistent, config.n_embd) * 0.02
-        )
+        # persistent_prefix_mode controls whether THIS block owns its own
+        # learned prefix (`per_block`) or whether the prefix is model-wide
+        # and arrives pre-prepended in the input (`model_wide`, default,
+        # paper Eq. 19). In `model_wide` mode the block does no prepend /
+        # slice — its forward receives [B, N_p+T, d] and produces the same
+        # shape unchanged.
+        self.persistent_prefix_mode = config.persistent_prefix_mode
+        if self.persistent_prefix_mode == "per_block":
+            # Small init like GPT-2 wte; learned, no weight decay (routed
+            # in §4.1).
+            self.persistent_mem = nn.Parameter(
+                torch.randn(config.nmm_n_persistent, config.n_embd) * 0.02
+            )
 
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(
@@ -434,7 +446,10 @@ class TitansMAGBlock(nn.Module):
         dtype matches x.dtype to avoid an implicit cast inside
         scaled_dot_product_attention under autocast.
         """
-        device = self.persistent_mem.device
+        # `persistent_mem` only exists in per_block mode (in model_wide
+        # mode the prefix lives on `TitansMAGGPT2`). Use a Parameter that's
+        # always present on the block — `ln_1.weight` works for both modes.
+        device = self.ln_1.weight.device
         N = self.N_p + T
         mask = torch.full((N, N), float("-inf"), device=device, dtype=dtype)
         mask[: self.N_p, : self.N_p] = 0
@@ -455,85 +470,122 @@ class TitansMAGBlock(nn.Module):
         return mask
 
     def forward(self, x: torch.Tensor, nmm_state, doc_boundaries=None):
-        B, T, _ = x.shape
-        x_aug = cat([self.persistent_mem.expand(B, -1, -1), x], dim=1)
-        y_attn = self.attn(
-            self.ln_1(x_aug), mask=self._aug_mask(T, dtype=x.dtype)
-        )[:, self.N_p :, :]
+        B, T_in, _ = x.shape
 
+        if self.persistent_prefix_mode == "per_block":
+            # Per-block: prepend this block's persistent_mem; slice persistent
+            # positions off the attention output before the residual / MAG /
+            # MLP. T_real == T_in.
+            x_aug = cat([self.persistent_mem.expand(B, -1, -1), x], dim=1)
+            T_real = T_in
+            mode_model_wide = False
+        else:
+            # Model-wide: x already includes the persistent prefix at
+            # positions [0, N_p). The block doesn't prepend or slice — the
+            # persistent positions stay in the residual through this block
+            # and accumulate information from real tokens.
+            x_aug = x
+            T_real = T_in - self.N_p
+            mode_model_wide = True
+
+        y_attn_aug = self.attn(
+            self.ln_1(x_aug), mask=self._aug_mask(T_real, dtype=x.dtype),
+        )
+
+        # NMM input + doc_boundaries handling per (feed_persistent_to_nmm,
+        # persistent_prefix_mode).
         if self.feed_persistent_to_nmm:
-            # Paper Eq. 28 strict: M(x̃). Feed the persistent-augmented input
-            # through ln_nmm + NMM; slice the persistent prefix off the OUTPUT
-            # so the residual stream only sees y_mem for real tokens.
-            # doc_boundaries must also gain a False prefix (persistent
-            # positions never trigger doc resets — they're input-independent
-            # and identical across documents).
-            if doc_boundaries is not None:
-                db_aug = cat(
-                    [torch.zeros(B, self.N_p, dtype=torch.bool, device=x.device),
-                     doc_boundaries], dim=1,
+            # NMM sees the persistent-augmented input (paper Eq. 28).
+            if mode_model_wide:
+                # doc_boundaries was augmented at the model level.
+                db_for_nmm = doc_boundaries
+            else:
+                # Per-block: augment locally with a False prefix.
+                if doc_boundaries is not None:
+                    db_for_nmm = cat(
+                        [torch.zeros(B, self.N_p, dtype=torch.bool, device=x.device),
+                         doc_boundaries], dim=1,
+                    )
+                else:
+                    db_for_nmm = None
+            y_mem_aug, nmm_state = self.nmm.forward_chunk(
+                self.ln_nmm(x_aug), nmm_state, db_for_nmm,
+            )
+        else:
+            # NMM sees only real tokens.
+            if mode_model_wide:
+                x_real = x_aug[:, self.N_p:, :]
+                db_real = (
+                    doc_boundaries[:, self.N_p:]
+                    if doc_boundaries is not None else None
                 )
             else:
-                db_aug = None
-            y_mem_full, nmm_state = self.nmm.forward_chunk(
-                self.ln_nmm(x_aug), nmm_state, db_aug,
+                x_real = x
+                db_real = doc_boundaries
+            y_mem_real, nmm_state = self.nmm.forward_chunk(
+                self.ln_nmm(x_real), nmm_state, db_real,
             )
-            y_mem = y_mem_full[:, self.N_p :, :]
-        else:
-            # Default: NMM sees only real tokens (lucidrains-flavored).
-            y_mem, nmm_state = self.nmm.forward_chunk(
-                self.ln_nmm(x), nmm_state, doc_boundaries,
-            )
+            # Pad to augmented shape so MAG composes; persistent positions
+            # get zero memory contribution (consistent with "NMM sees only
+            # real tokens").
+            if self.N_p > 0:
+                zero_persist = torch.zeros(
+                    B, self.N_p, y_mem_real.shape[-1],
+                    device=x.device, dtype=y_mem_real.dtype,
+                )
+                y_mem_aug = cat([zero_persist, y_mem_real], dim=1)
+            else:
+                y_mem_aug = y_mem_real
 
         if self.finetune_mode:
             # Additive gate: at out_scale=0 -> y_mem=0 -> o = y_attn exactly.
             # Pretrained GPT-2 residual preserved at init.
-            o = y_attn + F.silu(self.gamma_mem * y_mem) * y_attn
+            o_aug = y_attn_aug + F.silu(self.gamma_mem * y_mem_aug) * y_attn_aug
         else:
             # Paper's pure multiplicative gate (from-scratch only).
-            o = F.silu(self.gamma_attn * y_attn) * F.silu(self.gamma_mem * y_mem)
+            o_aug = F.silu(self.gamma_attn * y_attn_aug) * F.silu(self.gamma_mem * y_mem_aug)
 
-        x = x + o
-        x = x + self.mlp(self.ln_2(x))
-        return x, nmm_state
+        if mode_model_wide:
+            # MAG and MLP apply over the full augmented sequence; persistent
+            # positions evolve through the residual.
+            x_out = x_aug + o_aug
+            x_out = x_out + self.mlp(self.ln_2(x_out))
+        else:
+            # Slice persistent positions off before the residual on x (real
+            # tokens). Equivalent to the previous "slice y_attn / y_mem
+            # early and combine on real-token shape".
+            o = o_aug[:, self.N_p:, :]
+            x_out = x + o
+            x_out = x_out + self.mlp(self.ln_2(x_out))
+        return x_out, nmm_state
 
     def init_decode_cache(
         self, x_prompt: torch.Tensor, nmm_state: tuple, int8_kv_cache: bool = False,
     ) -> tuple:
-        """Seed the per-block decode caches from a warm-up prompt.
+        """Seed the per-block KV cache from a warm-up prompt.
 
-        Called once per block AFTER block.forward has already updated
-        nmm_state on the prompt. Computes:
-        - (k_cache, v_cache): K, V from attn over ln_1(x_aug_prompt),
-          length N_p + T_prompt — includes the persistent prefix.
-          When `int8_kv_cache=True`, returned as `KVCacheInt8` containers.
-        - nmm_conv_buffer: dict for NMM step_with_conv (last k-1 Linear
-          projections of ln_nmm(prompt)).
+        Called once per block BEFORE block.forward runs on the prompt
+        (caller's loop captures KV cache from the input then runs the
+        block, which mutates nmm_state). Returns (k_cache, v_cache).
 
-        x_prompt: [B, T, d] — the block's INPUT prompt (pre-block, not
-        post-block). nmm_state is the post-warmup NMM state.
-        Returns (k_cache, v_cache, nmm_conv_buffer).
+        Item 6: the NMM conv buffer is no longer captured here — it's
+        part of `nmm_state` and gets rolled forward naturally by
+        `block.forward` / `nmm.forward_chunk` during warm-up.
+
+        x_prompt: [B, T, d] — the block's INPUT prompt (pre-block).
+        Returns (k_cache, v_cache).
         """
-        B, T, _ = x_prompt.shape
-        # KV cache: project K, V from ln_1(x_aug) where x_aug includes the
-        # persistent prefix. Decode-time queries against this cache see the
-        # persistent positions exactly the way warm-up's attention saw them.
-        x_aug = cat([self.persistent_mem.expand(B, -1, -1), x_prompt], dim=1)
+        B, T_in, _ = x_prompt.shape
+        # In per_block mode the prompt arrives as real tokens; the block
+        # prepends its own persistent_mem here. In model_wide mode the
+        # prompt is already augmented at the model level.
+        if self.persistent_prefix_mode == "per_block":
+            x_aug = cat([self.persistent_mem.expand(B, -1, -1), x_prompt], dim=1)
+        else:
+            x_aug = x_prompt
         x_aug_norm = self.ln_1(x_aug)
         k_cache, v_cache = self.attn.project_kv(x_aug_norm, int8_kv_cache=int8_kv_cache)
-
-        # NMM conv buffer: last (k-1) Linear projections of ln_nmm input.
-        # Under feed_persistent_to_nmm, the conv must have seen the persistent
-        # prefix during warm-up — so we seed the buffer from ln_nmm(x_aug)
-        # (matching what _forward_chunk_sequential saw). Without this branch
-        # the decode-time conv would diverge from warm-up at exactly the
-        # boundary between persistent prefix and the new decoded token.
-        if self.feed_persistent_to_nmm:
-            x_nmm_norm = self.ln_nmm(x_aug)
-        else:
-            x_nmm_norm = self.ln_nmm(x_prompt)
-        nmm_conv_buffer = self.nmm.init_conv_buffer_from_prompt(x_nmm_norm)
-        return k_cache, v_cache, nmm_conv_buffer
+        return k_cache, v_cache
 
     def forward_step(
         self,
@@ -541,17 +593,17 @@ class TitansMAGBlock(nn.Module):
         nmm_state: tuple,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        nmm_conv_buffer: dict,
     ) -> tuple:
         """Single-token decode forward through one block.
 
-        x_new: [B, 1, d] — embedded new token (wte+wpe).
-        nmm_state: (M, S) from prior step.
-        k_cache, v_cache: [B, n_head, T_seen, head_dim] — prior K, V.
-        nmm_conv_buffer: dict from prior step.
+        Item 6: the NMM conv buffer is part of `nmm_state` now; no separate
+        `nmm_conv_buffer` argument. The signature shrinks correspondingly.
 
-        Returns (x_out [B, 1, d], new_nmm_state, new_k_cache, new_v_cache,
-        new_nmm_conv_buffer).
+        x_new: [B, 1, d] — embedded new token (wte+wpe).
+        nmm_state: (M, S, conv_buf) from prior step.
+        k_cache, v_cache: [B, n_head, T_seen, head_dim] — prior K, V.
+
+        Returns (x_out [B, 1, d], new_nmm_state, new_k_cache, new_v_cache).
         """
         # Attention via KV cache. ln_1 on the new token; no x_aug concat
         # (persistent prefix is already in the cache). Forward the SWA
@@ -565,10 +617,9 @@ class TitansMAGBlock(nn.Module):
         )
 
         # NMM via step_with_conv: one update per token, full conv context.
+        # conv_buf inside nmm_state rolls automatically.
         x_norm_nmm = self.ln_nmm(x_new).squeeze(1)  # [B, d]
-        y_mem_t, new_nmm_state, new_nmm_conv_buffer = self.nmm.step_with_conv(
-            x_norm_nmm, nmm_state, nmm_conv_buffer
-        )
+        y_mem_t, new_nmm_state = self.nmm.step_with_conv(x_norm_nmm, nmm_state)
         y_mem = y_mem_t.unsqueeze(1)  # [B, 1, d]
 
         if self.finetune_mode:
@@ -578,4 +629,4 @@ class TitansMAGBlock(nn.Module):
 
         x = x_new + o
         x = x + self.mlp(self.ln_2(x))
-        return x, new_nmm_state, new_k_cache, new_v_cache, new_nmm_conv_buffer
+        return x, new_nmm_state, new_k_cache, new_v_cache

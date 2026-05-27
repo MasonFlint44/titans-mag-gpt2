@@ -219,7 +219,7 @@ def test_prepare_decode_chunked_honors_initial_nmm_states():
     # Build a deliberately non-init state.
     custom_states = []
     for block in model.blocks:
-        M, S = block.nmm.init_state(B=1, device=torch.device("cpu"))
+        M, S, _ = block.nmm.init_state(B=1, device=torch.device("cpu"))
         # Perturb M so it's distinguishable from init.
         for k in M:
             M[k] = M[k] + torch.full_like(M[k], 7.0)

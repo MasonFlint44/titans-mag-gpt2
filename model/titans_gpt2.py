@@ -30,6 +30,21 @@ class TitansMAGGPT2(nn.Module):
         self.wpe = nn.Embedding(config.block_size, config.n_embd)
         self.drop = nn.Dropout(config.dropout)
 
+        # Paper Eq. 19 persistent-memory prefix at the model level. One set
+        # of learned tokens prepended ONCE to wte+wpe; persistent positions
+        # then propagate through every block's residual stream and pick up
+        # information from real tokens at each layer. Sliced off before
+        # ln_f / LM head so logits are only over real-token positions.
+        # In "per_block" mode this is absent and each block owns its own
+        # smaller prefix.
+        self._model_wide_persistent = (
+            config.persistent_prefix_mode == "model_wide"
+        )
+        if self._model_wide_persistent:
+            self.persistent_mem = nn.Parameter(
+                torch.randn(config.nmm_n_persistent, config.n_embd) * 0.02
+            )
+
         # Determine which blocks get the full TitansMAGBlock (with NMM /
         # persistent / MAG gate) vs. PlainGPT2Block (attn + MLP only).
         # nmm_layer_indices=None means every block has NMM (default,
@@ -107,6 +122,19 @@ class TitansMAGGPT2(nn.Module):
         pos = torch.arange(0, T, device=idx.device)
         x = self.drop(self.wte(idx) + self.wpe(pos))
 
+        # Model-wide persistent prefix (paper Eq. 19): prepend ONCE here.
+        # Each block sees the augmented sequence; the prefix accumulates
+        # information from real tokens at every layer via the residual
+        # stream. doc_boundaries is augmented in parallel with a False
+        # prefix so persistent positions never trigger NMM resets.
+        N_p = self.config.nmm_n_persistent
+        if self._model_wide_persistent and N_p > 0:
+            persistent = self.persistent_mem.unsqueeze(0).expand(B, -1, -1)
+            x = torch.cat([persistent, x], dim=1)
+            if doc_boundaries is not None:
+                pad = torch.zeros(B, N_p, dtype=torch.bool, device=idx.device)
+                doc_boundaries = torch.cat([pad, doc_boundaries], dim=1)
+
         if nmm_states is None:
             # Plain blocks have no NMM — their slot is None. The per-block
             # forward signature is uniform; PlainGPT2Block ignores the state.
@@ -119,6 +147,11 @@ class TitansMAGGPT2(nn.Module):
         for block, nmm_state in zip(self.blocks, nmm_states):
             x, nmm_state = block(x, nmm_state, doc_boundaries)
             new_nmm_states.append(nmm_state)
+
+        # Slice persistent positions off before ln_f / LM head — logits
+        # are only over real-token positions.
+        if self._model_wide_persistent and N_p > 0:
+            x = x[:, N_p:, :]
 
         x = self.ln_f(x)
         logits = x @ self.wte.weight.T  # tied weights
@@ -139,15 +172,15 @@ class TitansMAGGPT2(nn.Module):
         persistent prefix at positions 0..N_p-1.
 
         prompt_idx: [B, P] token ids. P must be <= block_size.
-        initial_nmm_states: optional list[n_layer] of (M, S) — for long
-        prompts where an earlier chunked warm-up established NMM state
-        that this prepare_decode call should continue from.
+        initial_nmm_states: optional list[n_layer] of (M, S, conv_buf) —
+        for long prompts where an earlier chunked warm-up established NMM
+        state that this prepare_decode call should continue from.
 
         Returns dict:
           last_logits:  [B, 1, vocab_size]
-          nmm_states:   list[n_layer] of (M, S)
+          nmm_states:   list[n_layer] of (M, S, conv_buf) (item 6 —
+                        conv buffer is folded into per-layer state)
           kv_caches:    list[n_layer] of (k_cache, v_cache)
-          nmm_conv_buffers: list[n_layer] of dict {'q', 'k', 'v'}
           position:     int — position index of the next decoded token
                         (= prompt length P)
         """
@@ -180,6 +213,15 @@ class TitansMAGGPT2(nn.Module):
 
         pos = torch.arange(0, P, device=prompt_idx.device)
         x = self.drop(self.wte(prompt_idx) + self.wpe(pos))
+
+        # Model-wide persistent prefix: prepend ONCE at the model level so
+        # every block sees the augmented sequence. The KV caches captured
+        # by `init_decode_cache` will then include the persistent positions
+        # naturally; `forward_step` only feeds new real tokens.
+        N_p = self.config.nmm_n_persistent
+        if self._model_wide_persistent and N_p > 0:
+            persistent = self.persistent_mem.unsqueeze(0).expand(B, -1, -1)
+            x = torch.cat([persistent, x], dim=1)
 
         if initial_nmm_states is None:
             nmm_states = [
@@ -224,18 +266,22 @@ class TitansMAGGPT2(nn.Module):
                     )
                 break  # one non-None layer is enough to verify B
         kv_caches = []
-        nmm_conv_buffers = []
         for block, nmm_state in zip(self.blocks, nmm_states):
-            # Capture decode caches BEFORE the block mutates x — they're
-            # functions of the block's INPUT, not its output.
-            k_cache, v_cache, conv_buf = block.init_decode_cache(
+            # Capture KV cache BEFORE the block mutates x — the cache is
+            # a function of the block's INPUT, not its output. NMM conv
+            # buffer is part of nmm_state now (item 6); it gets rolled
+            # forward naturally by `block(x, nmm_state, None)`.
+            k_cache, v_cache = block.init_decode_cache(
                 x, nmm_state, int8_kv_cache=int8_kv_cache,
             )
             kv_caches.append((k_cache, v_cache))
-            nmm_conv_buffers.append(conv_buf)
             x, nmm_state = block(x, nmm_state, None)
             nmm_states[len(kv_caches) - 1] = nmm_state
 
+        # Slice persistent positions off before ln_f (model_wide only;
+        # per_block mode has already produced real-token-only output).
+        if self._model_wide_persistent and N_p > 0:
+            x = x[:, N_p:, :]
         x = self.ln_f(x)
         logits = x @ self.wte.weight.T
         last_logits = logits[:, -1:, :]
@@ -243,7 +289,6 @@ class TitansMAGGPT2(nn.Module):
             "last_logits": last_logits,
             "nmm_states": nmm_states,
             "kv_caches": kv_caches,
-            "nmm_conv_buffers": nmm_conv_buffers,
             "position": P,
         }
 
@@ -350,19 +395,16 @@ class TitansMAGGPT2(nn.Module):
 
         new_nmm_states = []
         new_kv_caches = []
-        new_nmm_conv_buffers = []
         for i, block in enumerate(self.blocks):
             k_cache, v_cache = cache["kv_caches"][i]
-            x, nmm_state, k_cache, v_cache, conv_buf = block.forward_step(
+            x, nmm_state, k_cache, v_cache = block.forward_step(
                 x,
                 cache["nmm_states"][i],
                 k_cache,
                 v_cache,
-                cache["nmm_conv_buffers"][i],
             )
             new_nmm_states.append(nmm_state)
             new_kv_caches.append((k_cache, v_cache))
-            new_nmm_conv_buffers.append(conv_buf)
 
         x = self.ln_f(x)
         logits = x @ self.wte.weight.T  # [B, 1, vocab_size]
@@ -370,7 +412,6 @@ class TitansMAGGPT2(nn.Module):
             "last_logits": logits,
             "nmm_states": new_nmm_states,
             "kv_caches": new_kv_caches,
-            "nmm_conv_buffers": new_nmm_conv_buffers,
             "position": pos_idx + 1,
         }
         return logits, new_cache

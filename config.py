@@ -74,6 +74,29 @@ class TitansConfig:
     feed_persistent_to_nmm: bool = True
     nmm_n_heads: int = 1
 
+    # persistent_prefix_mode: where the learned persistent-memory prefix P
+    # lives. Paper Eq. 19 defines ONE prefix prepended to the input
+    # sequence; the resulting persistent positions propagate through all
+    # transformer blocks via the residual stream, accumulating information
+    # from real tokens at every layer.
+    #
+    # "model_wide" (default, paper-strict): a single Parameter
+    #   `TitansMAGGPT2.persistent_mem` of shape [N_p, n_embd]. Prepended
+    #   ONCE after wte+wpe, sliced off before ln_f / LM head. Blocks see
+    #   the augmented sequence as-is; they don't own a persistent prefix
+    #   of their own. Total persistent params: N_p * n_embd.
+    #
+    # "per_block": each TitansMAGBlock owns its own `persistent_mem`
+    #   Parameter of shape [N_p, n_embd]. Prepended at block input, sliced
+    #   off block output. Persistent positions DO NOT accumulate
+    #   cross-block — each block sees its own fresh input-independent
+    #   prefix. Total persistent params: N_p * n_embd * n_layer.
+    #
+    # Lucidrains' `persistent_memory` is a third variant (per-block,
+    # per-head, attention-internal K/V cache, never in the residual
+    # stream); not exposed here.
+    persistent_prefix_mode: str = "model_wide"
+
     # Memory-saving knobs (G256). Defaults preserve the original
     # fp32 / no-checkpoint behavior; flip when you hit OOM training the
     # NMM with realistic chunk sizes.
@@ -378,6 +401,14 @@ class TitansConfig:
         if self.nmm_n_persistent < 0:
             raise ValueError(
                 f"nmm_n_persistent must be >= 0 (got {self.nmm_n_persistent})"
+            )
+
+        if self.persistent_prefix_mode not in ("model_wide", "per_block"):
+            raise ValueError(
+                f"persistent_prefix_mode must be 'model_wide' or 'per_block' "
+                f"(got {self.persistent_prefix_mode!r}). Default is "
+                f"'model_wide' (paper Eq. 19); use 'per_block' for the "
+                f"legacy per-block prefix layout."
             )
 
         if self.nmm_expansion < 1:

@@ -131,7 +131,7 @@ def test_build_init_M_is_cloned_not_a_view():
 
 def test_init_state_returns_M_and_zero_S():
     nmm = NeuralMemoryModule(n_embd=8, expansion=2)
-    M, S = nmm.init_state(B=2, device=torch.device("cpu"))
+    M, S, _ = nmm.init_state(B=2, device=torch.device("cpu"))
     assert set(M.keys()) == set(S.keys())
     for k in M:
         assert M[k].shape == S[k].shape
@@ -140,7 +140,7 @@ def test_init_state_returns_M_and_zero_S():
 
 def test_init_state_shapes_match_build_init_M():
     nmm = NeuralMemoryModule(n_embd=16, expansion=4)
-    M, S = nmm.init_state(B=2, device=torch.device("cpu"))
+    M, S, _ = nmm.init_state(B=2, device=torch.device("cpu"))
     M_direct = nmm._build_init_M(B=2, device=torch.device("cpu"))
     for k in M:
         assert M[k].shape == M_direct[k].shape

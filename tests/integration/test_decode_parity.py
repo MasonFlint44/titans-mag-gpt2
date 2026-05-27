@@ -36,15 +36,19 @@ def test_prepare_decode_returns_expected_structure():
     prompt = torch.randint(0, cfg.vocab_size, (1, 8))
     with torch.no_grad():
         cache = model.prepare_decode(prompt)
+    # Item 6: the conv buffer was folded into nmm_states; the separate
+    # `nmm_conv_buffers` cache entry no longer exists.
     assert set(cache.keys()) == {
-        "last_logits", "nmm_states", "kv_caches",
-        "nmm_conv_buffers", "position",
+        "last_logits", "nmm_states", "kv_caches", "position",
     }
     assert cache["last_logits"].shape == (1, 1, cfg.vocab_size)
     assert cache["position"] == 8
     assert len(cache["nmm_states"]) == cfg.n_layer
     assert len(cache["kv_caches"]) == cfg.n_layer
-    assert len(cache["nmm_conv_buffers"]) == cfg.n_layer
+    # Each NMM-block state is the triple (M, S, conv_buf).
+    for st in cache["nmm_states"]:
+        if st is not None:
+            assert len(st) == 3
 
 
 def test_prepare_decode_kv_cache_includes_persistent_prefix():

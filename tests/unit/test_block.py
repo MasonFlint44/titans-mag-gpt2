@@ -8,7 +8,12 @@ from model.block import TitansMAGBlock
 
 
 def _cfg(finetune_mode=True, N_p=2, T=8, use_swa=False, n_embd=8, n_head=2,
-         feed_persistent_to_nmm=True, retrieval_from_M_prev=True):
+         feed_persistent_to_nmm=True, retrieval_from_M_prev=True,
+         persistent_prefix_mode="per_block"):
+    # Default `persistent_prefix_mode="per_block"` for the block-level tests
+    # so `TitansMAGBlock` owns its own `persistent_mem` (the tests probe
+    # block.persistent_mem.grad and similar). Model-wide mode is exercised
+    # at the TitansMAGGPT2 level in test_full_model.
     return TitansConfig(
         n_layer=1, n_head=n_head, n_embd=n_embd, vocab_size=16,
         block_size=64, chunk_size=T, dropout=0.0,
@@ -17,6 +22,7 @@ def _cfg(finetune_mode=True, N_p=2, T=8, use_swa=False, n_embd=8, n_head=2,
         finetune_mode=finetune_mode,
         feed_persistent_to_nmm=feed_persistent_to_nmm,
         retrieval_from_M_prev=retrieval_from_M_prev,
+        persistent_prefix_mode=persistent_prefix_mode,
     )
 
 
@@ -49,7 +55,10 @@ def test_block_separate_ln_nmm_in_state_dict():
 
 
 def test_block_is_differentiable():
-    cfg = _cfg(finetune_mode=False)  # so output isn't pure-residual at init
+    # Use per_block persistent mode so the block has its own persistent_mem
+    # (item 7a: default is now model_wide; the block-level test of grad
+    # flow needs per_block to put the Parameter on the block).
+    cfg = _cfg(finetune_mode=False, persistent_prefix_mode="per_block")
     block = TitansMAGBlock(cfg)
     state = block.nmm.init_state(B=2, device=torch.device("cpu"))
     x = torch.randn(2, 8, 8)
@@ -78,9 +87,12 @@ def test_block_doc_boundary_resets_nmm():
     cfg = _cfg(finetune_mode=False)
     block = TitansMAGBlock(cfg)
     state = block.nmm.init_state(B=2, device=torch.device("cpu"))
-    # Add some state perturbation in row 0.
-    state = ({k: state[0][k] + 1.0 for k in state[0]},
-             {k: state[1][k] + 0.5 for k in state[1]})
+    # State is now (M, S, conv_buf) per item 6; perturb M and S only.
+    state = (
+        {k: state[0][k] + 1.0 for k in state[0]},
+        {k: state[1][k] + 0.5 for k in state[1]},
+        state[2],
+    )
 
     x = torch.randn(2, 8, 8)
     db = torch.zeros(2, 8, dtype=torch.bool)
@@ -90,8 +102,11 @@ def test_block_doc_boundary_resets_nmm():
     # Make a fresh block + state (clone perturbed) without boundary.
     block2 = TitansMAGBlock(cfg)
     block2.load_state_dict(block.state_dict())
-    state2 = ({k: state[0][k].clone() for k in state[0]},
-              {k: state[1][k].clone() for k in state[1]})
+    state2 = (
+        {k: state[0][k].clone() for k in state[0]},
+        {k: state[1][k].clone() for k in state[1]},
+        {k: state[2][k].clone() for k in state[2]},
+    )
     y_noreset, _ = block2(x, nmm_state=state2, doc_boundaries=None)
     # Row 0 should diverge (state reset); row 1 should match (no boundary).
     assert not torch.allclose(y_reset[0], y_noreset[0], atol=1e-4)

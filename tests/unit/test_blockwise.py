@@ -716,7 +716,7 @@ def test_detach_state_between_blocks_zero_grad_on_state_in():
         # Build leaf tensors with requires_grad=True so backward populates
         # their .grad attribute directly (a `.clone().requires_grad_(True)`
         # tensor is a non-leaf and only stores .grad with .retain_grad()).
-        M, S = nmm.init_state(B, x.device)
+        M, S, _ = nmm.init_state(B, x.device)
         M = {k: v.detach().clone().requires_grad_(True) for k, v in M.items()}
         S = {k: v.detach().clone().requires_grad_(True) for k, v in S.items()}
         return (M, S)
@@ -1131,7 +1131,7 @@ def test_init_state_S_is_tuple_when_order_gt_1():
         spectral_norm=True, finetune_mode=False,
         momentum_order=3,
     )
-    M, S = nmm.init_state(B=2, device=torch.device("cpu"))
+    M, S, _ = nmm.init_state(B=2, device=torch.device("cpu"))
     assert isinstance(S, tuple)
     assert len(S) == 3
     for S_lvl in S:
@@ -1145,7 +1145,7 @@ def test_init_state_S_is_dict_when_order_eq_1():
         n_embd=16, expansion=2, kernel_size=2,
         spectral_norm=True, finetune_mode=False,
     )
-    M, S = nmm.init_state(B=2, device=torch.device("cpu"))
+    M, S, _ = nmm.init_state(B=2, device=torch.device("cpu"))
     assert isinstance(S, dict), f"expected dict, got {type(S).__name__}"
 
 
@@ -1245,7 +1245,7 @@ def test_momentum_order_2_through_full_model():
     for layer_state in st:
         if layer_state is None:
             continue
-        M, S = layer_state
+        M, S, _ = layer_state
         if isinstance(S, list):  # multi-head; not in this test cfg
             for hM, hS in zip([s[0] for s in layer_state], [s[1] for s in layer_state]):
                 assert isinstance(hS, tuple) and len(hS) == 2
@@ -1359,7 +1359,7 @@ def test_int8_init_state_has_scale_companions():
         spectral_norm=True, finetune_mode=False,
         state_dtype="int8", block_size=4,
     )
-    M, S = nmm.init_state(B=2, device=torch.device("cpu"))
+    M, S, _ = nmm.init_state(B=2, device=torch.device("cpu"))
     assert _is_int8_dict(M)
     assert _is_int8_dict(S)
     for k in nmm.state_keys:
@@ -1450,15 +1450,21 @@ def test_int8_state_rejects_sequential_path():
         nmm._forward_chunk_sequential(x, state, None)
 
 
-def test_int8_state_step_rejects():
+def test_int8_state_step_with_conv_rejects():
     nmm = NeuralMemoryModule(
         n_embd=16, expansion=2, kernel_size=2,
         spectral_norm=True, finetune_mode=False,
         state_dtype="int8", block_size=4,
     )
     state = nmm.init_state(2, torch.device("cpu"))
+    k = nmm.k_proj.conv.kernel_size
+    buf = {
+        "q": torch.zeros(2, k - 1, 16),
+        "k": torch.zeros(2, k - 1, 16),
+        "v": torch.zeros(2, k - 1, 16),
+    }
     with pytest.raises(NotImplementedError, match="int8"):
-        nmm.step(torch.randn(2, 16) * 0.3, state)
+        nmm.step_with_conv(torch.randn(2, 16) * 0.3, state, buf)
 
 
 def test_int8_state_memory_smaller_than_bf16():
@@ -1470,7 +1476,7 @@ def test_int8_state_memory_smaller_than_bf16():
             spectral_norm=True, finetune_mode=False,
             state_dtype=dtype, block_size=8,
         )
-        M, S = nmm.init_state(B=4, device=torch.device("cpu"))
+        M, S, _ = nmm.init_state(B=4, device=torch.device("cpu"))
         total = 0
         for k, v in M.items():
             total += v.element_size() * v.numel()

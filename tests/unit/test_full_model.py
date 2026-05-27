@@ -51,7 +51,7 @@ def test_forward_with_nmm_states_none_seeds_internally():
     assert len(states) == cfg.n_layer
     # Each layer's state is a (M, S) tuple of dicts.
     for s in states:
-        M, S = s
+        M, S, _ = s
         assert set(M.keys()) == {"W1.weight", "W_gate.weight", "W2.weight"}
 
 

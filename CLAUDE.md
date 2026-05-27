@@ -46,6 +46,12 @@ uv run pytest tests/parity/        # HF GPT-2 logit/perplexity parity
 uv run pytest tests/ddp/ -m ddp    # needs 2+ GPUs + torchrun
 ```
 
+> **Tests are slow while training is running.** Both share the local
+> GPU; expect pytest wall times to balloon (and possibly timeout) until
+> the training process exits. Either wait for training to finish, or
+> run a small focused subset (e.g. `uv run pytest tests/unit/test_optimizer.py`)
+> that doesn't need CUDA.
+
 Pytest markers: `slow`, `gpu`, `slow_gpu`, `ddp`, `compile`, `perf`. See
 `pyproject.toml` for definitions.
 
