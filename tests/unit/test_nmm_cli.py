@@ -80,7 +80,7 @@ def test_layer_indices_rejects_empty_string():
 
 
 def test_boolean_flags_default_false():
-    """The four `action='store_true'` flags must default to False, and only
+    """The `action='store_true'` flags must default to False, and only
     appear in the kwargs dict when explicitly set (the contract that lets
     TitansConfig defaults stand)."""
     args = _parse()
@@ -88,7 +88,6 @@ def test_boolean_flags_default_false():
     for k in (
         "nmm_detach_state_between_blocks",
         "nmm_compile_inner_loop",
-        "nmm_fused_kernel",
         "nmm_compile_ns5",
     ):
         assert k not in kwargs
@@ -106,11 +105,6 @@ def test_detach_state_round_trip():
 def test_compile_inner_loop_round_trip():
     args = _parse("--nmm-compile-inner-loop")
     assert nmm_kwargs_from_args(args) == {"nmm_compile_inner_loop": True}
-
-
-def test_fused_kernel_round_trip():
-    args = _parse("--nmm-fused-kernel")
-    assert nmm_kwargs_from_args(args) == {"nmm_fused_kernel": True}
 
 
 def test_compile_ns5_round_trip():

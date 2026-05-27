@@ -106,14 +106,6 @@ def add_nmm_args(parser: argparse.ArgumentParser) -> None:
              "training step.",
     )
     group.add_argument(
-        "--nmm-fused-kernel",
-        action="store_true",
-        help="Use the analytical inner gradient (model/nmm_fused.py) instead "
-             "of vmap(grad(...)) + autograd through NS5. ~5-15%% on top of "
-             "--nmm-compile-inner-loop; numerically locked to the reference "
-             "path by tests.",
-    )
-    group.add_argument(
         "--nmm-compile-ns5",
         action="store_true",
         help="Fused NS5 via torch.compile. No effect when "
@@ -193,8 +185,6 @@ def nmm_kwargs_from_args(args: argparse.Namespace) -> dict:
         kwargs["nmm_detach_state_between_blocks"] = True
     if args.nmm_compile_inner_loop:
         kwargs["nmm_compile_inner_loop"] = True
-    if args.nmm_fused_kernel:
-        kwargs["nmm_fused_kernel"] = True
     if args.nmm_compile_ns5:
         kwargs["nmm_compile_ns5"] = True
     if args.nmm_ns5_steps is not None:

@@ -631,7 +631,6 @@ class NeuralMemoryModule(nn.Module):
         retrieval_from_M_prev: bool = False,
         state_dtype: str = "fp32",
         low_rank=None,
-        fused_kernel: bool = False,
         compile_inner_loop: bool = False,
         softclamp_max=None,
         block_size: int = 1,
@@ -649,15 +648,15 @@ class NeuralMemoryModule(nn.Module):
         self.nmm_spectral_norm = spectral_norm
         self.finetune_mode = finetune_mode
         self.low_rank = low_rank
-        # When True, _run_inner_loop dispatches to the analytical-gradient
-        # fused path (model/nmm_fused.py) instead of vmap(grad(...)) +
-        # newton_schulz5. The reference path stays available for correctness
-        # comparisons (see tests/unit/test_nmm_fused.py).
-        self.fused_kernel = bool(fused_kernel)
+        # The analytical inner-gradient kernel (model/nmm_fused.py) is the
+        # only path on the sequential `block_size=1` recurrence — the
+        # earlier `fused_kernel` toggle is gone (always-on now). Decode
+        # paths (`step`, `step_with_conv`) still use the vmap-based
+        # `per_sample_grad_fn` reference because they fire once per token
+        # at inference time and aren't on any training hot path.
         # When True, _run_inner_loop is wrapped in `torch.compile(mode="default")`
-        # after construction. Independent of `fused_kernel` — compile alone
-        # gives the dominant ~1.8x speedup; combining with `fused_kernel`
-        # adds a further ~5%.
+        # after construction. The dominant ~1.8x speedup on the sequential
+        # path; pays a 30-60 s warm-up on the first training step.
         self.compile_inner_loop = bool(compile_inner_loop)
         # Soft norm-clamp threshold applied to surprise gradients BEFORE NS5.
         # None = disabled (paper-strict). See `softclamp_grad_norm` docstring.
@@ -1126,15 +1125,14 @@ class NeuralMemoryModule(nn.Module):
             dict(zip(self.state_keys, init_M_flat))
             if (init_M_flat and init_M_flat[0] is not None) else None
         )
-        # Cache the analytical-path constants up front when the fused kernel
-        # is on so the per-token branch stays branch-free. Norm params are
-        # outer-trained (fp32) and shared across batch + time.
-        if self.fused_kernel:
-            _norm_w = self.memory_mlp.norm.weight
-            _norm_b = self.memory_mlp.norm.bias
-            _norm_eps = self.memory_mlp.norm.eps
-            # Match the cached-reduction contract from _make_grad_fn.
-            _reduction = "sum" if self.nmm_spectral_norm else "mean"
+        # Cache the analytical-path constants up front so the per-token
+        # branch stays branch-free. Norm params are outer-trained (fp32)
+        # and shared across batch + time.
+        _norm_w = self.memory_mlp.norm.weight
+        _norm_b = self.memory_mlp.norm.bias
+        _norm_eps = self.memory_mlp.norm.eps
+        # Match the reduction contract that the analytical kernel expects.
+        _reduction = "sum" if self.nmm_spectral_norm else "mean"
 
         y_list = []
         for t in range(T_seg):
@@ -1164,12 +1162,9 @@ class NeuralMemoryModule(nn.Module):
 
             M_prev = M
 
-            if self.fused_kernel:
-                g_t = _fused.analytical_inner_grad(
-                    M, k_hat_t, v_t, _norm_w, _norm_b, _norm_eps, _reduction,
-                )
-            else:
-                g_t = self.per_sample_grad_fn(M, k_hat_t, v_t)
+            g_t = _fused.analytical_inner_grad(
+                M, k_hat_t, v_t, _norm_w, _norm_b, _norm_eps, _reduction,
+            )
             if self.softclamp_max is not None:
                 g_t = {key: softclamp_grad_norm(g, self.softclamp_max) for key, g in g_t.items()}
             if self.nmm_spectral_norm:
@@ -1181,12 +1176,9 @@ class NeuralMemoryModule(nn.Module):
             M = _dict_add(_scale(1.0 - alpha_t, M), _S_top(S, N))
 
             M_for_retrieval = M_prev if self.retrieval_from_M_prev else M
-            if self.fused_kernel:
-                y_t = self.out_scale * _fused.batched_retrieve(
-                    M_for_retrieval, q_hat_t, _norm_w, _norm_b, _norm_eps,
-                )
-            else:
-                y_t = self.out_scale * self._batched_retrieve(M_for_retrieval, q_hat_t)
+            y_t = self.out_scale * _fused.batched_retrieve(
+                M_for_retrieval, q_hat_t, _norm_w, _norm_b, _norm_eps,
+            )
             y_list.append(y_t)
 
         y_seg = torch.stack(y_list, dim=1)
@@ -1621,7 +1613,6 @@ class MultiHeadNMM(nn.Module):
         retrieval_from_M_prev: bool = False,
         state_dtype: str = "fp32",
         low_rank=None,
-        fused_kernel: bool = False,
         compile_inner_loop: bool = False,
         softclamp_max=None,
         block_size: int = 1,
@@ -1665,7 +1656,6 @@ class MultiHeadNMM(nn.Module):
                 retrieval_from_M_prev=retrieval_from_M_prev,
                 state_dtype=state_dtype,
                 low_rank=low_rank,
-                fused_kernel=fused_kernel,
                 compile_inner_loop=compile_inner_loop,
                 softclamp_max=softclamp_max,
                 block_size=block_size,

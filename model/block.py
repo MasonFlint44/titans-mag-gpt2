@@ -398,7 +398,6 @@ class TitansMAGBlock(nn.Module):
             retrieval_from_M_prev=config.retrieval_from_M_prev,
             state_dtype=config.nmm_state_dtype,
             low_rank=config.nmm_low_rank,
-            fused_kernel=config.nmm_fused_kernel,
             compile_inner_loop=config.nmm_compile_inner_loop,
             softclamp_max=config.nmm_softclamp_max,
             block_size=config.nmm_block_size,

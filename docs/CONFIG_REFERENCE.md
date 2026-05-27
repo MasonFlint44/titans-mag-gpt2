@@ -140,7 +140,6 @@ passed to `TitansConfig`. Quick reference:
 | `--nmm-layer-indices I,J,K` | csv ints | Subset of blocks that get NMM (others become plain GPT-2 blocks) |
 | `--nmm-detach-state-between-blocks` | flag | Truncated BPTT at block boundaries (requires `--nmm-block-size > 1`) |
 | `--nmm-compile-inner-loop` | flag | torch.compile the inner loop (~1.7× speedup, 30-60s first-step warm-up) |
-| `--nmm-fused-kernel` | flag | Analytical inner gradient (~5-15% on top of `--nmm-compile-inner-loop`) |
 | `--nmm-compile-ns5` | flag | Fused NS5 via torch.compile (no effect when `--nmm-compile-inner-loop` is set) |
 | `--nmm-ns5-steps N` | int | Newton-Schulz iteration count (default 5). **Lowering speeds up training significantly but drifts the spectral norm of NS5(g) — measured at gpt2_small: steps=4 ~16% faster + ~12% LR drift; steps=3 ~33% faster + ~20% LR drift.** Validate convergence on your data before lowering. |
 | `--nmm-use-gram-ns5` | flag | Replace stock NS5 with Tri Dao's Gram-Newton-Schulz (Dao-AILab/gram-newton-schulz). 2 rectangular matmuls + T iterations on the n×n Gram matrix, vs stock NS5's 2T rectangular matmuls. **Measured: ~15-20% speedup + ~2 GiB memory savings on the recommended recipe.** Requires `pip install gram-newton-schulz`, PyTorch 2.7+, CUDA 12.9+, and Hopper/Blackwell GPU. Overrides `--nmm-ns5-steps` and `--nmm-compile-ns5` (Gram-NS5 has its own coefficients and kernels). |
@@ -198,11 +197,10 @@ step, ~10 days for 50k steps.
 5. `--optim8bit` — 8-bit AdamW from `bitsandbytes`. ~1.2 GiB optimizer
    state savings on this model. Requires `pip install bitsandbytes`.
 
-**Note on `--nmm-compile-inner-loop` / `--nmm-fused-kernel`:** these flags
-only affect the per-token sequential path (`block_size=1`); they're
-silent no-ops on the blockwise path used here, and `--nmm-compile-inner-loop`
-in particular adds ~20 s of compile warm-up for zero runtime gain. Don't
-include them with this recipe — the config validator warns if you do.
+**Note on `--nmm-compile-inner-loop`:** only affects the per-token
+sequential path (`block_size=1`); silent no-op on the blockwise path
+used here, and adds ~20 s of compile warm-up for zero runtime gain.
+Don't include it with this recipe — the config validator warns if you do.
 
 ### Faster polar decomposition: `--nmm-use-gram-ns5`
 
@@ -342,21 +340,24 @@ the implementation changes.
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `nmm_compile_inner_loop` | `bool` | `False` | Wraps `_run_inner_loop` in `torch.compile(mode="default")`. Inductor traces the Python time loop and fuses adjacent ops into batched Triton kernels, eliminating the per-token dispatch overhead. **Dominant ~1.7× speedup** on its own. First step pays a one-time compile cost (~30-60 s); subsequent steps are fast. `mode="default"` (not `"reduce-overhead"`) because the inner loop builds new dicts each step which cudagraphs reject without explicit `cudagraph_mark_step_begin()` calls. |
-| `nmm_fused_kernel` | `bool` | `False` | Replaces `vmap(grad(inner_loss))` + autograd-through-NS5 with hand-derived analytical gradients (see `model/nmm_fused.py`). Adds **~5-15% on top of `compile_inner_loop`**. The hand-derived ops also trace more cleanly through Inductor than `torch.func.grad`. Correctness oracle is the reference path; `tests/unit/test_nmm_fused.py` locks the numerical match to fp32 round-off. |
+
+The analytical inner-gradient kernel (`model/nmm_fused.py`) is the only
+gradient path on the sequential `block_size=1` training loop — the
+earlier `nmm_fused_kernel` toggle is gone (always-on now). Hand-derived
+ops match the autograd reference within fp32 round-off;
+`tests/unit/test_nmm_fused.py` locks the numerical match. (The vmap-based
+`per_sample_grad_fn` reference still exists for decode-time
+`step` / `step_with_conv` use, but is no longer reachable from training.)
 
 **Measured impact** (RTX 5070 Ti, gpt2_small, bf16 autocast, end-to-end
 step with backward + Adam, `nmm_low_rank=64`, grad checkpoint on):
 
-| Config | T | B | Step time | tok/s | Speedup vs ref |
+| Config | T | B | Step time | tok/s | Speedup vs old reference path |
 |---|---|---|---|---|---|
-| reference | 256 | 1 | 40.0 s | 6.4 | 1.0× |
-| `+fused_kernel` | 256 | 1 | 33.2 s | 7.7 | 1.20× |
-| `+compile_inner_loop` | 256 | 1 | 21.9 s | 11.7 | **1.82×** |
-| `+fused_kernel +compile_inner_loop` | 256 | 1 | **21.0 s** | **12.2** | **1.90×** |
-| reference | 1024 | 1 | 158.1 s | 6.5 | 1.0× |
-| `+fused_kernel` | 1024 | 1 | 136.0 s | 7.5 | 1.16× |
-| `+compile_inner_loop` | 1024 | 1 | 93.0 s | 11.0 | **1.70×** |
-| `+fused_kernel +compile_inner_loop` | 1024 | 1 | **83.3 s** | **12.3** | **1.90×** |
+| analytical only (no compile) | 256 | 1 | 33.2 s | 7.7 | 1.20× |
+| `+compile_inner_loop` | 256 | 1 | **21.0 s** | **12.2** | **1.90×** |
+| analytical only (no compile) | 1024 | 1 | 136.0 s | 7.5 | 1.16× |
+| `+compile_inner_loop` | 1024 | 1 | **83.3 s** | **12.3** | **1.90×** |
 
 **Why isn't `compile_inner_loop` already 10×?** The remaining cost is
 the actual *compute* of the per-token NMM update plus the unavoidable
@@ -519,9 +520,12 @@ For long-context generation (e.g., 8K tokens cached across 12 layers), this is ~
 
 ---
 
-**Recommended starting point for T ≥ 256 training:** enable
-`nmm_compile_inner_loop` and `nmm_fused_kernel`. Net cost: one-time
-~30 s compile at first iteration, then ~1.9× faster forever.
+**Recommended starting point for T ≥ 256 training:** the analytical
+inner gradient is always on; enabling `nmm_compile_inner_loop` adds the
+big sequential-path speedup. Net cost: one-time ~30 s compile at first
+iteration, then ~1.9× faster forever. (Most users want the blockwise
+path with `nmm_block_size=64` instead — see the earlier table for the
+~45× speedup that delivers.)
 
 ```python
 TitansConfig.gpt2_small(
@@ -529,8 +533,7 @@ TitansConfig.gpt2_small(
     nmm_state_dtype="bf16",
     nmm_block_size=64,
     nmm_low_rank=64,
-    nmm_compile_inner_loop=True,    # the big speedup
-    nmm_fused_kernel=True,          # +5% on top, free correctness oracle
+    nmm_compile_inner_loop=True,    # only meaningful at nmm_block_size=1
 )
 ```
 

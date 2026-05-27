@@ -11,7 +11,9 @@ from typing import Optional
 # strand users on their old checkpoints. Keys NOT in this set are still
 # rejected loudly (typo / schema mismatch). Append to this set as knobs
 # are removed; never remove entries.
-_REMOVED_CONFIG_KEYS: frozenset = frozenset({})
+_REMOVED_CONFIG_KEYS: frozenset = frozenset({
+    "nmm_fused_kernel",          # removed: analytical inner gradient is now always-on
+})
 
 
 @dataclass
@@ -348,9 +350,7 @@ class TitansConfig:
     # — at gpt2_small, T=256, low_rank=64 it cuts step time ~1.8x (40s -> 22s
     # on RTX 5070 Ti). Inductor traces the Python time loop and fuses
     # adjacent ops into batched Triton kernels, eliminating the per-token
-    # dispatch overhead that dominates the reference path. Composes with
-    # nmm_fused_kernel for an extra ~5% on top of compile alone (the
-    # analytical-gradient ops trace more cleanly than `torch.func.grad`).
+    # dispatch overhead that dominates the reference path.
     #
     # Why not mode="reduce-overhead" (which enables cudagraphs): the inner
     # loop builds new dicts each step (`{k: a + b for k, b in ...}`) which
@@ -359,22 +359,6 @@ class TitansConfig:
     # Default mode is the safe + always-works choice; future work could
     # rewrite the loop to use pre-allocated buffers for reduce-overhead.
     nmm_compile_inner_loop: bool = False
-
-    # nmm_fused_kernel (G264): swap the per-token NMM inner update from the
-    # reference `vmap(grad(...)) + newton_schulz5` path to a fused
-    # implementation that uses analytical inner gradients (no `torch.func.grad`
-    # overhead) and an analytical NS5 backward. Optionally dispatches into a
-    # Triton kernel when CUDA is available, otherwise falls back to the
-    # analytical-PyTorch path (still ~5-20x faster than the reference).
-    #
-    # The reference path remains the correctness oracle — equivalence tests
-    # in `tests/unit/test_nmm_fused.py` lock the numerical match to within
-    # fp32/bf16 tolerance. Default False so users opt into the optimization
-    # explicitly; flip to True for any T >= 256 training run.
-    #
-    # Composes with every existing memory knob (nmm_low_rank,
-    # nmm_state_dtype="bf16", nmm_layer_indices).
-    nmm_fused_kernel: bool = False
 
     # nmm_low_rank (G262): factor the MemoryMLP weights as A @ B with an
     # intermediate dim of `nmm_low_rank`. At gpt2_small d=768, default
@@ -558,19 +542,17 @@ class TitansConfig:
                 "engagement) or set nmm_detach_state_between_blocks=False."
             )
 
-        # nmm_compile_inner_loop / nmm_fused_kernel only affect
-        # `_run_inner_loop`, which is the SEQUENTIAL path (`block_size=1`).
-        # On the blockwise path (`_forward_chunk_blockwise`) they're silent
-        # no-ops — bench-confirmed: all four combinations within 1% at
-        # block_size=64. The compile flag also costs ~20s of warm-up on the
-        # first step. Warn (not raise) so existing configs keep working;
-        # users can drop the flags or move to the sequential path.
+        # nmm_compile_inner_loop only affects `_run_inner_loop`, which is
+        # the SEQUENTIAL path (`block_size=1`). On the blockwise path
+        # (`_forward_chunk_blockwise`) it's a silent no-op — bench-confirmed
+        # within 1% at block_size=64. The compile flag also costs ~20s of
+        # warm-up on the first step. Warn (not raise) so existing configs
+        # keep working; users can drop the flag or move to the sequential
+        # path.
         if self.nmm_block_size > 1:
             wasted = []
             if self.nmm_compile_inner_loop:
                 wasted.append("nmm_compile_inner_loop")
-            if self.nmm_fused_kernel:
-                wasted.append("nmm_fused_kernel")
             if wasted:
                 warnings.warn(
                     f"{', '.join(wasted)} only affect the sequential path "
