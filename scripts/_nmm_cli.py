@@ -125,11 +125,28 @@ def add_nmm_args(parser: argparse.ArgumentParser) -> None:
         help="Replace stock Newton-Schulz with Tri Dao's Gram-Newton-Schulz "
              "(Dao-AILab/gram-newton-schulz). Standard NS5 does 2T "
              "rectangular matmuls; Gram-NS5 does 2 rectangular + T cheap "
-             "n×n Gram-matrix iterations. Empirically measured 1.17-3.07× "
-             "speedup at gpt2_small dims on consumer Blackwell (RTX 5070 Ti). "
-             "Requires `pip install gram-newton-schulz` and PyTorch 2.7+ / "
-             "CUDA 12.9+ on a Hopper/Blackwell GPU. Overrides "
-             "--nmm-ns5-steps.",
+             "n×n Gram-matrix iterations. Not recommended for the default "
+             "recipe: Gram-NS5 only beats stock NS5 at batch>=4; at batch=1 "
+             "(our block-aggregate NMM gradient) the CUDA kernel launch "
+             "overhead makes it ~1.75x SLOWER. Requires `pip install "
+             "gram-newton-schulz` and PyTorch 2.7+ / CUDA 12.9+ on a "
+             "Hopper/Blackwell GPU. Overrides --nmm-ns5-steps. Mutually "
+             "exclusive with --nmm-use-cans.",
+    )
+    group.add_argument(
+        "--nmm-use-cans",
+        action="store_true",
+        help="Replace stock Newton-Schulz with 3-step CANS-stationary "
+             "(arxiv 2506.10935). Same polynomial form as NS5 but with "
+             "(a, b, c) = (3.8641, -9.7196, 9.7101) — minimax-optimised "
+             "over the post-F-norm singular value range of gpt2_small NMM "
+             "gradients. At our recipe shapes (768x3072 and 3072x768, "
+             "batch=1) this gives ~4.6x better orthogonalisation error in "
+             "3 iterations than NS5 in 5, at ~1.6x the speed. No extra "
+             "dependency, no special GPU requirement. Coefficients are "
+             "recipe-specific — re-derive via scripts/benchmark_ns5.py if "
+             "you change d / expansion / low_rank. Overrides "
+             "--nmm-ns5-steps. Mutually exclusive with --nmm-use-gram-ns5.",
     )
 
 
@@ -171,4 +188,6 @@ def nmm_kwargs_from_args(args: argparse.Namespace) -> dict:
         kwargs["nmm_ns5_steps"] = args.nmm_ns5_steps
     if args.nmm_use_gram_ns5:
         kwargs["nmm_use_gram_ns5"] = True
+    if args.nmm_use_cans:
+        kwargs["nmm_use_cans"] = True
     return kwargs

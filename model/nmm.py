@@ -383,6 +383,55 @@ def newton_schulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.
     return G.to(orig_dtype)
 
 
+# Chebyshev-optimised Newton-Schulz (CANS), stationary 3-step variant.
+# arxiv 2506.10935 — same polynomial form as NS5 but with coefficients
+# minimax-optimised for the *actual* post-F-norm singular value range of the
+# inputs, instead of NS5's coefficients which are tuned for an idealised
+# fixed-point. Cheaper (3 iterations vs 5) and ~4.6× better orthogonalisation
+# error than NS5-5 at our NMM shapes.
+#
+# Coefficients derived via scipy.differential_evolution minimising
+# max|f^3(σ) - 1| over σ ∈ [0.0228, 0.0542] — the p10..max singular value
+# range observed on (768, 3072) and (3072, 768) post-F-norm-normalised
+# gradients (gpt2_small NMM MemoryMLP, full-rank). See
+# scripts/benchmark_ns5.py for the derivation script.
+#
+# Caveat: these coefficients are tuned for the gpt2_small NMM shape. At
+# larger d / different expansion / low-rank configurations the sv range
+# shifts and the polynomial may converge less cleanly — re-derive via
+# scripts/benchmark_ns5.py if you change the shape regime.
+_CANS_STATIONARY_3STEP_COEFS = (3.8641, -9.7196, 9.7101)
+_CANS_STATIONARY_3STEP_STEPS = 3
+
+
+def cans_stationary(G: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """3-step CANS-stationary iteration: same shape as NS5 but with
+    Chebyshev-optimised coefficients for the gpt2_small NMM sv range.
+
+    Step count (3) is baked into the coefficients — they're the LP-derived
+    minimax-optimal triple for *exactly* 3 iterations over the measured sv
+    range. Running for more or fewer steps with these coefficients is not
+    "CANS-k for k != 3"; it's CANS-3 truncated/extended, which performs
+    *worse* than NS5 (see scripts/benchmark_ns5.py).
+
+    Same fp32 autocast guard and transpose guard as `newton_schulz5`.
+    """
+    a, b, c = _CANS_STATIONARY_3STEP_COEFS
+    orig_dtype = G.dtype
+    with torch.amp.autocast(device_type=G.device.type, enabled=False):
+        G = G.float()
+        should_transpose = G.shape[-2] > G.shape[-1]
+        if should_transpose:
+            G = G.mT
+        G = G / (G.norm(dim=(-2, -1), keepdim=True) + eps)
+        for _ in range(_CANS_STATIONARY_3STEP_STEPS):
+            A = G @ G.mT
+            G = a * G + (b * A + c * (A @ A)) @ G
+        if should_transpose:
+            G = G.mT
+    return G.to(orig_dtype)
+
+
 # Tri Dao's Gram-Newton-Schulz: drop-in NS5 replacement that does most
 # work on the small Gram matrix instead of the rectangular input. ~1.17-
 # 3.07× speedup at gpt2_small dims on consumer Blackwell, claimed 42%
@@ -607,6 +656,7 @@ class NeuralMemoryModule(nn.Module):
         momentum_order: int = 1,
         ns5_steps: int = 5,
         use_gram_ns5: bool = False,
+        use_cans: bool = False,
     ):
         super().__init__()
         self.n_embd = n_embd
@@ -657,6 +707,12 @@ class NeuralMemoryModule(nn.Module):
             raise ValueError(f"momentum_order must be >= 1 (got {momentum_order})")
         self.momentum_order = int(momentum_order)
         self.use_gram_ns5 = bool(use_gram_ns5)
+        self.use_cans = bool(use_cans)
+        if self.use_gram_ns5 and self.use_cans:
+            raise ValueError(
+                "use_gram_ns5 and use_cans are mutually exclusive — both "
+                "replace the stock NS5 path. Pick one."
+            )
         # Number of Newton-Schulz iterations. 5 = paper-faithful (Muon
         # coefficients tuned for this fixed point); lower drifts the
         # spectral norm away from 1 (see config.nmm_ns5_steps docstring).
@@ -665,16 +721,29 @@ class NeuralMemoryModule(nn.Module):
         self.ns5_steps = int(ns5_steps)
         # Resolved NS5 callable — used by every path that applies NS5.
         # Bind `steps` here so call sites stay `self._ns5_fn(g)` with no
-        # extra argument threading. Two options:
-        #   1. use_gram_ns5=True → Tri Dao's Gram-NS5 (different algorithm,
-        #      Gram-NS5's own coefficient table — overrides ns5_steps)
-        #   2. default → plain stock NS5 with `ns5_steps` iterations
-        if self.use_gram_ns5:
+        # extra argument threading. Three options (mutually exclusive):
+        #   1. use_cans=True → 3-step CANS-stationary with coefficients tuned
+        #      for the gpt2_small NMM sv range. Best speed/quality at our
+        #      shapes (see scripts/benchmark_ns5.py). Ignores ns5_steps.
+        #   2. use_gram_ns5=True → Tri Dao's Gram-NS5 (different algorithm,
+        #      Gram-NS5's own coefficient table — overrides ns5_steps).
+        #   3. default → plain stock NS5 with `ns5_steps` iterations.
+        if self.use_cans:
+            # CANS-stationary has its step count and coefficients baked
+            # in — call it directly. Keep the closure shape compatible
+            # with the (_f, _s)-defaults convention used by the other
+            # branches so introspection tests still work.
+            _ns5_base = cans_stationary
+            _steps = _CANS_STATIONARY_3STEP_STEPS
+            self._ns5_fn = lambda g, _f=_ns5_base, _s=_steps: _f(g)
+        elif self.use_gram_ns5:
             _ns5_base = _get_gram_ns5_callable()
+            _steps = self.ns5_steps
+            self._ns5_fn = lambda g, _f=_ns5_base, _s=_steps: _f(g, steps=_s)
         else:
             _ns5_base = newton_schulz5
-        _steps = self.ns5_steps
-        self._ns5_fn = lambda g, _f=_ns5_base, _s=_steps: _f(g, steps=_s)
+            _steps = self.ns5_steps
+            self._ns5_fn = lambda g, _f=_ns5_base, _s=_steps: _f(g, steps=_s)
         # Paper Eq. 15: y_t = M(q_t) where M is M_{t-1} (read-then-write).
         # Default False = lucidrains "write-then-read" (retrieve from M_t).
         self.retrieval_from_M_prev = retrieval_from_M_prev
@@ -1562,6 +1631,7 @@ class MultiHeadNMM(nn.Module):
         momentum_order: int = 1,
         ns5_steps: int = 5,
         use_gram_ns5: bool = False,
+        use_cans: bool = False,
         per_head_learned_params: bool = True,
     ):
         super().__init__()
@@ -1603,6 +1673,7 @@ class MultiHeadNMM(nn.Module):
                 momentum_order=momentum_order,
                 ns5_steps=ns5_steps,
                 use_gram_ns5=use_gram_ns5,
+                use_cans=use_cans,
             )
             for _ in range(n_heads)
         ])

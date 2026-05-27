@@ -15,6 +15,7 @@ dependencies = [
     "datasets>=2.14",
     "numpy>=1.24",
     "tqdm>=4.66",
+    "scipy>=1.17.1",
 ]
 
 [project.optional-dependencies]

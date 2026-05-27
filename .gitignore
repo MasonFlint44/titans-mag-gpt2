@@ -52,6 +52,7 @@ corpora/
 # Experiment outputs (eval JSON + plots; regenerable from checkpoints)
 results/
 docs/figures/
+profiles/
 
 # Editor / OS
 .DS_Store

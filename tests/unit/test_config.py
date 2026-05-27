@@ -250,6 +250,70 @@ def test_use_gram_ns5_no_warn_with_default_knobs():
 
 
 # ---------------------------------------------------------------------------
+# nmm_use_cans — 3-step CANS-stationary (arxiv 2506.10935)
+# ---------------------------------------------------------------------------
+
+def test_use_cans_default_is_false():
+    """Default must be off so existing configs are unaffected. The recipe
+    opts in via the CLI flag; constructing TitansConfig() directly should
+    not change behavior."""
+    cfg = TitansConfig()
+    assert cfg.nmm_use_cans is False
+
+
+def test_use_cans_can_be_set_at_config_time():
+    cfg = TitansConfig(nmm_use_cans=True)
+    assert cfg.nmm_use_cans is True
+
+
+def test_use_cans_warns_when_overridden_knobs_set():
+    """ns5_steps is ignored under CANS — warn the user so a non-default
+    value doesn't silently disappear."""
+    with pytest.warns(UserWarning, match="nmm_use_cans=True overrides"):
+        TitansConfig(nmm_use_cans=True, nmm_ns5_steps=4)
+
+
+def test_use_cans_no_warn_with_default_knobs():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        TitansConfig(nmm_use_cans=True)  # default ns5_steps=5
+
+
+def test_use_cans_and_gram_ns5_mutually_exclusive():
+    """Both flags replace the stock NS5 path — must error rather than
+    silently picking one."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        TitansConfig(nmm_use_cans=True, nmm_use_gram_ns5=True)
+
+
+def test_use_cans_propagates_to_nmm():
+    """The config flag must actually flow through to NeuralMemoryModule
+    and switch the NS callable to CANS."""
+    from model.titans_gpt2 import TitansMAGGPT2
+    cfg = TitansConfig.gpt2_small(
+        n_layer=1, nmm_block_size=64,
+        nmm_detach_state_between_blocks=True,
+        nmm_use_cans=True,
+    )
+    m = TitansMAGGPT2(cfg)
+    assert m.blocks[0].nmm.use_cans is True
+    # Confirm the dispatch wired up the CANS callable rather than NS5.
+    # The CANS function lives in model.nmm; the lambda closure should
+    # call it. We test that the output differs from newton_schulz5 on
+    # the same input.
+    import torch
+    from model.nmm import newton_schulz5
+    torch.manual_seed(0)
+    g = torch.randn(768, 3072)
+    out_cans = m.blocks[0].nmm._ns5_fn(g)
+    out_ns5 = newton_schulz5(g)
+    # CANS-3 and NS5-5 give different orthogonalisation results — if they
+    # were identical the dispatch is broken (still calling NS5 under the
+    # CANS flag).
+    assert not torch.allclose(out_cans, out_ns5, atol=1e-2)
+
+
+# ---------------------------------------------------------------------------
 # Validation survives `python -O` (G190)
 # ---------------------------------------------------------------------------
 

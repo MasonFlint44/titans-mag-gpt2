@@ -1275,6 +1275,31 @@ def test_stock_ns5_resolves_to_newton_schulz5():
     assert plain_base is _nmm.newton_schulz5
 
 
+def test_use_cans_resolves_to_cans_stationary():
+    """When use_cans=True, self._ns5_fn dispatches to `cans_stationary`
+    (3-step Chebyshev-optimised). Inspect the closure's captured base."""
+    from model import nmm as _nmm
+    nmm_cans = NeuralMemoryModule(
+        n_embd=16, expansion=2, kernel_size=2,
+        spectral_norm=True, finetune_mode=False,
+        use_cans=True,
+    )
+    cans_base = nmm_cans._ns5_fn.__defaults__[0]
+    assert cans_base is _nmm.cans_stationary
+
+
+def test_use_cans_and_gram_ns5_mutually_exclusive_at_module_level():
+    """Direct NMM construction must also enforce the exclusion (not just
+    config-level), since callers can build NMM modules without going
+    through TitansConfig."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        NeuralMemoryModule(
+            n_embd=16, expansion=2, kernel_size=2,
+            spectral_norm=True, finetune_mode=False,
+            use_cans=True, use_gram_ns5=True,
+        )
+
+
 def test_use_gram_ns5_resolves_to_gram_callable():
     """When use_gram_ns5=True, self._ns5_fn dispatches to Tri Dao's
     Gram-Newton-Schulz wrapper instead of stock NS5 or its compiled

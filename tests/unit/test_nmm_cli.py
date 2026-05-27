@@ -124,6 +124,17 @@ def test_use_gram_ns5_omitted_stays_default():
     assert cfg.nmm_use_gram_ns5 is False
 
 
+def test_use_cans_round_trip():
+    args = _parse("--nmm-use-cans")
+    assert nmm_kwargs_from_args(args) == {"nmm_use_cans": True}
+
+
+def test_use_cans_omitted_stays_default():
+    args = _parse()
+    cfg = TitansConfig.gpt2_small(**nmm_kwargs_from_args(args))
+    assert cfg.nmm_use_cans is False
+
+
 def test_full_recipe_round_trip():
     """The recommended T=1024 consumer-GPU recipe must produce a kwargs dict
     that splats cleanly into TitansConfig.gpt2_small. Uses the blockwise

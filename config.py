@@ -289,6 +289,36 @@ class TitansConfig:
     # own per-iteration coefficient table).
     nmm_use_gram_ns5: bool = False
 
+    # nmm_use_cans: when True, replace stock NS5 with 3-step
+    # CANS-stationary (Chebyshev-optimised Newton-Schulz; arxiv 2506.10935).
+    # Same polynomial form as NS5 (X = aX + (bA + cA²)X) but with
+    # coefficients (a=3.8641, b=-9.7196, c=9.7101) minimax-optimised for
+    # the post-F-norm singular value range [0.0228, 0.0542] observed on
+    # gpt2_small NMM MemoryMLP gradients.
+    #
+    # At our recipe shapes (768×3072 and 3072×768, B=1) CANS-3 achieves
+    # ||XᵀX − I||_F ≈ 1.81 in 3 iterations, vs stock NS5-5's 8.30 in 5
+    # iterations: ~4.6× better orthogonalisation at ~1.6× the speed
+    # (~0.95 ms total vs ~1.54 ms total). See scripts/benchmark_ns5.py
+    # for the derivation and measurements.
+    #
+    # Tradeoffs vs use_gram_ns5:
+    #   * No optional dependency, no special GPU requirement (pure PyTorch).
+    #   * Stays competitive at batch=1 (gram-NS5 only wins at batch>=4).
+    #   * Coefficients are *recipe-specific*: optimised for the gpt2_small
+    #     NMM shape regime. At larger d / different expansion / low-rank
+    #     configurations the sv range shifts — re-derive via
+    #     scripts/benchmark_ns5.py for those regimes.
+    #
+    # Mutually exclusive with `nmm_use_gram_ns5`. When this flag is set,
+    # `nmm_ns5_steps` is IGNORED (CANS-stationary has 3 steps baked into
+    # its coefficient tuning).
+    #
+    # Config default is False (paper-faithful NS5) for back-compat; the
+    # recommended consumer-GPU recipe (README.md, RUNBOOK.md) opts in via
+    # `--nmm-use-cans`.
+    nmm_use_cans: bool = False
+
     # nmm_per_token_ns5 (G267): when True AND `nmm_block_size > 1`, the
     # blockwise path uses per-token NS5 + per-token θ weighting, matching
     # paper Eq 16's `Σ_t θ_t · NS5(∇_t)` exactly. Default False, which
@@ -522,6 +552,24 @@ class TitansConfig:
                 f"{self.nmm_ns5_steps} — Gram-NS5 has its own per-iteration "
                 f"coefficient table. Drop nmm_ns5_steps to silence this "
                 f"warning.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        # nmm_use_cans: mutually exclusive with nmm_use_gram_ns5; warn when
+        # ns5_steps is non-default since CANS has 3 baked into its
+        # coefficient tuning.
+        if self.nmm_use_cans and self.nmm_use_gram_ns5:
+            raise ValueError(
+                "nmm_use_cans and nmm_use_gram_ns5 are mutually exclusive — "
+                "both replace the stock NS5 path. Pick one."
+            )
+        if self.nmm_use_cans and self.nmm_ns5_steps != 5:
+            warnings.warn(
+                f"nmm_use_cans=True overrides nmm_ns5_steps="
+                f"{self.nmm_ns5_steps} — CANS-stationary has 3 iterations "
+                f"baked into its coefficient tuning. Drop nmm_ns5_steps to "
+                f"silence this warning.",
                 UserWarning,
                 stacklevel=2,
             )

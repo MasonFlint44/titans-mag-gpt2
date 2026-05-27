@@ -80,10 +80,6 @@ The recommended recipe for a 16 GiB consumer card (RTX 5070 Ti / 4080 /
 3090 class), T=1024, full-rank MemoryMLP, 12 NMM layers:
 
 ```bash
-# Optional: install Gram-Newton-Schulz for ~15% step-time + 2 GiB memory
-# savings. Requires Hopper/Blackwell GPU + CUDA 12.9+ + PyTorch 2.7+.
-uv pip install gram-newton-schulz
-
 uv run python scripts/finetune.py \
     --size small \
     --data /path/to/corpus.txt \
@@ -92,7 +88,7 @@ uv run python scripts/finetune.py \
     --nmm-block-size 64 \
     --nmm-state-dtype bf16 \
     --nmm-detach-state-between-blocks \
-    --nmm-use-gram-ns5 \
+    --nmm-use-cans \
     --compile-model \
     --optim8bit \
     --max-steps 5000
@@ -103,10 +99,17 @@ This loads pretrained `openai-community/gpt2`, splices in the NMM with
 At step 0 perplexity should equal vanilla GPT-2; from there it decreases
 as the memory contribution ramps up.
 
-Measured on RTX 5070 Ti: **~940 ms/step, 6.5 GiB peak, ~1080 tok/s**.
-Effective batch = 16 via `--grad-accum`; one optimizer step takes ~15 s.
-Drop `--nmm-use-gram-ns5` if you can't install the optional dep — adds
-~15% step time and ~2 GiB peak memory.
+The `--nmm-use-cans` flag swaps stock NS5 for 3-step CANS-stationary
+(arxiv 2506.10935) with coefficients tuned for the gpt2_small NMM
+singular-value range. Kernel-level: ~1.6× faster than NS5 with
+~4.6× better orthogonalisation. Drop it for paper-faithful NS5.
+
+Measured on RTX 5070 Ti without CANS: **~1.11 s/step, 8.5 GiB peak,
+~920 tok/s** (effective batch 16 via `--grad-accum`; ~18 s per
+optimizer step). With `--nmm-use-cans`, NS5 (~78% of CUDA time)
+runs ~1.6× faster — the step time savings depend on what fraction
+of your run is NMM; expect a meaningful but smaller-than-1.6× end-
+to-end gain.
 
 ### Resuming a run
 
