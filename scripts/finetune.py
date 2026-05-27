@@ -216,11 +216,18 @@ def main():
         optimizer = build_optimizer(model, use_8bit=args.optim8bit)
         start_step = 0
 
-    # Tokenize corpus (whole-file-as-one-document; users can swap in an HF
-    # streaming reader for FineWebEdu-scale runs).
+    # Tokenize corpus. Use `read_eot_separated_documents` so any literal
+    # `<|endoftext|>` markers in the corpus split into separate documents —
+    # `encode_corpus` then appends the EOT *id* (50256) between them, which is
+    # the signal the dataloader uses to set `doc_boundaries[i]=True` and reset
+    # the NMM state. Without this, the literals BPE-tokenize as 7 ordinary
+    # tokens and the reset never fires, leaving the NMM in unbounded-
+    # accumulation mode across the whole corpus. For files with no markers
+    # the helper returns a single-element list (matches the previous
+    # whole-file-as-one-document behavior).
+    from scripts.prepare_squad_corpus import read_eot_separated_documents
     tok = Tokenizer()
-    with open(args.data, "r", encoding="utf-8") as f:
-        token_stream = tok.encode_corpus([f.read()])
+    token_stream = tok.encode_corpus(read_eot_separated_documents(args.data))
 
     loader = ParallelStreamLoader(
         token_stream,

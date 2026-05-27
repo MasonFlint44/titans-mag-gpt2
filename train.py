@@ -1168,9 +1168,18 @@ def main():
         else:
             start_step = 0
 
+        # Tokenize corpus. `read_eot_separated_documents` splits the file on
+        # any literal `<|endoftext|>` markers so `encode_corpus` can append
+        # the EOT *id* (50256) between them — the signal the dataloader uses
+        # to set `doc_boundaries[i]=True` and reset the NMM state. Without
+        # the split step, the literals BPE-tokenize as 7 ordinary tokens
+        # and the reset never fires, leaving the NMM in unbounded-
+        # accumulation mode across the whole corpus. For files with no
+        # markers the helper returns a single-element list (matches the
+        # previous whole-file-as-one-document behavior).
+        from scripts.prepare_squad_corpus import read_eot_separated_documents
         tok = Tokenizer()
-        with open(args.data, "r", encoding="utf-8") as f:
-            token_stream = tok.encode_corpus([f.read()])
+        token_stream = tok.encode_corpus(read_eot_separated_documents(args.data))
 
         loader = ParallelStreamLoader(
             token_stream,
