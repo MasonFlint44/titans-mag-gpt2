@@ -383,39 +383,6 @@ def newton_schulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.
     return G.to(orig_dtype)
 
 
-# G274 — fused NS5 via torch.compile. The 5 iterations execute as 10
-# matmuls + 10 elementwise ops per call; without compile each is a
-# separate CUDA kernel launch (~5-10 μs each ≈ 50-100 μs of launch
-# overhead per NS5 call). When the per-step matmul itself takes
-# <100 μs (small per-sample shapes, e.g. low_rank), this overhead is
-# the bottleneck. `torch.compile(mode="default")` traces the iteration
-# into a single fused graph, eliminating the per-op launch cost.
-#
-# At gpt2_small dimensions (h=3072, d=768), the matmul time itself
-# dominates and the launch reduction is ~5-10%. At low_rank=64 or
-# during decode-time per-token NS5, the launch savings are more
-# significant (~30-50%).
-#
-# Build lazily on first use — torch.compile's trace warm-up takes
-# 1-3 s and we don't want to pay it at construction for users who
-# don't set the flag.
-_ns5_compiled_cache = None
-
-
-def _get_compiled_ns5():
-    """Return a torch.compile-wrapped version of newton_schulz5.
-
-    Module-level singleton so all NMM instances share the same compile
-    cache (one warm-up cost, all instances benefit).
-    """
-    global _ns5_compiled_cache
-    if _ns5_compiled_cache is None:
-        _ns5_compiled_cache = torch.compile(
-            newton_schulz5, mode="default", dynamic=False,
-        )
-    return _ns5_compiled_cache
-
-
 # Tri Dao's Gram-Newton-Schulz: drop-in NS5 replacement that does most
 # work on the small Gram matrix instead of the rectangular input. ~1.17-
 # 3.07× speedup at gpt2_small dims on consumer Blackwell, claimed 42%
@@ -638,7 +605,6 @@ class NeuralMemoryModule(nn.Module):
         lookahead_value: bool = False,
         per_param_lr_modulation: bool = False,
         momentum_order: int = 1,
-        compile_ns5: bool = False,
         ns5_steps: int = 5,
         use_gram_ns5: bool = False,
     ):
@@ -690,10 +656,6 @@ class NeuralMemoryModule(nn.Module):
         if momentum_order < 1:
             raise ValueError(f"momentum_order must be >= 1 (got {momentum_order})")
         self.momentum_order = int(momentum_order)
-        # G274: fused NS5 via torch.compile. When True, NS5 calls inside
-        # this NMM's forward paths go through the module-level compiled
-        # variant.
-        self.compile_ns5 = bool(compile_ns5)
         self.use_gram_ns5 = bool(use_gram_ns5)
         # Number of Newton-Schulz iterations. 5 = paper-faithful (Muon
         # coefficients tuned for this fixed point); lower drifts the
@@ -703,16 +665,12 @@ class NeuralMemoryModule(nn.Module):
         self.ns5_steps = int(ns5_steps)
         # Resolved NS5 callable — used by every path that applies NS5.
         # Bind `steps` here so call sites stay `self._ns5_fn(g)` with no
-        # extra argument threading. Three options, mutually exclusive in
-        # practice (Gram-NS5 supersedes both compile_ns5 and ns5_steps —
-        # see TitansConfig validator's warning):
-        #   1. use_gram_ns5=True → Tri Dao's Gram-NS5 (different algorithm)
-        #   2. compile_ns5=True → torch.compile-wrapped stock NS5
-        #   3. default → plain stock NS5
+        # extra argument threading. Two options:
+        #   1. use_gram_ns5=True → Tri Dao's Gram-NS5 (different algorithm,
+        #      Gram-NS5's own coefficient table — overrides ns5_steps)
+        #   2. default → plain stock NS5 with `ns5_steps` iterations
         if self.use_gram_ns5:
             _ns5_base = _get_gram_ns5_callable()
-        elif self.compile_ns5:
-            _ns5_base = _get_compiled_ns5()
         else:
             _ns5_base = newton_schulz5
         _steps = self.ns5_steps
@@ -1602,7 +1560,6 @@ class MultiHeadNMM(nn.Module):
         lookahead_value: bool = False,
         per_param_lr_modulation: bool = False,
         momentum_order: int = 1,
-        compile_ns5: bool = False,
         ns5_steps: int = 5,
         use_gram_ns5: bool = False,
         per_head_learned_params: bool = True,
@@ -1644,7 +1601,6 @@ class MultiHeadNMM(nn.Module):
                 lookahead_value=lookahead_value,
                 per_param_lr_modulation=per_param_lr_modulation,
                 momentum_order=momentum_order,
-                compile_ns5=compile_ns5,
                 ns5_steps=ns5_steps,
                 use_gram_ns5=use_gram_ns5,
             )

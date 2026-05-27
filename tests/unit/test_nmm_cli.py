@@ -87,7 +87,6 @@ def test_boolean_flags_default_false():
     kwargs = nmm_kwargs_from_args(args)
     for k in (
         "nmm_detach_state_between_blocks",
-        "nmm_compile_ns5",
     ):
         assert k not in kwargs
 
@@ -99,11 +98,6 @@ def test_detach_state_round_trip():
         "nmm_detach_state_between_blocks": True,
         "nmm_block_size": 16,
     }
-
-
-def test_compile_ns5_round_trip():
-    args = _parse("--nmm-compile-ns5")
-    assert nmm_kwargs_from_args(args) == {"nmm_compile_ns5": True}
 
 
 def test_ns5_steps_round_trip():

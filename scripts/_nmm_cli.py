@@ -98,12 +98,6 @@ def add_nmm_args(parser: argparse.ArgumentParser) -> None:
              "peak transient memory ~proportional to T/block_size.",
     )
     group.add_argument(
-        "--nmm-compile-ns5",
-        action="store_true",
-        help="Fused NS5 via torch.compile. Useful for the sequential / "
-             "per-token NS5 paths where launch overhead dominates.",
-    )
-    group.add_argument(
         "--nmm-ns5-steps",
         type=int,
         default=None,
@@ -135,7 +129,7 @@ def add_nmm_args(parser: argparse.ArgumentParser) -> None:
              "speedup at gpt2_small dims on consumer Blackwell (RTX 5070 Ti). "
              "Requires `pip install gram-newton-schulz` and PyTorch 2.7+ / "
              "CUDA 12.9+ on a Hopper/Blackwell GPU. Overrides "
-             "--nmm-ns5-steps and --nmm-compile-ns5.",
+             "--nmm-ns5-steps.",
     )
 
 
@@ -173,8 +167,6 @@ def nmm_kwargs_from_args(args: argparse.Namespace) -> dict:
         kwargs["nmm_layer_indices"] = args.nmm_layer_indices
     if args.nmm_detach_state_between_blocks:
         kwargs["nmm_detach_state_between_blocks"] = True
-    if args.nmm_compile_ns5:
-        kwargs["nmm_compile_ns5"] = True
     if args.nmm_ns5_steps is not None:
         kwargs["nmm_ns5_steps"] = args.nmm_ns5_steps
     if args.nmm_use_gram_ns5:

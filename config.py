@@ -14,6 +14,7 @@ from typing import Optional
 _REMOVED_CONFIG_KEYS: frozenset = frozenset({
     "nmm_fused_kernel",          # removed: analytical inner gradient is now always-on
     "nmm_compile_inner_loop",    # removed: niche sequential-path knob; cut for bloat
+    "nmm_compile_ns5",           # removed: superseded by nmm_use_gram_ns5
 })
 
 
@@ -262,31 +263,6 @@ class TitansConfig:
     # study on your own data. Sanity bounds: [1, 10].
     nmm_ns5_steps: int = 5
 
-    # nmm_compile_ns5 (G274 — fused Newton-Schulz via torch.compile): when
-    # True, every NS5 call in this NMM's forward paths goes through a
-    # torch.compile-wrapped variant. The 5 NS5 iterations execute as 10
-    # matmuls + 10 elementwise ops; without compile each is a separate
-    # CUDA kernel launch (~5-10 μs each), so 50-100 μs of pure launch
-    # overhead per NS5 call. Compile collapses this into a single graph.
-    #
-    # When meaningful:
-    # - block_size=1 sequential path WITHOUT nmm_compile_inner_loop
-    #   (which already wraps NS5 transitively).
-    # - blockwise path: NS5 is called per-block; compile saves the
-    #   per-block launch overhead.
-    # - per_token_ns5=True (G267): NS5 called per token within a block.
-    # - decode-time step_with_conv() where NS5 launch overhead is a
-    #   bigger fraction of step time.
-    #
-    # No effect when nmm_compile_inner_loop=True (compile already
-    # transitively traces the NS5 ops). Composable with every other
-    # path.
-    #
-    # First call pays a 1-3 s warm-up cost (Inductor traces the
-    # iteration); subsequent calls reuse the cached compiled graph.
-    # Module-level singleton cache so all NMMs share one warm-up.
-    nmm_compile_ns5: bool = False
-
     # nmm_use_gram_ns5: when True, replace the stock Newton-Schulz polar
     # decomposition with Tri Dao's Gram-Newton-Schulz (Dao-AILab/
     # gram-newton-schulz). Standard NS5 does 2T rectangular matmuls
@@ -310,8 +286,7 @@ class TitansConfig:
     # can build the Gram-NS module once and reuse it across all NS calls.
     #
     # When this flag is set, `nmm_ns5_steps` is IGNORED (Gram-NS5 has its
-    # own per-iteration coefficient table) and `nmm_compile_ns5` is
-    # redundant (Gram-NS5 has its own optimized kernels).
+    # own per-iteration coefficient table).
     nmm_use_gram_ns5: bool = False
 
     # nmm_per_token_ns5 (G267): when True AND `nmm_block_size > 1`, the
@@ -539,23 +514,17 @@ class TitansConfig:
                 "or leave nmm_per_head_learned_params=True (default)."
             )
 
-        # nmm_use_gram_ns5: warn about ignored knobs so the user knows
-        # their nmm_ns5_steps / nmm_compile_ns5 settings don't apply.
-        if self.nmm_use_gram_ns5:
-            redundant = []
-            if self.nmm_ns5_steps != 5:
-                redundant.append(f"nmm_ns5_steps={self.nmm_ns5_steps}")
-            if self.nmm_compile_ns5:
-                redundant.append("nmm_compile_ns5=True")
-            if redundant:
-                warnings.warn(
-                    f"nmm_use_gram_ns5=True overrides {', '.join(redundant)} — "
-                    f"Gram-NS5 has its own per-iteration coefficient table "
-                    f"and optimized kernels. Drop those knobs to silence "
-                    f"this warning.",
-                    UserWarning,
-                    stacklevel=2,
-                )
+        # nmm_use_gram_ns5: warn about ignored ns5_steps so the user knows
+        # their non-default setting doesn't apply.
+        if self.nmm_use_gram_ns5 and self.nmm_ns5_steps != 5:
+            warnings.warn(
+                f"nmm_use_gram_ns5=True overrides nmm_ns5_steps="
+                f"{self.nmm_ns5_steps} — Gram-NS5 has its own per-iteration "
+                f"coefficient table. Drop nmm_ns5_steps to silence this "
+                f"warning.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         # nmm_ns5_steps: paper default is 5; sanity bounds [1, 10].
         if not isinstance(self.nmm_ns5_steps, int) or not (1 <= self.nmm_ns5_steps <= 10):

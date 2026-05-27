@@ -139,9 +139,8 @@ passed to `TitansConfig`. Quick reference:
 | `--nmm-expansion N` | int | MemoryMLP hidden-dim multiplier (paper default 4; set 1 for ~4× smaller state at minor capacity cost) |
 | `--nmm-layer-indices I,J,K` | csv ints | Subset of blocks that get NMM (others become plain GPT-2 blocks) |
 | `--nmm-detach-state-between-blocks` | flag | Truncated BPTT at block boundaries (requires `--nmm-block-size > 1`) |
-| `--nmm-compile-ns5` | flag | Fused NS5 via torch.compile (saves per-call kernel-launch overhead) |
 | `--nmm-ns5-steps N` | int | Newton-Schulz iteration count (default 5). **Lowering speeds up training significantly but drifts the spectral norm of NS5(g) — measured at gpt2_small: steps=4 ~16% faster + ~12% LR drift; steps=3 ~33% faster + ~20% LR drift.** Validate convergence on your data before lowering. |
-| `--nmm-use-gram-ns5` | flag | Replace stock NS5 with Tri Dao's Gram-Newton-Schulz (Dao-AILab/gram-newton-schulz). 2 rectangular matmuls + T iterations on the n×n Gram matrix, vs stock NS5's 2T rectangular matmuls. **Measured: ~15-20% speedup + ~2 GiB memory savings on the recommended recipe.** Requires `pip install gram-newton-schulz`, PyTorch 2.7+, CUDA 12.9+, and Hopper/Blackwell GPU. Overrides `--nmm-ns5-steps` and `--nmm-compile-ns5` (Gram-NS5 has its own coefficients and kernels). |
+| `--nmm-use-gram-ns5` | flag | Replace stock NS5 with Tri Dao's Gram-Newton-Schulz (Dao-AILab/gram-newton-schulz). 2 rectangular matmuls + T iterations on the n×n Gram matrix, vs stock NS5's 2T rectangular matmuls. **Measured: ~15-20% speedup + ~2 GiB memory savings on the recommended recipe.** Requires `pip install gram-newton-schulz`, PyTorch 2.7+, CUDA 12.9+, and Hopper/Blackwell GPU. Overrides `--nmm-ns5-steps` (Gram-NS5 has its own coefficient table). |
 
 ### Recommended consumer-GPU recipe (T=1024, full-rank, 16 GiB card)
 
@@ -447,12 +446,6 @@ For long-context generation (e.g., 8K tokens cached across 12 layers), this is ~
 **Quality drift**: per-(B, head, token) scaling gives ~127 levels of resolution per row. For typical KV magnitudes the round-trip relative error is <1/127 per element. Empirically the logit drift over short decode runs is <5% relative (locked by test). For very long decode runs the noise can compound; pair with shorter generation horizons or per-element fp16 scales if you see drift.
 
 **Composability**: dense (bf16) and int8 caches go through the same `forward_with_kv_cache` path; `isinstance(cache, KVCacheInt8)` branches the append + dequant logic. Plain GPT-2 blocks (no NMM) support it too.
-
-### Fused Newton-Schulz via torch.compile (G274)
-
-| Field | Type | Default | Notes |
-|---|---|---|---|
-| `nmm_compile_ns5` | `bool` | `False` | Routes NS5 calls through a module-level `torch.compile`-wrapped variant. The 5 NS5 iterations are 10 matmuls + 10 elementwise ops — without compile each is a separate CUDA kernel launch (~5-10 μs each → 50-100 μs of pure launch overhead per call). Compile collapses them into one graph. Most useful for the blockwise path (per-block NS5 calls), `per_token_ns5=True` (per-token NS5), and decode-time `step_with_conv()`. First call pays a 1-3 s warm-up. **At gpt2_small dims the win is ~5-10%** because matmul time dominates over launch overhead at H=3072. Larger at low_rank=64 and decode-time (~30-50%). |
 
 ### Int8 state (G275)
 

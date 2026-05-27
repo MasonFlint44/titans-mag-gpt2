@@ -405,7 +405,6 @@ class TitansMAGBlock(nn.Module):
             lookahead_value=config.nmm_lookahead_value,
             per_param_lr_modulation=config.nmm_per_param_lr_modulation,
             momentum_order=config.nmm_momentum_order,
-            compile_ns5=config.nmm_compile_ns5,
             ns5_steps=config.nmm_ns5_steps,
             use_gram_ns5=config.nmm_use_gram_ns5,
         )

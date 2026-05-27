@@ -1254,49 +1254,25 @@ def test_momentum_order_2_through_full_model():
 
 
 # ---------------------------------------------------------------------------
-# #5: nmm_compile_ns5 (G274) — fused NS5 via torch.compile
+# #5: NS5 dispatch — Gram-NS5 vs. stock NS5
+# (the standalone `nmm_compile_ns5` toggle was removed; Gram-NS5 is the
+# only opt-in NS5 variant now.)
 # ---------------------------------------------------------------------------
 
 
-def test_config_compile_ns5_default_false():
-    cfg = TitansConfig.gpt2_small()
-    assert cfg.nmm_compile_ns5 is False
-
-
-def test_config_compile_ns5_propagates():
-    cfg = TitansConfig(
-        n_layer=2, n_head=2, n_embd=16, vocab_size=64,
-        block_size=32, chunk_size=32,
-        nmm_expansion=2, nmm_conv_kernel=2,
-        finetune_mode=False,
-        nmm_compile_ns5=True,
-    )
-    model = TitansMAGGPT2(cfg)
-    for blk in model.blocks:
-        if hasattr(blk, "nmm"):
-            assert blk.nmm.compile_ns5 is True
-
-
-def test_compile_ns5_resolves_to_compiled_function():
-    """When compile_ns5=True, self._ns5_fn dispatches to the compiled
-    variant instead of the plain `newton_schulz5` reference. The actual
-    `_ns5_fn` attribute is a lambda that binds `steps` so call sites can
-    stay `self._ns5_fn(g)` — we inspect the closure's captured base function."""
+def test_stock_ns5_resolves_to_newton_schulz5():
+    """When use_gram_ns5=False (default), self._ns5_fn dispatches to the
+    plain `newton_schulz5` reference. The actual `_ns5_fn` attribute is a
+    lambda that binds `steps` so call sites can stay `self._ns5_fn(g)` —
+    we inspect the closure's captured base function."""
     nmm_plain = NeuralMemoryModule(
         n_embd=16, expansion=2, kernel_size=2,
         spectral_norm=True, finetune_mode=False,
     )
-    nmm_compiled = NeuralMemoryModule(
-        n_embd=16, expansion=2, kernel_size=2,
-        spectral_norm=True, finetune_mode=False,
-        compile_ns5=True,
-    )
     from model import nmm as _nmm
     # __defaults__ on the lambda holds (_f=base_ns5, _s=steps).
     plain_base = nmm_plain._ns5_fn.__defaults__[0]
-    compiled_base = nmm_compiled._ns5_fn.__defaults__[0]
     assert plain_base is _nmm.newton_schulz5
-    assert compiled_base is not _nmm.newton_schulz5
 
 
 def test_use_gram_ns5_resolves_to_gram_callable():
@@ -1342,44 +1318,6 @@ def test_gram_ns5_produces_spectrally_normalized_output():
     assert abs(sv.max().item() - 1.0) < 0.3, (
         f"Gram-NS5 sv_max = {sv.max().item():.4f}, expected near 1"
     )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="torch.compile + CUDA required")
-def test_compile_ns5_matches_uncompiled_output():
-    """Compiled NS5 must produce the same output as the reference. With
-    TF32 matmul precision (G280: process-global `set_float32_matmul_precision`
-    set to 'high' in train.py + conftest.py), per-matmul precision is
-    ~1e-3 instead of fp32's ~1e-7; NS5's iteration damps but does not
-    erase that per-step noise. Tolerance of 5e-3 covers TF32 while still
-    catching any real math divergence between paths."""
-    from model.nmm import newton_schulz5, _get_compiled_ns5
-    torch.manual_seed(0)
-    G = torch.randn(2, 64, 32, device="cuda")
-    y_ref = newton_schulz5(G)
-    y_compiled = _get_compiled_ns5()(G)
-    assert torch.allclose(y_ref, y_compiled, atol=5e-3, rtol=5e-3), (
-        f"compiled NS5 differs from reference: max_abs="
-        f"{(y_ref - y_compiled).abs().max().item():.2e}"
-    )
-
-
-def test_compile_ns5_forward_finite_blockwise():
-    """End-to-end smoke: compile_ns5=True with blockwise path produces
-    finite output. Skips the actual compile on CPU (Inductor's CPU
-    backend works but is slow for this op set)."""
-    torch.manual_seed(0)
-    d, T, B = 16, 16, 2
-    # Force CPU but don't actually invoke compile — keep test cheap.
-    nmm = NeuralMemoryModule(
-        n_embd=d, expansion=2, kernel_size=2,
-        spectral_norm=True, finetune_mode=False,
-        block_size=4, compile_ns5=False,
-    )
-    # Manually swap to compiled ns5; the wrap is a no-op for our purposes
-    # but exercises the dispatch.
-    x = torch.randn(B, T, d) * 0.3
-    y, _ = nmm.forward_chunk(x, nmm.init_state(B, x.device), None)
-    assert torch.isfinite(y).all()
 
 
 # ---------------------------------------------------------------------------

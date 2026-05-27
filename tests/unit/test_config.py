@@ -243,15 +243,10 @@ def test_use_gram_ns5_warns_when_overridden_knobs_set():
         TitansConfig(nmm_use_gram_ns5=True, nmm_ns5_steps=4)
 
 
-def test_use_gram_ns5_warns_when_compile_ns5_set():
-    with pytest.warns(UserWarning, match="nmm_use_gram_ns5=True overrides"):
-        TitansConfig(nmm_use_gram_ns5=True, nmm_compile_ns5=True)
-
-
 def test_use_gram_ns5_no_warn_with_default_knobs():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        TitansConfig(nmm_use_gram_ns5=True)  # default ns5_steps=5, compile_ns5=False
+        TitansConfig(nmm_use_gram_ns5=True)  # default ns5_steps=5
 
 
 # ---------------------------------------------------------------------------
