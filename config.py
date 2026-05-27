@@ -264,51 +264,31 @@ class TitansConfig:
     nmm_ns5_steps: int = 5
 
     # nmm_use_gram_ns5: when True, replace the stock Newton-Schulz polar
-    # decomposition with Tri Dao's Gram-Newton-Schulz (Dao-AILab/
-    # gram-newton-schulz). Standard NS5 does 2T rectangular matmuls
-    # (T=5 iterations × 2 each); Gram-NS5 does 2 rectangular matmuls
-    # total + T iterations on the small n×n Gram matrix. At gpt2_small
-    # dims (m=4d=3072, n=d=768, α=4): claimed 42% FLOP reduction,
-    # measured 1.17-3.07× wall-clock speedup on a consumer Blackwell
-    # (RTX 5070 Ti, sm_120). The library also runs the iteration in
-    # fp16 (better than TF32 tensor-core throughput).
+    # decomposition with the Gram-iteration variant (Tri Dao et al.,
+    # POLAR_EXPRESS coefficients + reset at iter 2). Standard NS5 does 2T
+    # rectangular matmuls (T=5); Gram-NS5 does 2 rectangular matmuls total
+    # + T iterations on the small n×n Gram matrix. At gpt2_small dims
+    # (m=4d=3072, n=d=768, α=4): 42% FLOP reduction claimed in Tri Dao's
+    # paper.
     #
-    # Convergence: the library uses Polar Express coefficients (different
-    # per iteration) with a restart at iteration 2 to reset Gram-matrix
-    # drift. On random Gaussian inputs, |sv - 1| ≈ 0.12-0.15 — comparable
-    # to stock NS5-steps=5. Authors claim perplexity preserved within
-    # 0.01 on trillion-parameter Muon training.
+    # Implemented locally in model/nmm.py — no external dependency. The
+    # earlier dependency on `gram-newton-schulz` was dropped because:
+    #   - the library's in-place divide on the F-norm step trips AOT
+    #     autograd's tensor-version check under torch.compile
+    #   - its internal `torch.compile(mode='reduce-overhead')` wrapper
+    #     allocated per-shape CUDA-graph memory pools that blew past
+    #     16 GiB VRAM at our recipe scale
+    #   - the quack-kernels backend only beats cuBLAS at batch>=4 with
+    #     very large matrices, neither of which applies to our recipe
     #
-    # Optional dependency: install via `pip install
-    # 'titans-mag-gpt2[gram_ns5]'` or `pip install gram-newton-schulz`.
-    # Targets Hopper / Blackwell GPUs and requires PyTorch 2.7+, CUDA 12.9+.
-    # Construction-time flag, NOT runtime — set at config time so we
-    # can build the Gram-NS module once and reuse it across all NS calls.
+    # Convergence: POLAR_EXPRESS coefficients with reset at iter 2. On
+    # random Gaussian inputs, |sv - 1| ≈ 0.12-0.15 — comparable to stock
+    # NS5-steps=5. Authors claim perplexity preserved within 0.01 on
+    # trillion-parameter Muon training.
     #
     # When this flag is set, `nmm_ns5_steps` is IGNORED (Gram-NS5 has its
-    # own per-iteration coefficient table).
+    # own fixed per-iteration coefficient table).
     nmm_use_gram_ns5: bool = False
-
-    # nmm_gram_ns5_use_kernels: gates the library's `ns_use_kernels` toggle.
-    # When False (default), Gram-NS5's inner matmuls run via plain PyTorch
-    # (`A @ B` / `torch.baddbmm`) — pure cuBLAS, no custom CuTeDSL kernels.
-    # When True, the library's quack-based symmetric-GEMM kernels run instead.
-    #
-    # Default is False because at our recipe shapes (batch=1, 768x3072 /
-    # 3072x768) the quack kernels lose to cuBLAS by ~2.3x:
-    #
-    #     gram-NS5 (kernels=True):  ~2.32 ms / pair, error 5.35
-    #     gram-NS5 (kernels=False): ~1.00 ms / pair, error 5.35  ← default
-    #
-    # Same math, same quality — kernels just have a fixed launch overhead
-    # that doesn't pay off until matrices are very large.  Users training
-    # at batch>=4 on much larger weight shapes can opt in via
-    # `nmm_gram_ns5_use_kernels=True` (recommend benchmarking first).
-    #
-    # Has no effect when `nmm_use_gram_ns5=False`.  When kernels=True, the
-    # library additionally requires Hopper/Blackwell GPU + CUDA 12.9+ +
-    # PyTorch 2.7+; with kernels=False these requirements do not apply.
-    nmm_gram_ns5_use_kernels: bool = False
 
     # nmm_use_cans: when True, replace stock NS5 with 3-step
     # CANS-stationary (Chebyshev-optimised Newton-Schulz; arxiv 2506.10935).
@@ -573,18 +553,6 @@ class TitansConfig:
                 f"{self.nmm_ns5_steps} — Gram-NS5 has its own per-iteration "
                 f"coefficient table. Drop nmm_ns5_steps to silence this "
                 f"warning.",
-                UserWarning,
-                stacklevel=2,
-            )
-
-        # nmm_gram_ns5_use_kernels has no effect when gram-NS5 isn't enabled;
-        # warn so a misconfigured run doesn't look mysteriously slow.
-        if self.nmm_gram_ns5_use_kernels and not self.nmm_use_gram_ns5:
-            warnings.warn(
-                "nmm_gram_ns5_use_kernels=True has no effect when "
-                "nmm_use_gram_ns5=False. Set nmm_use_gram_ns5=True to "
-                "enable the Gram-Newton-Schulz path, or drop "
-                "nmm_gram_ns5_use_kernels to silence this warning.",
                 UserWarning,
                 stacklevel=2,
             )

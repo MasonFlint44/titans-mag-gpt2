@@ -300,11 +300,11 @@ python -m train --data corpus.txt \
 ```
 
 Measured on RTX 5070 Ti without `--nmm-use-gram-ns5`: ~1.11 s/step,
-8.5 GiB peak. The `--nmm-use-gram-ns5` flag swaps NS5 for Tri Dao's
-Gram-Newton-Schulz (kernels off by default — pure PyTorch is faster
-than the custom CuTeDSL kernels at batch=1). Needs `pip install
-gram-newton-schulz`. `--nmm-use-cans` is the alternative for a
-quality-favouring tradeoff; drop both for paper-faithful NS5.
+8.5 GiB peak. The `--nmm-use-gram-ns5` flag swaps NS5 for the
+Gram-iteration variant (Tri Dao et al., POLAR_EXPRESS coefficients).
+Implemented locally in `model/nmm.py` — no external dep.
+`--nmm-use-cans` is the alternative for a quality-favouring tradeoff;
+drop both for paper-faithful NS5.
 
 The `--nmm-detach-state-between-blocks`
 flag is what makes full-rank fit at T=1024 — it bounds the backward

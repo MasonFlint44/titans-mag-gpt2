@@ -24,16 +24,6 @@ dependencies = [
 # loud with an install hint).
 optim8bit = ["bitsandbytes>=0.43"]
 
-# Gram Newton-Schulz polar decomposition (Tri Dao). Drop-in replacement
-# for stock NS5 that does 2 rectangular matmuls + T iterations on the
-# small Gram matrix instead of 2T rectangular matmuls. Targets Hopper
-# (H100) / Blackwell (B100/B200/B300) GPUs and requires PyTorch 2.7+ /
-# CUDA 12.9+. Empirically measured 1.17-3.07× speedup at gpt2_small
-# dims on consumer Blackwell (sm_120). Convergence quality comparable
-# to stock NS5 with Muon coefficients. Install via the `gram_ns5` extra
-# when the --nmm-use-gram-ns5 flag is set.
-gram_ns5 = ["gram-newton-schulz>=0.1.4"]
-
 [dependency-groups]
 dev = [
     "pytest>=8.0",

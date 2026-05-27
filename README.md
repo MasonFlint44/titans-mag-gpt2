@@ -80,8 +80,6 @@ The recommended recipe for a 16 GiB consumer card (RTX 5070 Ti / 4080 /
 3090 class), T=1024, full-rank MemoryMLP, 12 NMM layers:
 
 ```bash
-uv pip install gram-newton-schulz
-
 uv run python scripts/finetune.py \
     --size small \
     --data /path/to/corpus.txt \
@@ -101,12 +99,10 @@ This loads pretrained `openai-community/gpt2`, splices in the NMM with
 At step 0 perplexity should equal vanilla GPT-2; from there it decreases
 as the memory contribution ramps up.
 
-The `--nmm-use-gram-ns5` flag swaps stock NS5 for Tri Dao's Gram-
-Newton-Schulz. By default the library's custom CuTeDSL kernels are
-disabled (`nmm_gram_ns5_use_kernels=False`) — at our recipe's batch=1
-NMM shapes pure-PyTorch matmul + baddbmm is ~2.3× faster than the
-kernels. Kernel-level: NS5-5 ~1.54 ms/pair, gram-NS5 ~1.00 ms/pair at
-the W1+W2 shapes. Drop the flag for paper-faithful NS5.
+The `--nmm-use-gram-ns5` flag swaps stock NS5 for the Gram-iteration
+variant (Tri Dao et al., POLAR_EXPRESS coefficients + reset at iter 2).
+Implemented locally in `model/nmm.py` — no external dependency. Drop
+the flag for paper-faithful NS5.
 
 Measured on RTX 5070 Ti without `--nmm-use-gram-ns5`: **~1.11 s/step,
 8.5 GiB peak, ~920 tok/s** (effective batch 16 via `--grad-accum`;

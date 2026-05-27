@@ -432,73 +432,133 @@ def cans_stationary(G: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     return G.to(orig_dtype)
 
 
-# Tri Dao's Gram-Newton-Schulz: drop-in NS5 replacement that does most
-# work on the small Gram matrix instead of the rectangular input.  See
-# `config.nmm_use_gram_ns5` and `config.nmm_gram_ns5_use_kernels` for the
-# user-facing docs.
+# Gram-iteration Newton-Schulz orthogonalization (Tri Dao et al., POLAR_EXPRESS
+# coefficients with restart at iteration 2). Reimplemented locally in pure
+# PyTorch — replaces the external `gram_newton_schulz` library.
 #
-# The library exposes a `ns_use_kernels` toggle: when False, the inner
-# matmuls run via plain PyTorch (`A @ B` / `torch.baddbmm`) instead of
-# quack's custom CuTeDSL kernels.  Measured at our batch=1 NMM shapes
-# (gpt2_small, 768x3072 / 3072x768):
+# Why we have our own copy:
+#   1. The upstream library does an in-place divide on the F-norm step
+#      (`X /= X.norm(...) + eps`), which mutates a tensor saved for the
+#      norm's backward. Under torch.compile + AOT autograd this trips the
+#      version-check and raises `BackendCompilerFailed`. We do an
+#      out-of-place divide here, so the compiled graph is well-formed.
+#   2. The library wraps `__call__` with `torch.compile(mode='reduce-
+#      overhead')` by default. With our outer `--compile-model`, that
+#      double-compile and its CUDA-graph memory pools produced ~10 GiB
+#      of extra per-layer activation memory at full recipe scale,
+#      blowing past 16 GiB VRAM.
+#   3. The kernel-backed path requires Hopper/Blackwell GPU + CUDA 12.9+
+#      + quack-kernels + nvidia-cutlass-dsl. At our batch=1 NMM shapes
+#      the quack kernels are slower than cuBLAS anyway (per the benchmark
+#      in scripts/benchmark_ns5.py), so the dependency wasn't paying its
+#      way. Dropping it removes the optional dep entirely.
 #
-#     gram-NS5 (kernels=True):  ~2.32 ms / pair, error 5.35
-#     gram-NS5 (kernels=False): ~1.00 ms / pair, error 5.35
+# Algorithm: maintain a small n×n Gram matrix R = X X^T and accumulate
+# a polynomial Q over five iterations of POLAR_EXPRESS coefficients,
+# with a reset at iteration 2 that re-orthogonalizes the intermediate
+# (X ← Q @ X, R ← X X^T, Q ← 0). Result: X ← Q_final @ X.
 #
-# Same math, ~2.3x faster without kernels — the quack kernels appear to
-# be tuned for very-large matrices and lose to cuBLAS at our sizes,
-# especially at batch=1 where launch overhead dominates.  We therefore
-# default kernels=False; users at batch>=4 with much larger matrices
-# can opt in via `nmm_gram_ns5_use_kernels=True`.
-#
-# Cache is keyed by `use_kernels` so we keep at most two GramNewtonSchulz
-# instances across the model (one per setting).
-_gram_ns_cache: dict[bool, "callable"] = {}
+# At gpt2_small NMM weight shapes (α = m/n = 4, m=3072, n=768), the
+# rectangular matmuls in the outer X-update are replaced by n×n
+# operations in the inner loop — 42% FLOP reduction vs stock NS5's 2T
+# rectangular matmuls (Tri Dao paper claim).
+
+# POLAR_EXPRESS per-iteration coefficients, scaled by a 1.05x safety
+# factor (arxiv 2505.16932 §5). Copied verbatim from the upstream
+# `gram_newton_schulz.coefficients` module so we don't depend on it.
+_POLAR_EXPRESS_COEFFICIENTS: tuple[tuple[float, float, float], ...] = (
+    (8.28721201814563 / 1.05, -23.595886519098837 / 1.05 ** 3,
+     17.300387312530933 / 1.05 ** 5),
+    (4.107059111542203 / 1.05, -2.9478499167379106 / 1.05 ** 3,
+     0.5448431082926601 / 1.05 ** 5),
+    (3.9486908534822946 / 1.05, -2.908902115962949 / 1.05 ** 3,
+     0.5518191394370137 / 1.05 ** 5),
+    (3.3184196573706015 / 1.05, -2.488488024314874 / 1.05 ** 3,
+     0.51004894012372 / 1.05 ** 5),
+    (2.300652019954817 / 1.05, -1.6689039845747493 / 1.05 ** 3,
+     0.4188073119525673 / 1.05 ** 5),
+)
+# Iteration indices (0-indexed) at which to re-orthogonalize the intermediate.
+_GRAM_RESET_ITERATIONS: frozenset = frozenset({2})
 
 
-def _get_gram_ns5_callable(use_kernels: bool = False):
-    """Return a callable matching `newton_schulz5(G, steps=5, eps=1e-7)`
-    that dispatches to Tri Dao's Gram-Newton-Schulz.
+def gram_newton_schulz(G: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """Gram-iteration Newton-Schulz orthogonalization (pure PyTorch).
 
-    Fails loud at first call if the `gram-newton-schulz` package isn't
-    installed — we don't want a silent fallback to stock NS5, since the
-    user explicitly set the flag.
-
-    When `use_kernels=False`, the library's quack-based CuTeDSL kernels
-    are bypassed in favour of plain PyTorch matmul + baddbmm.  The
-    Hopper/Blackwell GPU + CUDA 12.9+ requirements only apply when
-    `use_kernels=True`.
+    Stays in fp32 throughout, under `autocast(enabled=False)` — matches the
+    G226 invariant of `newton_schulz5`. Same shape contract: input and
+    output have the same shape; spectral norm of the output is driven
+    toward 1.
     """
-    if use_kernels not in _gram_ns_cache:
-        try:
-            from gram_newton_schulz import (
-                GramNewtonSchulz,
-                POLAR_EXPRESS_COEFFICIENTS,
-            )
-        except ImportError as e:
-            raise ImportError(
-                "nmm_use_gram_ns5=True requires the `gram-newton-schulz` "
-                "package. Install via `pip install gram-newton-schulz` or "
-                "`pip install titans-mag-gpt2[gram_ns5]`. "
-                "Hopper/Blackwell GPU + PyTorch 2.7+ + CUDA 12.9+ are "
-                "only required when `nmm_gram_ns5_use_kernels=True`."
-            ) from e
+    orig_dtype = G.dtype
+    orig_shape = G.shape
 
-        _gram_instance = GramNewtonSchulz(
-            ns_coefficients=POLAR_EXPRESS_COEFFICIENTS,
-            gram_newton_schulz_reset_iterations=[2],
-            ns_use_kernels=use_kernels,
-        )
+    with torch.amp.autocast(device_type=G.device.type, enabled=False):
+        X = G.float()
+        # Normalize to (B, m, n) so the iteration's matmuls are batched.
+        if X.ndim == 2:
+            X = X.unsqueeze(0)
+        elif X.ndim > 3:
+            X = X.view(-1, *X.shape[-2:])
 
-        def _gram_ns5_wrapper(G: torch.Tensor, steps: int = 5, eps: float = 1e-7,
-                              _inst=_gram_instance):
-            # Gram-NS5 ignores `steps` (per-iter coefficient table) and `eps`
-            # (handled internally). Signature kept compatible with
-            # `newton_schulz5` so callers don't have to branch.
-            return _inst(G)
+        # Iterate on the smaller-of-(m, n) Gram matrix. The transpose is a
+        # view (no copy); we transpose back at the end so the caller's
+        # output shape matches.
+        should_transpose = X.size(-2) > X.size(-1)
+        if should_transpose:
+            X = X.mT
 
-        _gram_ns_cache[use_kernels] = _gram_ns5_wrapper
-    return _gram_ns_cache[use_kernels]
+        # F-norm normalize, OUT-OF-PLACE. This is the load-bearing fix vs
+        # the upstream library's `X /= ...`: the in-place mutation breaks
+        # AOT autograd's tensor-version check, because `X.norm(...)`
+        # saves X at version 0 and the in-place divide bumps it to 1.
+        X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
+
+        # R = X X^T is the small n×n Gram matrix.
+        R = X @ X.mT
+        I = torch.eye(R.size(-1), device=R.device, dtype=R.dtype)
+        Q = None
+
+        for i, (a, b, c) in enumerate(_POLAR_EXPRESS_COEFFICIENTS):
+            if i in _GRAM_RESET_ITERATIONS and i != 0:
+                # Re-orthogonalize: apply the accumulated polynomial to X,
+                # then recompute R from the partial result. This is the
+                # mechanism that lets POLAR_EXPRESS converge in 5 iters
+                # what plain NS5 needs Muon-tuned coefficients to match.
+                X = Q @ X
+                R = X @ X.mT
+                Q = None
+
+            # Z = b·R + c·R²
+            Z = b * R + c * (R @ R)
+
+            if i == 0 or i in _GRAM_RESET_ITERATIONS:
+                Q = Z + a * I
+            else:
+                # Q ← a·Q + Q·Z = Q · (a·I + Z) — right-mult; equivalent to
+                # composing polynomial steps from the right.
+                Q = a * Q + Q @ Z
+
+            # Propagate R for the next iter, unless next iter resets it.
+            is_last = i == len(_POLAR_EXPRESS_COEFFICIENTS) - 1
+            next_is_reset = (i + 1) in _GRAM_RESET_ITERATIONS
+            if not is_last and not next_is_reset:
+                # R_next = (a·I + Z)·R·(a·I + Z) computed via two baddbmms.
+                RZ = a * R + R @ Z
+                R = a * RZ + Z @ RZ
+
+        # Final apply: X ← Q · X gives the orthogonalized rectangular
+        # output. The polynomial Q is the product Π(a_i·I + Z_i) for the
+        # iterations after the reset, applied to X via this one rectangular
+        # matmul. This is where the FLOP win lives: only two rectangular
+        # matmuls overall (initial R and this final Q·X), vs 2T for stock NS.
+        X = Q @ X
+
+        if should_transpose:
+            X = X.mT
+        X = X.view(orig_shape)
+
+    return X.to(orig_dtype)
 
 
 def _make_grad_fn(memory_mlp: nn.Module, spectral_norm: bool):
@@ -676,7 +736,6 @@ class NeuralMemoryModule(nn.Module):
         momentum_order: int = 1,
         ns5_steps: int = 5,
         use_gram_ns5: bool = False,
-        gram_ns5_use_kernels: bool = False,
         use_cans: bool = False,
     ):
         super().__init__()
@@ -728,7 +787,6 @@ class NeuralMemoryModule(nn.Module):
             raise ValueError(f"momentum_order must be >= 1 (got {momentum_order})")
         self.momentum_order = int(momentum_order)
         self.use_gram_ns5 = bool(use_gram_ns5)
-        self.gram_ns5_use_kernels = bool(gram_ns5_use_kernels)
         self.use_cans = bool(use_cans)
         if self.use_gram_ns5 and self.use_cans:
             raise ValueError(
@@ -745,25 +803,24 @@ class NeuralMemoryModule(nn.Module):
         # Bind `steps` here so call sites stay `self._ns5_fn(g)` with no
         # extra argument threading. Three options (mutually exclusive):
         #   1. use_cans=True → 3-step CANS-stationary with coefficients tuned
-        #      for the gpt2_small NMM sv range. Best speed/quality at our
-        #      shapes (see scripts/benchmark_ns5.py). Ignores ns5_steps.
-        #   2. use_gram_ns5=True → Tri Dao's Gram-NS5 (different algorithm,
-        #      Gram-NS5's own coefficient table — overrides ns5_steps).
+        #      for the gpt2_small NMM sv range (see scripts/benchmark_ns5.py).
+        #      Ignores ns5_steps.
+        #   2. use_gram_ns5=True → Gram-iteration Newton-Schulz (POLAR_EXPRESS
+        #      coefficients + reset at iter 2). Different algorithm; the
+        #      coefficient table is fixed, so ns5_steps is ignored.
         #   3. default → plain stock NS5 with `ns5_steps` iterations.
+        # All three paths follow the same lambda shape:
+        #   self._ns5_fn = lambda g, _f=<callable>, _s=<int>: _f(g)
+        # The `_s` slot lets introspection tests inspect the bound step
+        # count even when the callable itself ignores it.
         if self.use_cans:
-            # CANS-stationary has its step count and coefficients baked
-            # in — call it directly. Keep the closure shape compatible
-            # with the (_f, _s)-defaults convention used by the other
-            # branches so introspection tests still work.
             _ns5_base = cans_stationary
             _steps = _CANS_STATIONARY_3STEP_STEPS
             self._ns5_fn = lambda g, _f=_ns5_base, _s=_steps: _f(g)
         elif self.use_gram_ns5:
-            _ns5_base = _get_gram_ns5_callable(
-                use_kernels=self.gram_ns5_use_kernels,
-            )
-            _steps = self.ns5_steps
-            self._ns5_fn = lambda g, _f=_ns5_base, _s=_steps: _f(g, steps=_s)
+            _ns5_base = gram_newton_schulz
+            _steps = len(_POLAR_EXPRESS_COEFFICIENTS)
+            self._ns5_fn = lambda g, _f=_ns5_base, _s=_steps: _f(g)
         else:
             _ns5_base = newton_schulz5
             _steps = self.ns5_steps
@@ -1655,7 +1712,6 @@ class MultiHeadNMM(nn.Module):
         momentum_order: int = 1,
         ns5_steps: int = 5,
         use_gram_ns5: bool = False,
-        gram_ns5_use_kernels: bool = False,
         use_cans: bool = False,
         per_head_learned_params: bool = True,
     ):
@@ -1698,7 +1754,6 @@ class MultiHeadNMM(nn.Module):
                 momentum_order=momentum_order,
                 ns5_steps=ns5_steps,
                 use_gram_ns5=use_gram_ns5,
-                gram_ns5_use_kernels=gram_ns5_use_kernels,
                 use_cans=use_cans,
             )
             for _ in range(n_heads)

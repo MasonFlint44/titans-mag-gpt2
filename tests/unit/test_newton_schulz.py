@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from model.nmm import cans_stationary, newton_schulz5
+from model.nmm import cans_stationary, gram_newton_schulz, newton_schulz5
 
 
 def _spectral_norm(G: torch.Tensor) -> float:
@@ -286,3 +286,132 @@ def test_cans_tiny_input_with_eps_does_not_explode():
     """G norm near zero — `+ eps` must keep the divide finite."""
     G = torch.randn(8, 16) * 1e-9
     assert torch.isfinite(cans_stationary(G)).all()
+
+
+# ---------------------------------------------------------------------------
+# gram_newton_schulz — local Gram-iteration impl with POLAR_EXPRESS coefficients
+# ---------------------------------------------------------------------------
+
+
+def test_gram_ns5_spectral_norm_near_one_at_nmm_shapes():
+    """POLAR_EXPRESS coefficients should drive spectral norm toward 1 at
+    rectangular NMM gradient shapes."""
+    torch.manual_seed(0)
+    for rows, cols in [(768, 3072), (3072, 768)]:
+        G = torch.randn(rows, cols) * 0.5
+        s = _spectral_norm(gram_newton_schulz(G))
+        assert 0.70 < s < 1.30, f"shape=({rows},{cols}): out of basin, got {s}"
+
+
+def test_gram_ns5_with_batch_dim():
+    """3D inputs [B, h, d] — each batch row must converge to the basin."""
+    G = torch.randn(4, 768, 3072) * 0.5
+    out = gram_newton_schulz(G)
+    for b in range(G.shape[0]):
+        s = _spectral_norm(out[b])
+        assert 0.70 < s < 1.30, f"batch={b}: out of basin, got {s}"
+
+
+def test_gram_ns5_output_shape_matches_input():
+    for shape in [(8, 4), (4, 8), (16, 16), (32, 7), (7, 32), (2, 4, 8)]:
+        G = torch.randn(*shape)
+        assert gram_newton_schulz(G).shape == G.shape
+
+
+def test_gram_ns5_pre_scaling_is_cancelled():
+    """F-norm normalisation must cancel positive pre-scaling."""
+    G = torch.randn(768, 3072)
+    a = gram_newton_schulz(G)
+    b = gram_newton_schulz(G * 7.3)
+    assert torch.allclose(a, b, atol=1e-4)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])
+def test_gram_ns5_output_dtype_matches_input_dtype(dtype):
+    G = torch.randn(8, 16).to(dtype)
+    assert gram_newton_schulz(G).dtype == dtype
+
+
+def test_gram_ns5_internal_matmul_runs_fp32_under_bf16_autocast():
+    """G226 defence: gram-NS5 must keep its iteration in fp32 even under
+    an ambient bf16 autocast."""
+    seen_dtypes: list[torch.dtype] = []
+    orig_matmul = torch.Tensor.__matmul__
+
+    def patched(self, other):
+        out = orig_matmul(self, other)
+        seen_dtypes.append(out.dtype)
+        return out
+
+    torch.Tensor.__matmul__ = patched
+    try:
+        G = torch.randn(8, 64).to(torch.bfloat16)
+        with torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16):
+            _ = gram_newton_schulz(G)
+    finally:
+        torch.Tensor.__matmul__ = orig_matmul
+
+    # 5 iterations × multiple matmuls per iter, plus the initial X@X^T
+    # and final Q@X. At least 8 matmuls total.
+    assert len(seen_dtypes) >= 8, (
+        f"Expected >=8 matmuls inside gram-NS iteration, saw {len(seen_dtypes)}"
+    )
+    assert all(d == torch.float32 for d in seen_dtypes), (
+        f"At least one matmul ran outside fp32: {seen_dtypes}"
+    )
+
+
+def test_gram_ns5_normalize_is_out_of_place():
+    """Load-bearing autograd correctness: the F-norm divide must be
+    out-of-place. The upstream library's `X /= ...` mutates a tensor
+    that's saved for the norm's backward, breaking autograd's
+    version-tracking under torch.compile + AOT. Verify the local impl
+    leaves the input's _version untouched."""
+    G = torch.randn(8, 16, requires_grad=True)
+    v_before = G._version
+    Y = gram_newton_schulz(G)
+    assert G._version == v_before, (
+        f"gram_newton_schulz mutated its input in-place "
+        f"(version {v_before} -> {G._version})"
+    )
+    # And backward must run without raising the in-place error.
+    Y.sum().backward()
+    assert G.grad is not None
+
+
+def test_gram_ns5_tiny_input_with_eps_does_not_explode():
+    G = torch.randn(8, 16) * 1e-9
+    assert torch.isfinite(gram_newton_schulz(G)).all()
+
+
+@pytest.mark.gpu
+def test_gram_ns5_compile_plus_backward():
+    """Regression test for the bug that motivated the local impl:
+    `torch.compile` + the NMM forward + loss.backward() must not raise
+    an in-place autograd error inside gram_newton_schulz. This test
+    failed against the upstream library; it must pass against ours."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    from config import TitansConfig
+    from model.titans_gpt2 import TitansMAGGPT2
+
+    cfg = TitansConfig.gpt2_small(
+        n_layer=2, chunk_size=128,
+        nmm_block_size=64,
+        nmm_state_dtype="bf16",
+        nmm_detach_state_between_blocks=True,
+        nmm_use_gram_ns5=True,
+    )
+    m = TitansMAGGPT2(cfg).cuda()
+    m = torch.compile(m, mode="default", dynamic=False)
+    m.train()
+    x = torch.randint(0, cfg.vocab_size, (1, 128)).cuda()
+    boundaries = torch.zeros(1, 128, dtype=torch.bool).cuda()
+    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+        logits, _ = m(x, None, boundaries)
+    loss = torch.nn.functional.cross_entropy(
+        logits[:, :-1].reshape(-1, logits.size(-1)),
+        x[:, 1:].reshape(-1),
+    )
+    loss.backward()  # must not raise
+    assert torch.isfinite(loss).item()

@@ -132,7 +132,21 @@ def main():
         # Warn loudly if architecture-affecting flags were passed — silently
         # ignoring them would mask a configuration bug.
         nmm_kwargs = nmm_kwargs_from_args(args)
-        ignored = {**nmm_kwargs}
+        # Backend toggles that don't change parameter shapes / graph
+        # topology — safe to override on resume.  These flags select the
+        # NS5 *implementation* (which polynomial/coefficients/kernels)
+        # without changing any saved weight or optimizer state.  Useful
+        # when a chosen backend turns out to OOM or break under newer
+        # library versions and we want to fall back without re-training.
+        _RESUME_OVERRIDABLE = {
+            "nmm_use_gram_ns5",
+            "nmm_use_cans",
+            "nmm_ns5_steps",
+        }
+        overrides = {k: v for k, v in nmm_kwargs.items() if k in _RESUME_OVERRIDABLE}
+        for k, v in overrides.items():
+            setattr(config, k, v)
+        ignored = {k: v for k, v in nmm_kwargs.items() if k not in _RESUME_OVERRIDABLE}
         # `--size` defaults to "small" but might mismatch the checkpoint;
         # only flag it if it actually disagrees.
         ckpt_size = _config_size_label(config)
@@ -142,6 +156,12 @@ def main():
         # size; warn if the user tried to change it.
         if args.chunk_size != config.chunk_size and args.chunk_size != 512:
             ignored["chunk_size"] = args.chunk_size
+        if overrides:
+            print(
+                f"[finetune] --resume-from: applying non-architecture "
+                f"overrides ({sorted(overrides.keys())}) to the saved config.",
+                file=sys.stderr,
+            )
         if ignored:
             print(
                 f"[finetune] --resume-from: ignoring architecture-affecting "

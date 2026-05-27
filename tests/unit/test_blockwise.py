@@ -1300,13 +1300,9 @@ def test_use_cans_and_gram_ns5_mutually_exclusive_at_module_level():
         )
 
 
-def test_use_gram_ns5_resolves_to_gram_callable():
-    """When use_gram_ns5=True, self._ns5_fn dispatches to Tri Dao's
-    Gram-Newton-Schulz wrapper instead of stock NS5 or its compiled
-    variant. Only attempts to construct when the package is installed."""
-    import importlib.util
-    if importlib.util.find_spec("gram_newton_schulz") is None:
-        pytest.skip("gram-newton-schulz not installed; skipping")
+def test_use_gram_ns5_resolves_to_local_callable():
+    """When use_gram_ns5=True, self._ns5_fn dispatches to our local
+    gram_newton_schulz function, not stock NS5."""
     from model import nmm as _nmm
     nmm_gram = NeuralMemoryModule(
         n_embd=16, expansion=2, kernel_size=2,
@@ -1314,57 +1310,25 @@ def test_use_gram_ns5_resolves_to_gram_callable():
         use_gram_ns5=True,
     )
     gram_base = nmm_gram._ns5_fn.__defaults__[0]
-    # Wrapper is module-private but named _gram_ns5_wrapper.
-    assert gram_base.__name__ == "_gram_ns5_wrapper"
+    assert gram_base is _nmm.gram_newton_schulz
     assert gram_base is not _nmm.newton_schulz5
 
 
-def test_gram_ns5_kernels_flag_changes_dispatch():
-    """Two NMM modules with different `gram_ns5_use_kernels` settings must
-    end up with different `_ns5_fn` callables (different cache entries
-    under the hood). Same flag value should share the cache."""
-    import importlib.util
-    if importlib.util.find_spec("gram_newton_schulz") is None:
-        pytest.skip("gram-newton-schulz not installed; skipping")
-    common = dict(
-        n_embd=16, expansion=2, kernel_size=2,
-        spectral_norm=True, finetune_mode=False, use_gram_ns5=True,
-    )
-    nmm_no_kernels_1 = NeuralMemoryModule(**common, gram_ns5_use_kernels=False)
-    nmm_no_kernels_2 = NeuralMemoryModule(**common, gram_ns5_use_kernels=False)
-    nmm_kernels = NeuralMemoryModule(**common, gram_ns5_use_kernels=True)
-
-    base_no_k_1 = nmm_no_kernels_1._ns5_fn.__defaults__[0]
-    base_no_k_2 = nmm_no_kernels_2._ns5_fn.__defaults__[0]
-    base_k = nmm_kernels._ns5_fn.__defaults__[0]
-
-    # Same setting → cached singleton shared.
-    assert base_no_k_1 is base_no_k_2
-    # Different setting → distinct wrapper instance.
-    assert base_no_k_1 is not base_k
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Gram-NS5 requires CUDA")
 def test_gram_ns5_produces_spectrally_normalized_output():
-    """Gram-NS5 should produce output with spectral norm close to 1 on a
-    realistically-shaped NMM gradient tensor — same convergence target
-    as stock NS5, just a different algorithm/coefficients."""
-    import importlib.util
-    if importlib.util.find_spec("gram_newton_schulz") is None:
-        pytest.skip("gram-newton-schulz not installed; skipping")
-    from model.nmm import _get_gram_ns5_callable
+    """Local gram-NS5 should produce output with spectral norm close to 1
+    on a realistically-shaped NMM gradient tensor."""
+    from model.nmm import gram_newton_schulz
     torch.manual_seed(0)
-    G = torch.randn(1, 3072, 768, device="cuda", dtype=torch.float32)
-    gram_ns = _get_gram_ns5_callable()
-    Y = gram_ns(G)
+    G = torch.randn(1, 3072, 768, dtype=torch.float32)
+    Y = gram_newton_schulz(G)
     assert Y.shape == G.shape
     sv = torch.linalg.svdvals(Y[0])
-    # Polar Express coefficients give |sv - 1| ~ 0.12-0.15 on random
-    # Gaussian inputs, comparable to stock NS5-steps=5 (~0.13).
-    # Allow generous slack — bound is "spectrally normalized to within
-    # ~30%", catches catastrophic regressions (e.g. wrong shape passed).
+    # POLAR_EXPRESS coefficients give |sv - 1| ~ 0.12-0.15 on random
+    # Gaussian inputs, comparable to stock NS5-steps=5 (~0.13). Allow
+    # generous slack — bound is "spectrally normalized to within ~30%",
+    # catches catastrophic regressions (e.g. wrong shape passed).
     assert abs(sv.max().item() - 1.0) < 0.3, (
-        f"Gram-NS5 sv_max = {sv.max().item():.4f}, expected near 1"
+        f"gram-NS5 sv_max = {sv.max().item():.4f}, expected near 1"
     )
 
 
