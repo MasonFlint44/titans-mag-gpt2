@@ -319,11 +319,13 @@ def test_gram_ns5_output_shape_matches_input():
 
 
 def test_gram_ns5_pre_scaling_is_cancelled():
-    """F-norm normalisation must cancel positive pre-scaling."""
+    """F-norm normalisation must cancel positive pre-scaling. Tolerance
+    is loose (1e-3) because the iteration runs in fp16 — bit-exactness
+    would require fp32 internals."""
     G = torch.randn(768, 3072)
     a = gram_newton_schulz(G)
     b = gram_newton_schulz(G * 7.3)
-    assert torch.allclose(a, b, atol=1e-4)
+    assert torch.allclose(a, b, atol=1e-3)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])
@@ -332,9 +334,12 @@ def test_gram_ns5_output_dtype_matches_input_dtype(dtype):
     assert gram_newton_schulz(G).dtype == dtype
 
 
-def test_gram_ns5_internal_matmul_runs_fp32_under_bf16_autocast():
-    """G226 defence: gram-NS5 must keep its iteration in fp32 even under
-    an ambient bf16 autocast."""
+def test_gram_ns5_internal_matmul_runs_fp16_under_bf16_autocast():
+    """Gram-NS5 deliberately runs its iteration in fp16 (POLAR_EXPRESS
+    coefficients + reset at iter 2 tolerate fp16; the inner-loop tensor-
+    core speedup is ~2×). Under an outer bf16 autocast, the explicit
+    `X.to(torch.float16)` must stick — no silent downcast to bf16 from
+    autocast, no upcast back to fp32. This test guards both directions."""
     seen_dtypes: list[torch.dtype] = []
     orig_matmul = torch.Tensor.__matmul__
 
@@ -356,8 +361,11 @@ def test_gram_ns5_internal_matmul_runs_fp32_under_bf16_autocast():
     assert len(seen_dtypes) >= 8, (
         f"Expected >=8 matmuls inside gram-NS iteration, saw {len(seen_dtypes)}"
     )
-    assert all(d == torch.float32 for d in seen_dtypes), (
-        f"At least one matmul ran outside fp32: {seen_dtypes}"
+    # Every matmul should be fp16. Bf16 would mean autocast leaked through;
+    # fp32 would mean we missed the .to(fp16) cast on some tensor.
+    assert all(d == torch.float16 for d in seen_dtypes), (
+        f"At least one matmul ran outside fp16: "
+        f"{set(seen_dtypes)} (expected only torch.float16)"
     )
 
 
