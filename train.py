@@ -834,10 +834,10 @@ def main():
     parser.add_argument("--size", default="small",
                         choices=["small", "medium", "large", "xl"])
     parser.add_argument("--chunk-size", type=int, default=1024)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--grad-accum", type=int, default=1)
-    parser.add_argument("--max-steps", type=int, default=100_000)
-    parser.add_argument("--warmup-steps", type=int, default=1000)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--grad-accum", type=int, default=16)
+    parser.add_argument("--max-steps", type=int, default=5000)
+    parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--save-every", type=int, default=1000)
     parser.add_argument(
