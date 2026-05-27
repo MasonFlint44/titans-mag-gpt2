@@ -631,7 +631,6 @@ class NeuralMemoryModule(nn.Module):
         retrieval_from_M_prev: bool = False,
         state_dtype: str = "fp32",
         low_rank=None,
-        compile_inner_loop: bool = False,
         softclamp_max=None,
         block_size: int = 1,
         per_token_ns5: bool = False,
@@ -654,10 +653,6 @@ class NeuralMemoryModule(nn.Module):
         # paths (`step`, `step_with_conv`) still use the vmap-based
         # `per_sample_grad_fn` reference because they fire once per token
         # at inference time and aren't on any training hot path.
-        # When True, _run_inner_loop is wrapped in `torch.compile(mode="default")`
-        # after construction. The dominant ~1.8x speedup on the sequential
-        # path; pays a 30-60 s warm-up on the first training step.
-        self.compile_inner_loop = bool(compile_inner_loop)
         # Soft norm-clamp threshold applied to surprise gradients BEFORE NS5.
         # None = disabled (paper-strict). See `softclamp_grad_norm` docstring.
         self.softclamp_max = softclamp_max
@@ -697,8 +692,7 @@ class NeuralMemoryModule(nn.Module):
         self.momentum_order = int(momentum_order)
         # G274: fused NS5 via torch.compile. When True, NS5 calls inside
         # this NMM's forward paths go through the module-level compiled
-        # variant. No effect when compile_inner_loop=True (the inner-
-        # loop compile already wraps NS5 transitively).
+        # variant.
         self.compile_ns5 = bool(compile_ns5)
         self.use_gram_ns5 = bool(use_gram_ns5)
         # Number of Newton-Schulz iterations. 5 = paper-faithful (Muon
@@ -812,18 +806,6 @@ class NeuralMemoryModule(nn.Module):
             ).squeeze(0)
 
         self._batched_retrieve = vmap(_retrieve_one_sample, in_dims=(0, 0))
-
-        # Opt-in torch.compile on the per-token inner loop. Has to be done
-        # AFTER all attributes are wired (compile binds `self` at wrap time).
-        # mode="default" — see config docstring for why not "reduce-overhead".
-        # Wrapping the bound method works in PyTorch 2.x: inductor traces
-        # through `self` references just fine.
-        if self.compile_inner_loop:
-            # Bind the wrapped callable on the instance so any future access
-            # picks up the compiled version, NOT the class-level unbound method.
-            self._run_inner_loop = torch.compile(
-                self._run_inner_loop, mode="default", dynamic=False,
-            )
 
     def _build_init_M(self, B: int, device) -> dict:
         """Per-sample-batched initial M dict from `memory_mlp` parameters,
@@ -1613,7 +1595,6 @@ class MultiHeadNMM(nn.Module):
         retrieval_from_M_prev: bool = False,
         state_dtype: str = "fp32",
         low_rank=None,
-        compile_inner_loop: bool = False,
         softclamp_max=None,
         block_size: int = 1,
         per_token_ns5: bool = False,
@@ -1656,7 +1637,6 @@ class MultiHeadNMM(nn.Module):
                 retrieval_from_M_prev=retrieval_from_M_prev,
                 state_dtype=state_dtype,
                 low_rank=low_rank,
-                compile_inner_loop=compile_inner_loop,
                 softclamp_max=softclamp_max,
                 block_size=block_size,
                 per_token_ns5=per_token_ns5,

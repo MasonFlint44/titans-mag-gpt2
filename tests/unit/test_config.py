@@ -164,22 +164,6 @@ def test_from_scratch_equal_chunk_does_not_warn():
         TitansConfig(finetune_mode=False, chunk_size=1024, block_size=1024)
 
 
-# ---------------------------------------------------------------------------
-# Sequential-path flags warn when set with blockwise path (no-op there).
-# Bench confirmed: nmm_compile_inner_loop has zero effect on the blockwise
-# path, and costs ~20s of compile warm-up. Warn so users don't pay that
-# cost for nothing.
-# ---------------------------------------------------------------------------
-
-def test_compile_inner_loop_with_blockwise_warns():
-    with pytest.warns(UserWarning, match="sequential path"):
-        TitansConfig(nmm_block_size=64, nmm_compile_inner_loop=True)
-
-
-def test_compile_inner_loop_with_sequential_does_not_warn():
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        TitansConfig(nmm_block_size=1, nmm_compile_inner_loop=True)
 
 
 # ---------------------------------------------------------------------------

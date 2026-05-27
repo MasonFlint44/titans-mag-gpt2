@@ -98,20 +98,10 @@ def add_nmm_args(parser: argparse.ArgumentParser) -> None:
              "peak transient memory ~proportional to T/block_size.",
     )
     group.add_argument(
-        "--nmm-compile-inner-loop",
-        action="store_true",
-        help="Wrap the per-token inner loop in torch.compile(mode='default'). "
-             "Inductor fuses adjacent ops into batched Triton kernels — "
-             "dominant ~1.7x speedup. Pays a 30-60s warm-up on the first "
-             "training step.",
-    )
-    group.add_argument(
         "--nmm-compile-ns5",
         action="store_true",
-        help="Fused NS5 via torch.compile. No effect when "
-             "--nmm-compile-inner-loop is set (the inner-loop compile already "
-             "traces NS5 transitively). Useful for the sequential / per-token "
-             "NS5 paths.",
+        help="Fused NS5 via torch.compile. Useful for the sequential / "
+             "per-token NS5 paths where launch overhead dominates.",
     )
     group.add_argument(
         "--nmm-ns5-steps",
@@ -183,8 +173,6 @@ def nmm_kwargs_from_args(args: argparse.Namespace) -> dict:
         kwargs["nmm_layer_indices"] = args.nmm_layer_indices
     if args.nmm_detach_state_between_blocks:
         kwargs["nmm_detach_state_between_blocks"] = True
-    if args.nmm_compile_inner_loop:
-        kwargs["nmm_compile_inner_loop"] = True
     if args.nmm_compile_ns5:
         kwargs["nmm_compile_ns5"] = True
     if args.nmm_ns5_steps is not None:

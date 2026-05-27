@@ -139,8 +139,7 @@ passed to `TitansConfig`. Quick reference:
 | `--nmm-expansion N` | int | MemoryMLP hidden-dim multiplier (paper default 4; set 1 for ~4× smaller state at minor capacity cost) |
 | `--nmm-layer-indices I,J,K` | csv ints | Subset of blocks that get NMM (others become plain GPT-2 blocks) |
 | `--nmm-detach-state-between-blocks` | flag | Truncated BPTT at block boundaries (requires `--nmm-block-size > 1`) |
-| `--nmm-compile-inner-loop` | flag | torch.compile the inner loop (~1.7× speedup, 30-60s first-step warm-up) |
-| `--nmm-compile-ns5` | flag | Fused NS5 via torch.compile (no effect when `--nmm-compile-inner-loop` is set) |
+| `--nmm-compile-ns5` | flag | Fused NS5 via torch.compile (saves per-call kernel-launch overhead) |
 | `--nmm-ns5-steps N` | int | Newton-Schulz iteration count (default 5). **Lowering speeds up training significantly but drifts the spectral norm of NS5(g) — measured at gpt2_small: steps=4 ~16% faster + ~12% LR drift; steps=3 ~33% faster + ~20% LR drift.** Validate convergence on your data before lowering. |
 | `--nmm-use-gram-ns5` | flag | Replace stock NS5 with Tri Dao's Gram-Newton-Schulz (Dao-AILab/gram-newton-schulz). 2 rectangular matmuls + T iterations on the n×n Gram matrix, vs stock NS5's 2T rectangular matmuls. **Measured: ~15-20% speedup + ~2 GiB memory savings on the recommended recipe.** Requires `pip install gram-newton-schulz`, PyTorch 2.7+, CUDA 12.9+, and Hopper/Blackwell GPU. Overrides `--nmm-ns5-steps` and `--nmm-compile-ns5` (Gram-NS5 has its own coefficients and kernels). |
 
@@ -197,10 +196,6 @@ step, ~10 days for 50k steps.
 5. `--optim8bit` — 8-bit AdamW from `bitsandbytes`. ~1.2 GiB optimizer
    state savings on this model. Requires `pip install bitsandbytes`.
 
-**Note on `--nmm-compile-inner-loop`:** only affects the per-token
-sequential path (`block_size=1`); silent no-op on the blockwise path
-used here, and adds ~20 s of compile warm-up for zero runtime gain.
-Don't include it with this recipe — the config validator warns if you do.
 
 ### Faster polar decomposition: `--nmm-use-gram-ns5`
 
@@ -339,8 +334,6 @@ the implementation changes.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `nmm_compile_inner_loop` | `bool` | `False` | Wraps `_run_inner_loop` in `torch.compile(mode="default")`. Inductor traces the Python time loop and fuses adjacent ops into batched Triton kernels, eliminating the per-token dispatch overhead. **Dominant ~1.7× speedup** on its own. First step pays a one-time compile cost (~30-60 s); subsequent steps are fast. `mode="default"` (not `"reduce-overhead"`) because the inner loop builds new dicts each step which cudagraphs reject without explicit `cudagraph_mark_step_begin()` calls. |
-
 The analytical inner-gradient kernel (`model/nmm_fused.py`) is the only
 gradient path on the sequential `block_size=1` training loop — the
 earlier `nmm_fused_kernel` toggle is gone (always-on now). Hand-derived
@@ -349,24 +342,13 @@ ops match the autograd reference within fp32 round-off;
 `per_sample_grad_fn` reference still exists for decode-time
 `step` / `step_with_conv` use, but is no longer reachable from training.)
 
-**Measured impact** (RTX 5070 Ti, gpt2_small, bf16 autocast, end-to-end
-step with backward + Adam, `nmm_low_rank=64`, grad checkpoint on):
-
-| Config | T | B | Step time | tok/s | Speedup vs old reference path |
-|---|---|---|---|---|---|
-| analytical only (no compile) | 256 | 1 | 33.2 s | 7.7 | 1.20× |
-| `+compile_inner_loop` | 256 | 1 | **21.0 s** | **12.2** | **1.90×** |
-| analytical only (no compile) | 1024 | 1 | 136.0 s | 7.5 | 1.16× |
-| `+compile_inner_loop` | 1024 | 1 | **83.3 s** | **12.3** | **1.90×** |
-
-**Why isn't `compile_inner_loop` already 10×?** The remaining cost is
-the actual *compute* of the per-token NMM update plus the unavoidable
-sequential dependency on `(M, S)`. Inductor fuses adjacent ops into ~1
-Triton kernel per logical block, but it cannot parallelise across the
-time dimension (state is recurrent). The matmul shapes at our scale
-(W [H, D] @ k [D], outer products u [H] ⊗ v [D]) don't engage tensor
-cores — cuBLAS uses the same non-TC kernels for these shapes. The
-algorithmic answer is **`nmm_block_size > 1`** (blockwise path),
+The earlier `nmm_compile_inner_loop` toggle (which wrapped
+`_run_inner_loop` in `torch.compile`) is also gone. Users who want
+fused per-token kernels on the sequential path should rely on the
+outer `--compile-model` flag, which traces the full model forward
+(including `_run_inner_loop`) into one Inductor graph and yields
+similar throughput at this scale. The algorithmic answer for serious
+training throughput is **`nmm_block_size > 1`** (blockwise path),
 which batches matmuls across tokens to engage TC.
 
 ### Blockwise NMM (G266, G267) — chunk-as-update for tensor-core engagement
@@ -429,7 +411,7 @@ At `nmm_block_size=64`, a 50k-step training run goes from **~7 weeks (sequential
 
 CLI flag (not a config field — runtime concern): `--compile-model`.
 
-Wraps the full `TitansMAGGPT2` in `torch.compile(mode="default", dynamic=False)` after construction (and BEFORE DDP). Inductor traces the embedding + N transformer blocks + LN + LM head into one graph per shape. Composes with `nmm_compile_inner_loop` — the inner compile runs first, the outer compile traces around the compiled inner call.
+Wraps the full `TitansMAGGPT2` in `torch.compile(mode="default", dynamic=False)` after construction (and BEFORE DDP). Inductor traces the embedding + N transformer blocks + LN + LM head into one graph per shape.
 
 **Expected impact**: 10-20% throughput on top of the inner-loop compile alone. The outer attention + MLP paths haven't been compiled separately before; full-model compile picks them up. Adds 1-3 minutes of warm-up compile time on the first training step.
 
@@ -470,7 +452,7 @@ For long-context generation (e.g., 8K tokens cached across 12 layers), this is ~
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `nmm_compile_ns5` | `bool` | `False` | Routes NS5 calls through a module-level `torch.compile`-wrapped variant. The 5 NS5 iterations are 10 matmuls + 10 elementwise ops — without compile each is a separate CUDA kernel launch (~5-10 μs each → 50-100 μs of pure launch overhead per call). Compile collapses them into one graph. **No effect when `nmm_compile_inner_loop=True`** (which already wraps NS5 transitively). Most useful for the blockwise path (per-block NS5 calls), `per_token_ns5=True` (per-token NS5), and decode-time `step_with_conv()`. First call pays a 1-3 s warm-up. **At gpt2_small dims the win is ~5-10%** because matmul time dominates over launch overhead at H=3072. Larger at low_rank=64 and decode-time (~30-50%). |
+| `nmm_compile_ns5` | `bool` | `False` | Routes NS5 calls through a module-level `torch.compile`-wrapped variant. The 5 NS5 iterations are 10 matmuls + 10 elementwise ops — without compile each is a separate CUDA kernel launch (~5-10 μs each → 50-100 μs of pure launch overhead per call). Compile collapses them into one graph. Most useful for the blockwise path (per-block NS5 calls), `per_token_ns5=True` (per-token NS5), and decode-time `step_with_conv()`. First call pays a 1-3 s warm-up. **At gpt2_small dims the win is ~5-10%** because matmul time dominates over launch overhead at H=3072. Larger at low_rank=64 and decode-time (~30-50%). |
 
 ### Int8 state (G275)
 
@@ -520,12 +502,11 @@ For long-context generation (e.g., 8K tokens cached across 12 layers), this is ~
 
 ---
 
-**Recommended starting point for T ≥ 256 training:** the analytical
-inner gradient is always on; enabling `nmm_compile_inner_loop` adds the
-big sequential-path speedup. Net cost: one-time ~30 s compile at first
-iteration, then ~1.9× faster forever. (Most users want the blockwise
-path with `nmm_block_size=64` instead — see the earlier table for the
-~45× speedup that delivers.)
+**Recommended starting point for T ≥ 256 training:** the blockwise
+path with `nmm_block_size=64`, batched matmul-based inner gradient
+(always-on, no toggle), bf16 state, and `--compile-model` to fuse the
+outer transformer. See the blockwise speedup table above for the
+~45× win.
 
 ```python
 TitansConfig.gpt2_small(
@@ -533,8 +514,9 @@ TitansConfig.gpt2_small(
     nmm_state_dtype="bf16",
     nmm_block_size=64,
     nmm_low_rank=64,
-    nmm_compile_inner_loop=True,    # only meaningful at nmm_block_size=1
 )
+# Combine with `--compile-model --optim8bit --nmm-use-gram-ns5` at the
+# CLI for the documented consumer-GPU recipe (README.md, RUNBOOK.md).
 ```
 
 **G160 — `nmm_spectral_norm` and inner-loss reduction are linked:**

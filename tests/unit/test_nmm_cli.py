@@ -87,7 +87,6 @@ def test_boolean_flags_default_false():
     kwargs = nmm_kwargs_from_args(args)
     for k in (
         "nmm_detach_state_between_blocks",
-        "nmm_compile_inner_loop",
         "nmm_compile_ns5",
     ):
         assert k not in kwargs
@@ -100,11 +99,6 @@ def test_detach_state_round_trip():
         "nmm_detach_state_between_blocks": True,
         "nmm_block_size": 16,
     }
-
-
-def test_compile_inner_loop_round_trip():
-    args = _parse("--nmm-compile-inner-loop")
-    assert nmm_kwargs_from_args(args) == {"nmm_compile_inner_loop": True}
 
 
 def test_compile_ns5_round_trip():
@@ -139,9 +133,7 @@ def test_use_gram_ns5_omitted_stays_default():
 def test_full_recipe_round_trip():
     """The recommended T=1024 consumer-GPU recipe must produce a kwargs dict
     that splats cleanly into TitansConfig.gpt2_small. Uses the blockwise
-    path so compile_inner_loop / fused_kernel are intentionally omitted —
-    they're no-ops on the blockwise path and adding them costs ~20s of
-    torch.compile warm-up for zero runtime gain (the config validator warns)."""
+    path so no sequential-only knobs apply."""
     args = _parse(
         "--nmm-block-size", "64",
         "--nmm-state-dtype", "bf16",

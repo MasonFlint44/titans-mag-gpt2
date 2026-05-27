@@ -240,7 +240,6 @@ cfg = TitansConfig.gpt2_small(
     nmm_block_size=64,
     nmm_state_dtype="bf16",
     nmm_low_rank=64,
-    nmm_compile_inner_loop=True,   # the speedup
 )
 # Blockwise throughput at gpt2_small, RTX 5070 Ti, T=1024:
 #   block_size=64  -> 1.88 s/step ( 45x over sequential), 50k steps in ~31 h
@@ -269,8 +268,7 @@ Measured on RTX 5070 Ti: ~940 ms/step, 6.5 GiB peak with Gram-NS5
 `pip install gram-newton-schulz` and a Hopper/Blackwell GPU; drop it if
 unavailable.
 
-(`--nmm-compile-inner-loop` is a no-op on the blockwise path used here;
-the config validator warns if set.) The `--nmm-detach-state-between-blocks`
+The `--nmm-detach-state-between-blocks`
 flag is what makes full-rank fit at T=1024 — it bounds the backward
 graph to a single block. Tradeoff: outer NMM-related params learn from
 64-token windows instead of full-chunk BPTT. For standard LM training
