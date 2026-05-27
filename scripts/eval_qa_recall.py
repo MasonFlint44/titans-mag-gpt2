@@ -336,9 +336,10 @@ def _load_model(checkpoint_path: Path, device: torch.device):
     """Rebuild the model from a training checkpoint.
 
     Checkpoints store `config` as `dataclasses.asdict(config)` (see
-    `train.save_checkpoint`), so we reconstruct the TitansConfig via
-    `TitansConfig(**ckpt["config"])` — matches the established pattern in
-    tests/unit/test_checkpoint.py.
+    `train.save_checkpoint`). We use `TitansConfig.from_dict` so saved
+    checkpoints from older schema versions (with knobs we've since
+    removed) still load cleanly — `from_dict` silently drops keys in
+    `_REMOVED_CONFIG_KEYS` and raises loud on truly unknown keys.
     """
     from model.titans_gpt2 import TitansMAGGPT2
     from model import _unwrap
@@ -350,7 +351,7 @@ def _load_model(checkpoint_path: Path, device: torch.device):
             f"Checkpoint {checkpoint_path} lacks a 'config' key. "
             f"Pass a checkpoint saved by `save_checkpoint` from train.py."
         )
-    config = TitansConfig(**ckpt["config"])
+    config = TitansConfig.from_dict(ckpt["config"])
     model = TitansMAGGPT2(config).to(device)
     # train.py stores under "state_dict" (G184/G186/G195 path); generate.py
     # used "model" in an earlier draft — accept either for forward compat.

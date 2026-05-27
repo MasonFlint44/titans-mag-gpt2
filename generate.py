@@ -397,10 +397,10 @@ def _main():
                 f"Cannot rebuild the model architecture; pass a checkpoint "
                 f"saved by `save_checkpoint` from train.py."
             )
-        # save_checkpoint stores config as dataclasses.asdict(config) — rebuild
-        # the TitansConfig from the dict (same pattern as test_checkpoint.py
-        # and scripts.eval_qa_recall._load_model).
-        config = TitansConfig(**ckpt["config"])
+        # save_checkpoint stores config as dataclasses.asdict(config). Use
+        # `TitansConfig.from_dict` so removed-field migrations are honored —
+        # older checkpoints (with knobs we've since cut) load cleanly.
+        config = TitansConfig.from_dict(ckpt["config"])
         model = TitansMAGGPT2(config).to(device)
         # state_dict keys may have _orig_mod./module. prefixes from
         # torch.compile / DDP wrapping at save time. _unwrap strips them.

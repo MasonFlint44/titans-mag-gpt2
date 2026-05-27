@@ -1,8 +1,17 @@
 """TitansConfig dataclass + GPT-2 factory presets."""
 
+import dataclasses
 import warnings
 from dataclasses import dataclass, field
 from typing import Optional
+
+
+# Keys removed from TitansConfig over time. `from_dict` silently drops these
+# when loading older checkpoints so a refactor that cuts a knob doesn't
+# strand users on their old checkpoints. Keys NOT in this set are still
+# rejected loudly (typo / schema mismatch). Append to this set as knobs
+# are removed; never remove entries.
+_REMOVED_CONFIG_KEYS: frozenset = frozenset({})
 
 
 @dataclass
@@ -635,6 +644,28 @@ class TitansConfig:
                 UserWarning,
                 stacklevel=2,
             )
+
+    # Forward-compat loader for saved checkpoints. `save_checkpoint` writes
+    # `dataclasses.asdict(config)` (a dict with every current field). When
+    # a later schema removes a field, the dict still carries it — and
+    # `TitansConfig(**ckpt["config"])` raises TypeError on the unknown key.
+    # `from_dict` accepts the dict, silently drops keys listed in
+    # `_REMOVED_CONFIG_KEYS` (known intentional removals), and raises loud
+    # on any OTHER unknown key (likely typo or genuine schema mismatch).
+    @classmethod
+    def from_dict(cls, d: dict) -> "TitansConfig":
+        valid = {f.name for f in dataclasses.fields(cls)}
+        unknown = set(d) - valid
+        bad = unknown - _REMOVED_CONFIG_KEYS
+        if bad:
+            raise TypeError(
+                f"TitansConfig.from_dict: unrecognized config keys "
+                f"{sorted(bad)}. Either the saved checkpoint comes from "
+                f"an incompatible build, or someone misspelled a field. "
+                f"Known-deprecated keys that ARE silently dropped on load: "
+                f"{sorted(_REMOVED_CONFIG_KEYS)}."
+            )
+        return cls(**{k: v for k, v in d.items() if k in valid})
 
     # Factory methods. Merging via **{**defaults, **overrides} (not fixed
     # kwargs + **overrides) lets callers override backbone dims without

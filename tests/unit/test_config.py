@@ -382,3 +382,80 @@ def test_nmm_depth_rejects_other_values():
     for bad in (1, 3, 4, 0, -1):
         with pytest.raises(ValueError, match=r"nmm_depth=.*not supported"):
             TitansConfig.gpt2_small(nmm_depth=bad)
+
+
+# ---------------------------------------------------------------------------
+# from_dict: forward-compat checkpoint loading
+# ---------------------------------------------------------------------------
+
+def test_from_dict_round_trips_through_asdict():
+    """The basic contract: asdict produces a payload that from_dict can
+    reconstruct losslessly. save_checkpoint depends on this — it stores
+    `dataclasses.asdict(config)` and consumers load via from_dict."""
+    import dataclasses
+    cfg = TitansConfig.gpt2_small(chunk_size=256, block_size=256)
+    d = dataclasses.asdict(cfg)
+    cfg2 = TitansConfig.from_dict(d)
+    # Spot-check fields across categories (backbone, NMM, knobs).
+    assert cfg2.n_layer == cfg.n_layer
+    assert cfg2.n_embd == cfg.n_embd
+    assert cfg2.chunk_size == cfg.chunk_size
+    assert cfg2.nmm_block_size == cfg.nmm_block_size
+    assert cfg2.nmm_state_dtype == cfg.nmm_state_dtype
+
+
+def test_from_dict_silently_drops_known_removed_keys():
+    """When a knob is removed from TitansConfig, its name moves into
+    `_REMOVED_CONFIG_KEYS`. Old checkpoints that still carry the key in
+    their saved-asdict payload must load WITHOUT error — losing the
+    setting silently is the explicit migration contract."""
+    import dataclasses
+    from config import _REMOVED_CONFIG_KEYS
+    cfg = TitansConfig.gpt2_small(chunk_size=256, block_size=256)
+    d = dataclasses.asdict(cfg)
+    # Simulate a removed key by appending one to both the payload and
+    # the removed-set (monkeypatched scope).
+    d_with_removed = dict(d)
+    d_with_removed["__test_legacy_knob__"] = True
+    # Bypass the loud-error path by patching the removed set for this call.
+    import config as cfg_mod
+    original = cfg_mod._REMOVED_CONFIG_KEYS
+    cfg_mod._REMOVED_CONFIG_KEYS = frozenset(original | {"__test_legacy_knob__"})
+    try:
+        cfg2 = TitansConfig.from_dict(d_with_removed)  # must NOT raise
+    finally:
+        cfg_mod._REMOVED_CONFIG_KEYS = original
+    # Result matches the cfg without the removed key.
+    assert cfg2.n_layer == cfg.n_layer
+
+
+def test_from_dict_raises_loud_on_unknown_keys():
+    """A key that's NOT in the dataclass AND NOT in `_REMOVED_CONFIG_KEYS`
+    means either a typo or a schema mismatch we can't migrate silently.
+    Raise TypeError with a clear message so it's obvious which key is
+    the problem."""
+    import dataclasses
+    import pytest
+    cfg = TitansConfig.gpt2_small(chunk_size=256, block_size=256)
+    d = dataclasses.asdict(cfg)
+    d["totally_made_up_knob"] = 42
+    with pytest.raises(TypeError, match="totally_made_up_knob"):
+        TitansConfig.from_dict(d)
+
+
+def test_from_dict_error_message_lists_known_deprecated_keys():
+    """The error from `from_dict` must enumerate `_REMOVED_CONFIG_KEYS`
+    so users debugging a 'unrecognized key' failure can see which keys
+    WOULD have been migrated — narrows the gap between 'I'm using the
+    wrong schema' and 'I have a typo'."""
+    import dataclasses
+    import pytest
+    cfg = TitansConfig.gpt2_small(chunk_size=256, block_size=256)
+    d = dataclasses.asdict(cfg)
+    d["something_unrelated"] = "x"
+    with pytest.raises(TypeError) as exc:
+        TitansConfig.from_dict(d)
+    # Error mentions both the offending key and the deprecated allowlist
+    # mechanism (even if the list is empty).
+    assert "something_unrelated" in str(exc.value)
+    assert "_REMOVED_CONFIG_KEYS" in str(exc.value) or "deprecated" in str(exc.value).lower()
