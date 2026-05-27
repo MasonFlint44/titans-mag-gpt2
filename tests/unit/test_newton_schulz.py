@@ -339,29 +339,42 @@ def test_gram_ns5_internal_matmul_runs_fp16_under_bf16_autocast():
     coefficients + reset at iter 2 tolerate fp16; the inner-loop tensor-
     core speedup is ~2×). Under an outer bf16 autocast, the explicit
     `X.to(torch.float16)` must stick — no silent downcast to bf16 from
-    autocast, no upcast back to fp32. This test guards both directions."""
+    autocast, no upcast back to fp32. This test guards both directions.
+
+    Patches both `Tensor.__matmul__` (the plain `@` operator for the
+    initial Gram and final Q·X matmuls) and `torch.baddbmm` (the fused
+    polynomial-update ops in the loop body)."""
     seen_dtypes: list[torch.dtype] = []
     orig_matmul = torch.Tensor.__matmul__
+    orig_baddbmm = torch.baddbmm
 
-    def patched(self, other):
+    def patched_matmul(self, other):
         out = orig_matmul(self, other)
         seen_dtypes.append(out.dtype)
         return out
 
-    torch.Tensor.__matmul__ = patched
+    def patched_baddbmm(*args, **kwargs):
+        out = orig_baddbmm(*args, **kwargs)
+        seen_dtypes.append(out.dtype)
+        return out
+
+    torch.Tensor.__matmul__ = patched_matmul
+    torch.baddbmm = patched_baddbmm
     try:
         G = torch.randn(8, 64).to(torch.bfloat16)
         with torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16):
             _ = gram_newton_schulz(G)
     finally:
         torch.Tensor.__matmul__ = orig_matmul
+        torch.baddbmm = orig_baddbmm
 
-    # 5 iterations × multiple matmuls per iter, plus the initial X@X^T
-    # and final Q@X. At least 8 matmuls total.
-    assert len(seen_dtypes) >= 8, (
-        f"Expected >=8 matmuls inside gram-NS iteration, saw {len(seen_dtypes)}"
+    # 5 iterations × multiple matmul-class ops per iter, plus the initial
+    # X@X^T, the reset's X@X^T, and the final Q@X. At least 12 total ops.
+    assert len(seen_dtypes) >= 12, (
+        f"Expected >=12 matmul-class ops inside gram-NS iteration, "
+        f"saw {len(seen_dtypes)}"
     )
-    # Every matmul should be fp16. Bf16 would mean autocast leaked through;
+    # Every op should be fp16. Bf16 would mean autocast leaked through;
     # fp32 would mean we missed the .to(fp16) cast on some tensor.
     assert all(d == torch.float16 for d in seen_dtypes), (
         f"At least one matmul ran outside fp16: "

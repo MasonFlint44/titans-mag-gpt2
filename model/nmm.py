@@ -543,23 +543,23 @@ def gram_newton_schulz(G: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
                 R = X @ X.mT
                 Q = None
 
-            # Z = b·R + c·R²
-            Z = b * R + c * (R @ R)
+            # Z = b·R + c·R²  (one fused baddbmm: beta=b · R + alpha=c · R@R)
+            Z = torch.baddbmm(R, R, R, alpha=c, beta=b)
 
             if i == 0 or i in _GRAM_RESET_ITERATIONS:
                 Q = Z + a * I
             else:
                 # Q ← a·Q + Q·Z = Q · (a·I + Z) — right-mult; equivalent to
                 # composing polynomial steps from the right.
-                Q = a * Q + Q @ Z
+                Q = torch.baddbmm(Q, Q, Z, beta=a)
 
             # Propagate R for the next iter, unless next iter resets it.
             is_last = i == len(_POLAR_EXPRESS_COEFFICIENTS) - 1
             next_is_reset = (i + 1) in _GRAM_RESET_ITERATIONS
             if not is_last and not next_is_reset:
-                # R_next = (a·I + Z)·R·(a·I + Z) computed via two baddbmms.
-                RZ = a * R + R @ Z
-                R = a * RZ + Z @ RZ
+                # R_next = (a·I + Z)·R·(a·I + Z), two fused baddbmms.
+                RZ = torch.baddbmm(R, R, Z, beta=a)
+                R = torch.baddbmm(RZ, Z, RZ, beta=a)
 
         # Final apply: X ← Q · X gives the orthogonalized rectangular
         # output. The polynomial Q is the product Π(a_i·I + Z_i) for the
