@@ -92,12 +92,12 @@ def load_eval_records(path: Path) -> list[EvalRecord]:
 
 
 def _format_distractor(d: EvalRecord) -> str:
-    """Same `[P] ... Q: ... A: ...` shape as the training format — keeps the
-    eval distribution close to what the model saw at training time. Uses the
-    first answer alias as the canonical training-time gold."""
-    if not d.answers:
-        raise ValueError(f"distractor {d.id!r} has no answers")
-    return f"[P] {d.context}\nQ: {d.question}\nA: {d.answers[0]}\n"
+    """Format a distractor as a bare passage block (NO Q/A pair). Matches
+    the training scenario shape produced by `prepare_squad_corpus.build_
+    recall_scenarios`: passages clustered at the start, exactly one Q/A
+    at the end. Including distractor Q/A here would create a different
+    distribution from training and could leak answer-pattern signal."""
+    return f"[P] {d.context}\n"
 
 
 def build_qa_prompt(
@@ -110,10 +110,10 @@ def build_qa_prompt(
     """Build a prompt where the target passage ends `distance` tokens before
     the final question.
 
-    Layout (in token order):
+    Layout (in token order, matching training scenario shape):
         [P] {target_passage}
-        {distractor_1}      # one full triple
-        {distractor_2}
+        [P] {distractor_1_passage}
+        [P] {distractor_2_passage}
         ...
         Q: {target_question}
         A:
@@ -121,9 +121,9 @@ def build_qa_prompt(
     Distractors are appended AFTER the target until the byte-pair token gap
     between target's end and the final `Q:` reaches at least `distance`.
     Distractors are drawn from `distractor_pool` (which must exclude the
-    target) without replacement; if the pool is exhausted before reaching
-    `distance`, we stop and return whatever we packed — caller can check
-    the returned `actual_distance` for honest reporting.
+    target AND any record sharing the target's title — caller filters
+    before passing) without replacement; if the pool is exhausted before
+    reaching `distance`, we stop and return whatever we packed.
 
     Returns:
       prompt_text:     the full string to encode and feed the model.
@@ -132,7 +132,10 @@ def build_qa_prompt(
                        `Q:` start (≤ `distance` if pool exhausted).
     """
     target_block = f"[P] {target.context}\n"
-    q_prompt = f"\nQ: {target.question}\nA:"
+    # Q-prompt has NO leading newline — the trailing `\n` from the last
+    # passage block provides the separator. Adding one here would double
+    # the newline and diverge from training scenarios.
+    q_prompt = f"Q: {target.question}\nA:"
 
     # Build distractor padding by drawing without replacement until the
     # accumulated padding token count meets the target distance. Shuffle
@@ -285,9 +288,18 @@ def evaluate(
         t0 = time.time()
 
         for i, target in enumerate(sample):
-            # Distractor pool excludes the target (avoids leak: target's own
-            # Q/A pair appearing as a distractor right next to itself).
-            pool = [r for r in records if r.id != target.id]
+            # Distractor pool excludes the target AND any record sharing
+            # the target's Wikipedia title. Without the title filter, a
+            # distractor about the same article (e.g., another Q/A pair
+            # from the "Beyoncé" passage set) could let the model answer
+            # via topic-matching rather than cross-passage recall —
+            # exactly the failure mode the architecture test is supposed
+            # to expose. Matches the topic-disjoint sampling used in
+            # training scenarios.
+            pool = [
+                r for r in records
+                if r.id != target.id and r.title != target.title
+            ]
 
             for distance in distances:
                 # Per-distance rng makes the distractor shuffle reproducible
