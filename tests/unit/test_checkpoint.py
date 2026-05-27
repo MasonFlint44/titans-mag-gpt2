@@ -243,6 +243,192 @@ def test_run_training_continues_across_epochs_on_single_gpu():
     )
 
 
+# ---------------------------------------------------------------------------
+# run_training start_step / resume
+# ---------------------------------------------------------------------------
+
+
+def test_run_training_respects_start_step():
+    """`start_step=N` makes the training loop begin counting from N instead
+    of 0. With max_steps=N+K we should see exactly K optimizer steps,
+    leaving the final step counter at N+K.
+
+    This is the load-bearing piece of resume: without it, --resume-from
+    would re-do every step from 0, undoing the previous run."""
+    cfg = TitansConfig(
+        n_layer=2, n_head=2, n_embd=8, vocab_size=32,
+        block_size=64, chunk_size=4, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=2,
+        finetune_mode=False,
+        nmm_layer_indices=[],
+    )
+    model = TitansMAGGPT2(cfg)
+    optimizer = build_optimizer(model)
+
+    class _Loader:
+        def __iter__(self):
+            for _ in range(20):
+                yield _fake_batch(cfg, B=1, T=4)
+    loader = _Loader()
+
+    from train import run_training
+    run_training(
+        model=model, optimizer=optimizer, loader=loader,
+        device=torch.device("cpu"),
+        max_steps=5, warmup_steps=0, accum_steps=1,
+        log_every=1, save_every=None, save_dir=None,
+        config=cfg, autocast_dtype=None,
+        show_progress=False,
+        start_step=3,  # resume from step 3
+    )
+
+    # Two optimizer steps should have happened (3 -> 4 -> 5).
+    p = next(iter(model.parameters()))
+    state = optimizer.state.get(p, {})
+    n_steps = int(state.get("step", torch.tensor(0)).item()) if state else 0
+    assert n_steps == 2, (
+        f"Expected 2 optimizer steps (max_steps=5, start_step=3), got "
+        f"{n_steps}. run_training is ignoring start_step."
+    )
+
+
+def test_run_training_rejects_negative_start_step():
+    """start_step < 0 is nonsense (no prior step counter would be negative).
+    Reject loudly instead of silently coercing — catches the typo
+    --resume-from=path → start_step=-1 from a bug."""
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=8, vocab_size=16,
+        block_size=16, chunk_size=4, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=2,
+        finetune_mode=False, nmm_layer_indices=[],
+    )
+    model = TitansMAGGPT2(cfg)
+    optimizer = build_optimizer(model)
+    from train import run_training
+    with pytest.raises(ValueError, match="start_step must be >= 0"):
+        run_training(
+            model=model, optimizer=optimizer, loader=iter([]),
+            device=torch.device("cpu"),
+            max_steps=5, warmup_steps=0, accum_steps=1,
+            log_every=1, save_every=None, save_dir=None,
+            config=cfg, autocast_dtype=None,
+            show_progress=False,
+            start_step=-1,
+        )
+
+
+def test_run_training_rejects_start_step_at_or_past_max_steps():
+    """If `start_step >= max_steps` there's nothing to train — the loop
+    would no-op and the user would silently get a "done" with zero work.
+    Common cause: forgot to bump --max-steps when resuming. Fail loud."""
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=8, vocab_size=16,
+        block_size=16, chunk_size=4, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=2,
+        finetune_mode=False, nmm_layer_indices=[],
+    )
+    model = TitansMAGGPT2(cfg)
+    optimizer = build_optimizer(model)
+    from train import run_training
+    with pytest.raises(ValueError, match=r"start_step.*>=.*max_steps"):
+        run_training(
+            model=model, optimizer=optimizer, loader=iter([]),
+            device=torch.device("cpu"),
+            max_steps=5, warmup_steps=0, accum_steps=1,
+            log_every=1, save_every=None, save_dir=None,
+            config=cfg, autocast_dtype=None,
+            show_progress=False,
+            start_step=5,  # equal to max_steps
+        )
+
+
+def test_resume_round_trip_via_save_and_load(tmp_path):
+    """End-to-end resume integration: a continuous N-step run produces the
+    same final params as a (save at N//2) + (resume to N) run.
+
+    Both paths use the SAME max_steps (so the cosine LR schedule is
+    identical across cycles) and the SAME data trajectory (a constant-
+    batch loader removes loader-state-on-resume as a confounder). With
+    those held fixed, resume MUST be bit-equivalent — anything else
+    surfaces a real bug in start_step plumbing, state-dict / optimizer
+    loading, or from_dict's reconstruction.
+    """
+    cfg = TitansConfig(
+        n_layer=1, n_head=2, n_embd=8, vocab_size=16,
+        block_size=16, chunk_size=4, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=2,
+        finetune_mode=False, nmm_layer_indices=[],
+    )
+
+    # Constant-batch loader: every iteration sees the same input. Removes
+    # the "loader restarts at batch 0 on resume" confounder so we can
+    # directly test the resume-state mechanism.
+    torch.manual_seed(7)
+    const_batch = _fake_batch(cfg, B=1, T=4)
+    class _ConstLoader:
+        def __iter__(self):
+            while True:
+                yield const_batch
+
+    from train import run_training, load_checkpoint
+
+    # === Continuous run: max_steps=4, save_every=2 so we capture step 2 ===
+    torch.manual_seed(0)
+    model_cont = TitansMAGGPT2(cfg)
+    opt_cont = build_optimizer(model_cont)
+    save_dir = tmp_path / "cont_ckpts"
+    run_training(
+        model=model_cont, optimizer=opt_cont, loader=_ConstLoader(),
+        device=torch.device("cpu"),
+        max_steps=4, warmup_steps=0, accum_steps=1,
+        log_every=1, save_every=2, save_dir=str(save_dir), keep_last_n=10,
+        config=cfg, autocast_dtype=None,
+        show_progress=False,
+    )
+    cont_final_params = {
+        n: p.detach().clone() for n, p in model_cont.named_parameters()
+    }
+
+    # === Resume from the step=2 checkpoint, run through step 4 ===
+    # The saved `step=2` is the counter value at the save call site,
+    # which fires BEFORE the post-cycle `step += 1` — so the model has
+    # actually completed 3 cycles. To resume without redoing cycle 3,
+    # start_step = saved_step + 1 = 3. This matches the off-by-one fix
+    # in finetune.py / train.py's resume path.
+    ckpt = load_checkpoint(save_dir / "step_0000002.pt",
+                           device=torch.device("cpu"))
+    cfg_loaded = TitansConfig.from_dict(ckpt["config"])
+    # Different init seed → resume must override via load_state_dict.
+    torch.manual_seed(99)
+    model_b = TitansMAGGPT2(cfg_loaded)
+    model_b.load_state_dict(ckpt["state_dict"])
+    opt_b = build_optimizer(model_b)
+    opt_b.load_state_dict(ckpt["optimizer"])
+    run_training(
+        model=model_b, optimizer=opt_b, loader=_ConstLoader(),
+        device=torch.device("cpu"),
+        max_steps=4, warmup_steps=0, accum_steps=1,
+        log_every=1, save_every=None, save_dir=None,
+        config=cfg_loaded, autocast_dtype=None,
+        show_progress=False,
+        start_step=int(ckpt["step"]) + 1,
+    )
+    resume_params = {
+        n: p.detach().clone() for n, p in model_b.named_parameters()
+    }
+
+    # Bit-equivalent (within fp32 round-off). If this drifts, the resume
+    # state-restoration is incomplete.
+    for name in cont_final_params:
+        assert torch.allclose(
+            cont_final_params[name], resume_params[name],
+            atol=1e-6, rtol=1e-6,
+        ), (
+            f"Resume diverged on param {name}: max_abs="
+            f"{(cont_final_params[name] - resume_params[name]).abs().max().item():.2e}"
+        )
+
+
 def test_run_training_handles_all_none_nmm_norms():
     """Regression: under --vanilla-gpt2 every block is a PlainGPT2Block, so
     `compute_nmm_norm(states)` returns `[None, None, ...]` — a list that's

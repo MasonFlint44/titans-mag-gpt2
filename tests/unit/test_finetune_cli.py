@@ -102,3 +102,61 @@ def test_data_is_required():
     not deep inside encode_corpus with a confusing FileNotFoundError."""
     with pytest.raises(SystemExit):
         build_parser().parse_args([])
+
+
+# ---------------------------------------------------------------------------
+# --resume-from
+# ---------------------------------------------------------------------------
+
+def test_resume_from_flag_exists_and_defaults_none():
+    """No resume requested → args.resume_from is None, training proceeds
+    from a fresh load_pretrained. The flag must be opt-in."""
+    args = _parse()
+    assert args.resume_from is None
+
+
+def test_resume_from_round_trip():
+    args = _parse("--resume-from", "ckpts/titans/latest.pt")
+    assert args.resume_from == "ckpts/titans/latest.pt"
+
+
+def test_resume_compatible_with_recipe_flags():
+    """Resume + the documented consumer-GPU recipe must parse cleanly —
+    the user keeping the same training scaffolding (--max-steps, --grad-accum,
+    --compile-model, --optim8bit) is the common case for "extend a run by N
+    more steps."""
+    args = _parse(
+        "--resume-from", "ckpts/titans/latest.pt",
+        "--max-steps", "10000",
+        "--save-dir", "ckpts/titans",
+        "--batch-size", "1", "--grad-accum", "16",
+        "--compile-model", "--optim8bit",
+    )
+    assert args.resume_from == "ckpts/titans/latest.pt"
+    assert args.max_steps == 10000
+    assert args.compile_model is True
+    assert args.optim8bit is True
+
+
+def test_config_size_label_helper_round_trips():
+    """`_config_size_label` powers the resume-mode "ignored --size" warning.
+    Must correctly identify each preset by its (n_layer, n_embd) signature."""
+    from scripts.finetune import _config_size_label
+    from config import TitansConfig
+    assert _config_size_label(TitansConfig.gpt2_small()) == "small"
+    assert _config_size_label(TitansConfig.gpt2_medium()) == "medium"
+    assert _config_size_label(TitansConfig.gpt2_large()) == "large"
+    assert _config_size_label(TitansConfig.gpt2_xl()) == "xl"
+
+
+def test_config_size_label_handles_custom_dims():
+    """For custom configs not matching any factory, return 'custom' rather
+    than guessing — the warning would otherwise be misleading."""
+    from scripts.finetune import _config_size_label
+    from config import TitansConfig
+    custom = TitansConfig(
+        n_layer=4, n_head=2, n_embd=8, vocab_size=16,
+        block_size=32, chunk_size=16, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=2,
+    )
+    assert _config_size_label(custom) == "custom"

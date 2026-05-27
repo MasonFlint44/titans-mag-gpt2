@@ -133,6 +133,42 @@ Look for `dist.all_reduce` in the stack — that confirms a collective wait.
 
 ---
 
+## Resuming a training run
+
+Use `--resume-from PATH` on `scripts/finetune.py` (or `train.py`). The flag accepts a step-N checkpoint (`step_NNNNNNN.pt`) or `latest.pt` and restores:
+
+- **Model weights** via `load_state_dict` (with `_unwrap` to strip `_orig_mod.` / `module.` prefixes from compile/DDP wrapping).
+- **Optimizer state** — m, v moments and step counter survive across resume. Including for 8-bit AdamW (bitsandbytes).
+- **Step counter** — set to `saved_step + 1` so the resume picks up at the next cycle, not the saved one. (The saved value is off-by-one with respect to "completed cycles" — `save_checkpoint` records the counter before the post-cycle `step += 1` increment.)
+- **Config** — reconstructed from `dataclasses.asdict(config)` via `TitansConfig.from_dict`, which silently drops keys listed in `_REMOVED_CONFIG_KEYS` so checkpoints from older schemas still load.
+
+Architecture-affecting CLI flags (`--size`, `--chunk-size`, `--nmm-*`) are IGNORED in resume mode (warning printed to stderr). Changing them would invalidate the loaded optimizer state's param-group shape. Scaffolding flags (`--max-steps`, `--save-dir`, `--save-every`, `--warmup-steps`, `--grad-accum`) stay user-controlled — you can extend a run, redirect saves, or change effective batch size.
+
+Loader state is NOT restored — the data iterator restarts at the corpus head on each `run_training` call. For multi-epoch training where the loader gets recycled anyway, this is a wash; for partial-epoch resume you re-read the same head-of-corpus chunks once. Document caveat, not a bug.
+
+### Examples
+
+Extend a finished 5000-step run by 5000 more:
+```bash
+uv run python scripts/finetune.py \
+    --resume-from ckpts/titans/latest.pt \
+    --data corpus.txt \
+    --max-steps 10000 --save-dir ckpts/titans
+```
+
+Recover from a crash mid-training:
+```bash
+uv run python scripts/finetune.py \
+    --resume-from ckpts/titans/latest.pt \
+    --data corpus.txt \
+    --max-steps 5000 --save-dir ckpts/titans \
+    --compile-model --optim8bit  # same flags as the original
+```
+
+The `[finetune] resumed from ... (saved at step N, continuing from cycle N+1)` line on stderr confirms the resume worked.
+
+---
+
 ## LR deflation across resumes
 
 **Symptom.** Each time you resume from a checkpoint, the effective LR is lower than the previous run. After 3-4 resumes the model barely trains.

@@ -81,12 +81,27 @@ def build_parser() -> argparse.ArgumentParser:
              "Trained quality is empirically close to fp32 AdamW; small drift "
              "possible at long horizons.",
     )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Resume training from a saved checkpoint (step_*.pt or latest.pt). "
+             "Restores model weights, optimizer state (including 8-bit AdamW "
+             "moments), and step counter. Architecture-affecting CLI flags "
+             "(--size, --chunk-size, --nmm-*) are IGNORED in resume mode — the "
+             "checkpoint's saved config is authoritative. Training scaffolding "
+             "flags (--max-steps, --save-dir, --save-every, --warmup-steps, "
+             "--grad-accum) remain user-controlled so you can extend a run, "
+             "redirect saves, etc.",
+    )
     from scripts._nmm_cli import add_nmm_args
     add_nmm_args(parser)
     return parser
 
 
 def main():
+    import sys
+    from pathlib import Path
     from scripts._nmm_cli import nmm_kwargs_from_args
     parser = build_parser()
     args = parser.parse_args()
@@ -98,23 +113,109 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     autocast_dtype = torch.bfloat16 if device.type == "cuda" else None
 
-    config = build_finetune_config(
-        args.size,
-        chunk_size=args.chunk_size,
-        **nmm_kwargs_from_args(args),
-    )
-    model = TitansMAGGPT2(config).to(device)
-    load_pretrained(model, config)
+    # Resume vs fresh: in resume mode, the checkpoint's saved config is
+    # authoritative. Architecture-affecting CLI flags are ignored — pinning
+    # them at the checkpoint's values prevents the user from accidentally
+    # changing the model shape mid-run (which would silently corrupt
+    # `optimizer.load_state_dict`).
+    if args.resume_from is not None:
+        from train import load_checkpoint
+        from model import _unwrap
+        ckpt = load_checkpoint(args.resume_from, device=device)
+        if "config" not in ckpt:
+            raise SystemExit(
+                f"Checkpoint {args.resume_from} lacks a 'config' key; cannot "
+                f"reconstruct the model architecture. Use a checkpoint saved "
+                f"by save_checkpoint from train.py."
+            )
+        config = TitansConfig.from_dict(ckpt["config"])
+        # Warn loudly if architecture-affecting flags were passed — silently
+        # ignoring them would mask a configuration bug.
+        nmm_kwargs = nmm_kwargs_from_args(args)
+        ignored = {**nmm_kwargs}
+        # `--size` defaults to "small" but might mismatch the checkpoint;
+        # only flag it if it actually disagrees.
+        ckpt_size = _config_size_label(config)
+        if args.size != ckpt_size and args.size != "small":
+            ignored["size"] = args.size
+        # chunk_size in the checkpoint config IS the authoritative chunk
+        # size; warn if the user tried to change it.
+        if args.chunk_size != config.chunk_size and args.chunk_size != 512:
+            ignored["chunk_size"] = args.chunk_size
+        if ignored:
+            print(
+                f"[finetune] --resume-from: ignoring architecture-affecting "
+                f"CLI flags ({sorted(ignored.keys())}) — checkpoint's saved "
+                f"config is authoritative. Drop them from the command line "
+                f"to silence this warning.",
+                file=sys.stderr,
+            )
+        model = TitansMAGGPT2(config).to(device)
+        # Skip load_pretrained — the checkpoint already has trained weights.
+        # G277 — wrap with torch.compile BEFORE load_state_dict so the
+        # `_orig_mod.` prefix is in place before we load (or alternatively,
+        # use _unwrap on the saved dict). We do the latter — matches how
+        # other consumers (eval_qa_recall, generate.py) handle this.
+        if args.compile_model:
+            model = torch.compile(model, mode="default", dynamic=False)
+        state = ckpt.get("state_dict", ckpt.get("model"))
+        if state is None:
+            raise SystemExit(
+                f"Checkpoint {args.resume_from} has neither 'state_dict' nor "
+                f"'model' keys. Use a checkpoint saved by save_checkpoint."
+            )
+        # `_unwrap` strips any `_orig_mod.` (torch.compile) or `module.` (DDP)
+        # prefixes the checkpoint may have. The freshly-wrapped model above
+        # uses `_orig_mod.` again if compile_model is set, but
+        # `model.load_state_dict` accepts the unprefixed keys via standard
+        # PyTorch resolution.
+        if args.compile_model:
+            _unwrap(model).load_state_dict(_unwrap(state))
+        else:
+            model.load_state_dict(_unwrap(state))
+        optimizer = build_optimizer(model, use_8bit=args.optim8bit)
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        else:
+            print(
+                f"[finetune] --resume-from: checkpoint has no 'optimizer' key, "
+                f"continuing with fresh optimizer state (m, v moments reset "
+                f"to zero). Loss curve may briefly spike before the optimizer "
+                f"re-equilibrates.",
+                file=sys.stderr,
+            )
+        # The saved `step` field is the value of the step counter at the
+        # save call site, which lives BETWEEN `optimizer.step()` and the
+        # `step += 1` increment. So a checkpoint with `step=N` was actually
+        # saved AFTER `N+1` completed cycles. To resume without re-doing
+        # the most recent cycle, set `start_step = N + 1`.
+        start_step = int(ckpt.get("step", -1)) + 1
+        print(
+            f"[finetune] resumed from {args.resume_from} "
+            f"(saved at step {ckpt.get('step')}, "
+            f"continuing from cycle {start_step})",
+            file=sys.stderr,
+        )
+    else:
+        config = build_finetune_config(
+            args.size,
+            chunk_size=args.chunk_size,
+            **nmm_kwargs_from_args(args),
+        )
+        model = TitansMAGGPT2(config).to(device)
+        load_pretrained(model, config)
 
-    # G277 — full-forward torch.compile. Wrap AFTER load_pretrained (so the
-    # compile sees post-pretrained-init weights, not the random init) and
-    # BEFORE build_optimizer (so param groups are derived from the unwrapped
-    # model's named_parameters() — _unwrap strips both `_orig_mod.` compile
-    # prefixes and any DDP `module.` prefixes at save/load time).
-    if args.compile_model:
-        model = torch.compile(model, mode="default", dynamic=False)
+        # G277 — full-forward torch.compile. Wrap AFTER load_pretrained (so
+        # the compile sees post-pretrained-init weights, not the random init)
+        # and BEFORE build_optimizer (so param groups are derived from the
+        # unwrapped model's named_parameters() — _unwrap strips both
+        # `_orig_mod.` compile prefixes and any DDP `module.` prefixes at
+        # save/load time).
+        if args.compile_model:
+            model = torch.compile(model, mode="default", dynamic=False)
 
-    optimizer = build_optimizer(model, use_8bit=args.optim8bit)
+        optimizer = build_optimizer(model, use_8bit=args.optim8bit)
+        start_step = 0
 
     # Tokenize corpus (whole-file-as-one-document; users can swap in an HF
     # streaming reader for FineWebEdu-scale runs).
@@ -125,7 +226,7 @@ def main():
     loader = ParallelStreamLoader(
         token_stream,
         batch_size=args.batch_size,
-        chunk_size=args.chunk_size,
+        chunk_size=config.chunk_size,
         eot_id=tok.eot_token,
     )
 
@@ -143,7 +244,22 @@ def main():
         keep_last_n=args.keep_last_n,
         config=config,
         autocast_dtype=autocast_dtype,
+        start_step=start_step,
     )
+
+
+def _config_size_label(config: TitansConfig) -> str:
+    """Map a config's backbone dims back to the closest factory name for
+    use in --resume-from's architecture-mismatch warning."""
+    if config.n_embd == 768 and config.n_layer == 12:
+        return "small"
+    if config.n_embd == 1024 and config.n_layer == 24:
+        return "medium"
+    if config.n_embd == 1280 and config.n_layer == 36:
+        return "large"
+    if config.n_embd == 1600 and config.n_layer == 48:
+        return "xl"
+    return "custom"
 
 
 if __name__ == "__main__":

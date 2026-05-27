@@ -507,6 +507,7 @@ def run_training(
     rank: int = 0,
     is_distributed: bool = False,
     show_progress: bool = True,
+    start_step: int = 0,
 ) -> None:
     """Top-level training loop covering both Phase 4.4 (fine-tune) and 4.5
     (from-scratch). One optimizer.step per accumulation cycle of `accum_steps`
@@ -551,16 +552,43 @@ def run_training(
     per-step `loss`, `grad_norm`, `lr`, `tok/s`, and mean `nmm` norm is
     drawn to stderr. `log_every` periodic dumps are emitted via
     `tqdm.write` so they don't tear the bar.
+
+    Resume: pass `start_step > 0` to pick up where a previous run left off.
+    The caller is responsible for restoring model + optimizer state from a
+    checkpoint BEFORE calling run_training (see `load_checkpoint` and the
+    --resume-from CLI flag on train.py / scripts/finetune.py). The
+    `start_step` value sets the initial step counter so the LR schedule
+    resumes at the right point in the warmup-then-cosine trajectory; the
+    progress bar starts at `start_step / max_steps` rather than 0. Note
+    that the dataloader iterator is rebuilt from scratch on every call —
+    so a resumed run re-reads the corpus from the beginning, which is
+    fine for multi-epoch training where the loader gets recycled anyway
+    but means we don't preserve exact intra-epoch data position.
     """
     import contextlib
+
+    if start_step < 0:
+        raise ValueError(
+            f"start_step must be >= 0 (got {start_step!r}); use 0 for a fresh "
+            f"run or a positive value matching a saved checkpoint's step."
+        )
+    if start_step >= max_steps:
+        raise ValueError(
+            f"start_step ({start_step}) >= max_steps ({max_steps}) — there's "
+            f"nothing to train. Increase max_steps past the checkpoint's step "
+            f"to continue training."
+        )
 
     base_lrs = base_lrs_from_constants()
     model.train()
     nmm_states = None
 
     # Progress bar — only on rank 0, never under explicit show_progress=False.
+    # `initial=start_step` makes the bar render with the resumed progress
+    # rather than restarting from 0%.
     bar = tqdm(
         total=max_steps,
+        initial=start_step,
         desc="train",
         unit="step",
         disable=not (show_progress and rank == 0),
@@ -568,7 +596,7 @@ def run_training(
         leave=True,
     )
 
-    step = 0
+    step = start_step
     micro_batches = iter(loader)
     tokens_since_last_step = 0
     step_t0 = time.perf_counter()
@@ -845,6 +873,19 @@ def main():
              "`pip install bitsandbytes`. Trained quality is empirically "
              "close to fp32 AdamW; small drift possible at long horizons.",
     )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Resume training from a saved checkpoint (step_*.pt or latest.pt). "
+             "Restores model weights, optimizer state, and step counter so the "
+             "LR schedule resumes at the right position in warmup-then-cosine. "
+             "Architecture-affecting flags (--size, --chunk-size, --nmm-*) are "
+             "IGNORED in resume mode — the checkpoint's saved config is "
+             "authoritative. Training scaffolding (--max-steps, --save-dir, "
+             "--save-every, --warmup-steps, --grad-accum) remains user-"
+             "controlled. DDP-aware: each rank loads from the same checkpoint.",
+    )
     from scripts._nmm_cli import add_nmm_args, nmm_kwargs_from_args
     add_nmm_args(parser)
     args = parser.parse_args()
@@ -866,19 +907,32 @@ def main():
         rank, world_size = 0, 1
 
     try:
-        # Config BEFORE loader (loader reads chunk_size) — G205.
-        factory = {
-            "small": TitansConfig.gpt2_small,
-            "medium": TitansConfig.gpt2_medium,
-            "large": TitansConfig.gpt2_large,
-            "xl": TitansConfig.gpt2_xl,
-        }[args.size]
-        config = factory(
-            finetune_mode=False,
-            chunk_size=args.chunk_size,
-            block_size=args.chunk_size,  # match so all wpe positions train (G163)
-            **nmm_kwargs_from_args(args),
-        )
+        # Resume vs fresh. Resume: load config + state from checkpoint;
+        # architecture-affecting CLI flags are ignored (silently — train.py
+        # tolerates them rather than raising, since DDP launches all ranks
+        # with the same argv and may pre-existing scripts pass them
+        # uniformly).
+        if args.resume_from is not None:
+            ckpt = load_checkpoint(args.resume_from, device=device)
+            if "config" not in ckpt:
+                raise SystemExit(
+                    f"Checkpoint {args.resume_from} lacks a 'config' key."
+                )
+            config = TitansConfig.from_dict(ckpt["config"])
+        else:
+            # Config BEFORE loader (loader reads chunk_size) — G205.
+            factory = {
+                "small": TitansConfig.gpt2_small,
+                "medium": TitansConfig.gpt2_medium,
+                "large": TitansConfig.gpt2_large,
+                "xl": TitansConfig.gpt2_xl,
+            }[args.size]
+            config = factory(
+                finetune_mode=False,
+                chunk_size=args.chunk_size,
+                block_size=args.chunk_size,  # match so all wpe positions train (G163)
+                **nmm_kwargs_from_args(args),
+            )
 
         # Seed BEFORE model so all ranks build identical params, then re-seed
         # PER RANK so dropout masks diverge (G204).
@@ -906,7 +960,40 @@ def main():
         if is_distributed:
             model = DDP(model, device_ids=[local_rank])
 
+        # Load checkpoint weights AFTER compile + DDP wrap (matching the
+        # established save-side _unwrap pattern: _unwrap on save strips the
+        # prefixes, so we load into the inner module here too). Optimizer
+        # construction must follow because bnb 8-bit AdamW reads the
+        # current param tensors at __init__.
+        if args.resume_from is not None:
+            from model import _unwrap
+            state = ckpt.get("state_dict", ckpt.get("model"))
+            if state is None:
+                raise SystemExit(
+                    f"Checkpoint {args.resume_from} has neither 'state_dict' "
+                    f"nor 'model' keys."
+                )
+            _unwrap(model).load_state_dict(_unwrap(state))
+
         optimizer = build_optimizer(model, use_8bit=args.optim8bit)
+
+        if args.resume_from is not None and "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        # The saved `step` is the value of the counter at the save call
+        # site, BEFORE the `step += 1` increment — so `step=N` records
+        # model state after N+1 completed cycles. Resume must add 1 to
+        # avoid re-doing the saved cycle.
+        if args.resume_from is not None:
+            start_step = int(ckpt.get("step", -1)) + 1
+        else:
+            start_step = 0
+        if args.resume_from is not None and rank == 0:
+            print(
+                f"[train] resumed from {args.resume_from} "
+                f"(saved at step {ckpt.get('step')}, "
+                f"continuing from cycle {start_step})",
+                flush=True,
+            )
 
         tok = Tokenizer()
         with open(args.data, "r", encoding="utf-8") as f:
@@ -915,7 +1002,7 @@ def main():
         loader = ParallelStreamLoader(
             token_stream,
             batch_size=args.batch_size,
-            chunk_size=args.chunk_size,
+            chunk_size=config.chunk_size,
             eot_id=tok.eot_token,
             rank=rank,
             world_size=world_size,
@@ -939,6 +1026,7 @@ def main():
             autocast_dtype=autocast_dtype,
             rank=rank,
             is_distributed=is_distributed,
+            start_step=start_step,
         )
     finally:
         # G225/G227 — NCCL cleanup on exception path. Consistent 4-space indent.

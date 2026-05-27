@@ -108,6 +108,31 @@ Effective batch = 16 via `--grad-accum`; one optimizer step takes ~15 s.
 Drop `--nmm-use-gram-ns5` if you can't install the optional dep — adds
 ~15% step time and ~2 GiB peak memory.
 
+### Resuming a run
+
+To continue from a saved checkpoint (after a crash, deliberate pause, or
+to extend a finished run with more steps), pass `--resume-from`:
+
+```bash
+uv run python scripts/finetune.py \
+    --resume-from ckpts/titans/latest.pt \
+    --data /path/to/corpus.txt \
+    --max-steps 10000 \
+    --save-dir ckpts/titans
+```
+
+In resume mode the checkpoint's saved config is authoritative —
+architecture-affecting CLI flags (`--size`, `--chunk-size`, `--nmm-*`)
+are ignored with a warning, since changing them would invalidate the
+loaded optimizer state. Training scaffolding (`--max-steps`,
+`--save-dir`, `--save-every`, `--warmup-steps`, `--grad-accum`) stays
+under your control. Optimizer state is restored from the checkpoint so
+the AdamW moments and step counter pick up where they left off; the LR
+schedule advances to the correct position in warmup-then-cosine for the
+resumed step.
+
+The same flag works on `train.py` for from-scratch / DDP runs.
+
 See [`docs/CONFIG_REFERENCE.md`](docs/CONFIG_REFERENCE.md) for what each
 flag does, the speed/memory tradeoff space, and alternative recipes.
 
