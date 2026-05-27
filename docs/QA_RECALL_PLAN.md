@@ -78,7 +78,7 @@ uv run python scripts/finetune.py \
     --nmm-block-size 64 \
     --nmm-state-dtype bf16 \
     --nmm-detach-state-between-blocks \
-    --nmm-use-cans \
+    --nmm-use-gram-ns5 \
     --compile-model --optim8bit \
     --max-steps 5000 \
     --save-dir ckpts/titans

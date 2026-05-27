@@ -124,6 +124,22 @@ def test_use_gram_ns5_omitted_stays_default():
     assert cfg.nmm_use_gram_ns5 is False
 
 
+def test_gram_ns5_use_kernels_round_trip():
+    args = _parse("--nmm-use-gram-ns5", "--nmm-gram-ns5-use-kernels")
+    assert nmm_kwargs_from_args(args) == {
+        "nmm_use_gram_ns5": True,
+        "nmm_gram_ns5_use_kernels": True,
+    }
+
+
+def test_gram_ns5_use_kernels_omitted_stays_default():
+    """Default must be False — pure-PyTorch backend is the recipe default
+    because it's faster than the quack kernels at batch=1 NMM shapes."""
+    args = _parse()
+    cfg = TitansConfig.gpt2_small(**nmm_kwargs_from_args(args))
+    assert cfg.nmm_gram_ns5_use_kernels is False
+
+
 def test_use_cans_round_trip():
     args = _parse("--nmm-use-cans")
     assert nmm_kwargs_from_args(args) == {"nmm_use_cans": True}

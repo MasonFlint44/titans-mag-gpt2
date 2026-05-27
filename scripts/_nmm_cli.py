@@ -125,13 +125,23 @@ def add_nmm_args(parser: argparse.ArgumentParser) -> None:
         help="Replace stock Newton-Schulz with Tri Dao's Gram-Newton-Schulz "
              "(Dao-AILab/gram-newton-schulz). Standard NS5 does 2T "
              "rectangular matmuls; Gram-NS5 does 2 rectangular + T cheap "
-             "n×n Gram-matrix iterations. Not recommended for the default "
-             "recipe: Gram-NS5 only beats stock NS5 at batch>=4; at batch=1 "
-             "(our block-aggregate NMM gradient) the CUDA kernel launch "
-             "overhead makes it ~1.75x SLOWER. Requires `pip install "
-             "gram-newton-schulz` and PyTorch 2.7+ / CUDA 12.9+ on a "
-             "Hopper/Blackwell GPU. Overrides --nmm-ns5-steps. Mutually "
+             "n×n Gram-matrix iterations. By default this uses the pure-"
+             "PyTorch backend (no custom kernels) — fastest at our recipe's "
+             "batch=1 NMM shapes. Add --nmm-gram-ns5-use-kernels to opt in "
+             "to the library's quack-based CuTeDSL kernels (only beneficial "
+             "at batch>=4 with very large matrices). Requires `pip install "
+             "gram-newton-schulz`. Overrides --nmm-ns5-steps. Mutually "
              "exclusive with --nmm-use-cans.",
+    )
+    group.add_argument(
+        "--nmm-gram-ns5-use-kernels",
+        action="store_true",
+        help="When --nmm-use-gram-ns5 is set, also enable the library's "
+             "quack-based CuTeDSL kernels (default OFF — pure PyTorch is "
+             "~2.3x faster at our recipe's batch=1 NMM shapes). Enable only "
+             "if you're training at batch>=4 with much larger matrices than "
+             "gpt2_small. Requires PyTorch 2.7+, CUDA 12.9+, and a Hopper/"
+             "Blackwell GPU.",
     )
     group.add_argument(
         "--nmm-use-cans",
@@ -188,6 +198,8 @@ def nmm_kwargs_from_args(args: argparse.Namespace) -> dict:
         kwargs["nmm_ns5_steps"] = args.nmm_ns5_steps
     if args.nmm_use_gram_ns5:
         kwargs["nmm_use_gram_ns5"] = True
+    if args.nmm_gram_ns5_use_kernels:
+        kwargs["nmm_gram_ns5_use_kernels"] = True
     if args.nmm_use_cans:
         kwargs["nmm_use_cans"] = True
     return kwargs

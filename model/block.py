@@ -407,6 +407,7 @@ class TitansMAGBlock(nn.Module):
             momentum_order=config.nmm_momentum_order,
             ns5_steps=config.nmm_ns5_steps,
             use_gram_ns5=config.nmm_use_gram_ns5,
+            gram_ns5_use_kernels=config.nmm_gram_ns5_use_kernels,
             use_cans=config.nmm_use_cans,
         )
         if config.nmm_n_heads > 1:

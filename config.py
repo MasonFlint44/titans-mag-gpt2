@@ -289,6 +289,27 @@ class TitansConfig:
     # own per-iteration coefficient table).
     nmm_use_gram_ns5: bool = False
 
+    # nmm_gram_ns5_use_kernels: gates the library's `ns_use_kernels` toggle.
+    # When False (default), Gram-NS5's inner matmuls run via plain PyTorch
+    # (`A @ B` / `torch.baddbmm`) — pure cuBLAS, no custom CuTeDSL kernels.
+    # When True, the library's quack-based symmetric-GEMM kernels run instead.
+    #
+    # Default is False because at our recipe shapes (batch=1, 768x3072 /
+    # 3072x768) the quack kernels lose to cuBLAS by ~2.3x:
+    #
+    #     gram-NS5 (kernels=True):  ~2.32 ms / pair, error 5.35
+    #     gram-NS5 (kernels=False): ~1.00 ms / pair, error 5.35  ← default
+    #
+    # Same math, same quality — kernels just have a fixed launch overhead
+    # that doesn't pay off until matrices are very large.  Users training
+    # at batch>=4 on much larger weight shapes can opt in via
+    # `nmm_gram_ns5_use_kernels=True` (recommend benchmarking first).
+    #
+    # Has no effect when `nmm_use_gram_ns5=False`.  When kernels=True, the
+    # library additionally requires Hopper/Blackwell GPU + CUDA 12.9+ +
+    # PyTorch 2.7+; with kernels=False these requirements do not apply.
+    nmm_gram_ns5_use_kernels: bool = False
+
     # nmm_use_cans: when True, replace stock NS5 with 3-step
     # CANS-stationary (Chebyshev-optimised Newton-Schulz; arxiv 2506.10935).
     # Same polynomial form as NS5 (X = aX + (bA + cA²)X) but with
@@ -552,6 +573,18 @@ class TitansConfig:
                 f"{self.nmm_ns5_steps} — Gram-NS5 has its own per-iteration "
                 f"coefficient table. Drop nmm_ns5_steps to silence this "
                 f"warning.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        # nmm_gram_ns5_use_kernels has no effect when gram-NS5 isn't enabled;
+        # warn so a misconfigured run doesn't look mysteriously slow.
+        if self.nmm_gram_ns5_use_kernels and not self.nmm_use_gram_ns5:
+            warnings.warn(
+                "nmm_gram_ns5_use_kernels=True has no effect when "
+                "nmm_use_gram_ns5=False. Set nmm_use_gram_ns5=True to "
+                "enable the Gram-Newton-Schulz path, or drop "
+                "nmm_gram_ns5_use_kernels to silence this warning.",
                 UserWarning,
                 stacklevel=2,
             )

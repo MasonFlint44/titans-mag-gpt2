@@ -250,6 +250,53 @@ def test_use_gram_ns5_no_warn_with_default_knobs():
 
 
 # ---------------------------------------------------------------------------
+# nmm_gram_ns5_use_kernels — quack CuTeDSL kernels vs pure-PyTorch fallback
+# ---------------------------------------------------------------------------
+
+def test_gram_ns5_use_kernels_default_is_false():
+    """Default must be False so the recipe gets the pure-PyTorch backend
+    (faster than the quack kernels at our batch=1 NMM shapes). Users at
+    batch>=4 with much larger matrices can opt in."""
+    cfg = TitansConfig()
+    assert cfg.nmm_gram_ns5_use_kernels is False
+
+
+def test_gram_ns5_use_kernels_can_be_set_at_config_time():
+    cfg = TitansConfig(nmm_use_gram_ns5=True, nmm_gram_ns5_use_kernels=True)
+    assert cfg.nmm_gram_ns5_use_kernels is True
+
+
+def test_gram_ns5_use_kernels_warns_when_gram_ns5_off():
+    """Setting kernels=True without enabling gram-NS5 itself has no effect
+    — warn so a misconfigured run doesn't look mysteriously slow."""
+    with pytest.warns(UserWarning, match="nmm_gram_ns5_use_kernels=True"):
+        TitansConfig(nmm_gram_ns5_use_kernels=True)
+
+
+def test_gram_ns5_use_kernels_no_warn_when_off():
+    """Default kernels=False with default use_gram_ns5=False is the steady
+    state — no warning."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        TitansConfig()
+
+
+def test_gram_ns5_use_kernels_propagates_to_nmm():
+    """The config flag must actually flow through to NeuralMemoryModule."""
+    pytest.importorskip("gram_newton_schulz")
+    from model.titans_gpt2 import TitansMAGGPT2
+    cfg = TitansConfig.gpt2_small(
+        n_layer=1, nmm_block_size=64,
+        nmm_detach_state_between_blocks=True,
+        nmm_use_gram_ns5=True,
+        nmm_gram_ns5_use_kernels=False,  # match the new default explicitly
+    )
+    m = TitansMAGGPT2(cfg)
+    assert m.blocks[0].nmm.use_gram_ns5 is True
+    assert m.blocks[0].nmm.gram_ns5_use_kernels is False
+
+
+# ---------------------------------------------------------------------------
 # nmm_use_cans — 3-step CANS-stationary (arxiv 2506.10935)
 # ---------------------------------------------------------------------------
 

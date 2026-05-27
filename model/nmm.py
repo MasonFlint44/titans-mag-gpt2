@@ -433,26 +433,43 @@ def cans_stationary(G: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
 
 
 # Tri Dao's Gram-Newton-Schulz: drop-in NS5 replacement that does most
-# work on the small Gram matrix instead of the rectangular input. ~1.17-
-# 3.07× speedup at gpt2_small dims on consumer Blackwell, claimed 42%
-# FLOP reduction at α=m/n=4. See config.nmm_use_gram_ns5 for the user-
-# facing docs.
+# work on the small Gram matrix instead of the rectangular input.  See
+# `config.nmm_use_gram_ns5` and `config.nmm_gram_ns5_use_kernels` for the
+# user-facing docs.
 #
-# Module-level singleton so all NMM instances share a single GramNS
-# object (avoids repeated coefficient-table allocation).
-_gram_ns_cache = None
+# The library exposes a `ns_use_kernels` toggle: when False, the inner
+# matmuls run via plain PyTorch (`A @ B` / `torch.baddbmm`) instead of
+# quack's custom CuTeDSL kernels.  Measured at our batch=1 NMM shapes
+# (gpt2_small, 768x3072 / 3072x768):
+#
+#     gram-NS5 (kernels=True):  ~2.32 ms / pair, error 5.35
+#     gram-NS5 (kernels=False): ~1.00 ms / pair, error 5.35
+#
+# Same math, ~2.3x faster without kernels — the quack kernels appear to
+# be tuned for very-large matrices and lose to cuBLAS at our sizes,
+# especially at batch=1 where launch overhead dominates.  We therefore
+# default kernels=False; users at batch>=4 with much larger matrices
+# can opt in via `nmm_gram_ns5_use_kernels=True`.
+#
+# Cache is keyed by `use_kernels` so we keep at most two GramNewtonSchulz
+# instances across the model (one per setting).
+_gram_ns_cache: dict[bool, "callable"] = {}
 
 
-def _get_gram_ns5_callable():
+def _get_gram_ns5_callable(use_kernels: bool = False):
     """Return a callable matching `newton_schulz5(G, steps=5, eps=1e-7)`
     that dispatches to Tri Dao's Gram-Newton-Schulz.
 
     Fails loud at first call if the `gram-newton-schulz` package isn't
     installed — we don't want a silent fallback to stock NS5, since the
     user explicitly set the flag.
+
+    When `use_kernels=False`, the library's quack-based CuTeDSL kernels
+    are bypassed in favour of plain PyTorch matmul + baddbmm.  The
+    Hopper/Blackwell GPU + CUDA 12.9+ requirements only apply when
+    `use_kernels=True`.
     """
-    global _gram_ns_cache
-    if _gram_ns_cache is None:
+    if use_kernels not in _gram_ns_cache:
         try:
             from gram_newton_schulz import (
                 GramNewtonSchulz,
@@ -462,23 +479,26 @@ def _get_gram_ns5_callable():
             raise ImportError(
                 "nmm_use_gram_ns5=True requires the `gram-newton-schulz` "
                 "package. Install via `pip install gram-newton-schulz` or "
-                "`pip install titans-mag-gpt2[gram_ns5]`. Requires PyTorch "
-                "2.7+, CUDA 12.9+, and a Hopper/Blackwell GPU."
+                "`pip install titans-mag-gpt2[gram_ns5]`. "
+                "Hopper/Blackwell GPU + PyTorch 2.7+ + CUDA 12.9+ are "
+                "only required when `nmm_gram_ns5_use_kernels=True`."
             ) from e
 
         _gram_instance = GramNewtonSchulz(
             ns_coefficients=POLAR_EXPRESS_COEFFICIENTS,
             gram_newton_schulz_reset_iterations=[2],
+            ns_use_kernels=use_kernels,
         )
 
-        def _gram_ns5_wrapper(G: torch.Tensor, steps: int = 5, eps: float = 1e-7):
+        def _gram_ns5_wrapper(G: torch.Tensor, steps: int = 5, eps: float = 1e-7,
+                              _inst=_gram_instance):
             # Gram-NS5 ignores `steps` (per-iter coefficient table) and `eps`
             # (handled internally). Signature kept compatible with
             # `newton_schulz5` so callers don't have to branch.
-            return _gram_instance(G)
+            return _inst(G)
 
-        _gram_ns_cache = _gram_ns5_wrapper
-    return _gram_ns_cache
+        _gram_ns_cache[use_kernels] = _gram_ns5_wrapper
+    return _gram_ns_cache[use_kernels]
 
 
 def _make_grad_fn(memory_mlp: nn.Module, spectral_norm: bool):
@@ -656,6 +676,7 @@ class NeuralMemoryModule(nn.Module):
         momentum_order: int = 1,
         ns5_steps: int = 5,
         use_gram_ns5: bool = False,
+        gram_ns5_use_kernels: bool = False,
         use_cans: bool = False,
     ):
         super().__init__()
@@ -707,6 +728,7 @@ class NeuralMemoryModule(nn.Module):
             raise ValueError(f"momentum_order must be >= 1 (got {momentum_order})")
         self.momentum_order = int(momentum_order)
         self.use_gram_ns5 = bool(use_gram_ns5)
+        self.gram_ns5_use_kernels = bool(gram_ns5_use_kernels)
         self.use_cans = bool(use_cans)
         if self.use_gram_ns5 and self.use_cans:
             raise ValueError(
@@ -737,7 +759,9 @@ class NeuralMemoryModule(nn.Module):
             _steps = _CANS_STATIONARY_3STEP_STEPS
             self._ns5_fn = lambda g, _f=_ns5_base, _s=_steps: _f(g)
         elif self.use_gram_ns5:
-            _ns5_base = _get_gram_ns5_callable()
+            _ns5_base = _get_gram_ns5_callable(
+                use_kernels=self.gram_ns5_use_kernels,
+            )
             _steps = self.ns5_steps
             self._ns5_fn = lambda g, _f=_ns5_base, _s=_steps: _f(g, steps=_s)
         else:
@@ -1631,6 +1655,7 @@ class MultiHeadNMM(nn.Module):
         momentum_order: int = 1,
         ns5_steps: int = 5,
         use_gram_ns5: bool = False,
+        gram_ns5_use_kernels: bool = False,
         use_cans: bool = False,
         per_head_learned_params: bool = True,
     ):
@@ -1673,6 +1698,7 @@ class MultiHeadNMM(nn.Module):
                 momentum_order=momentum_order,
                 ns5_steps=ns5_steps,
                 use_gram_ns5=use_gram_ns5,
+                gram_ns5_use_kernels=gram_ns5_use_kernels,
                 use_cans=use_cans,
             )
             for _ in range(n_heads)

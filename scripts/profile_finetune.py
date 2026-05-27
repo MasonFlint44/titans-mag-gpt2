@@ -46,7 +46,8 @@ RECIPE_KWARGS = dict(
     nmm_block_size=64,
     nmm_state_dtype="bf16",
     nmm_detach_state_between_blocks=True,
-    nmm_use_cans=True,
+    nmm_use_gram_ns5=True,
+    # nmm_gram_ns5_use_kernels defaults to False — pure-PyTorch backend.
 )
 
 

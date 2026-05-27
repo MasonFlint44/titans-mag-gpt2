@@ -1307,8 +1307,6 @@ def test_use_gram_ns5_resolves_to_gram_callable():
     import importlib.util
     if importlib.util.find_spec("gram_newton_schulz") is None:
         pytest.skip("gram-newton-schulz not installed; skipping")
-    if not torch.cuda.is_available():
-        pytest.skip("Gram-NS5 requires CUDA")
     from model import nmm as _nmm
     nmm_gram = NeuralMemoryModule(
         n_embd=16, expansion=2, kernel_size=2,
@@ -1319,6 +1317,31 @@ def test_use_gram_ns5_resolves_to_gram_callable():
     # Wrapper is module-private but named _gram_ns5_wrapper.
     assert gram_base.__name__ == "_gram_ns5_wrapper"
     assert gram_base is not _nmm.newton_schulz5
+
+
+def test_gram_ns5_kernels_flag_changes_dispatch():
+    """Two NMM modules with different `gram_ns5_use_kernels` settings must
+    end up with different `_ns5_fn` callables (different cache entries
+    under the hood). Same flag value should share the cache."""
+    import importlib.util
+    if importlib.util.find_spec("gram_newton_schulz") is None:
+        pytest.skip("gram-newton-schulz not installed; skipping")
+    common = dict(
+        n_embd=16, expansion=2, kernel_size=2,
+        spectral_norm=True, finetune_mode=False, use_gram_ns5=True,
+    )
+    nmm_no_kernels_1 = NeuralMemoryModule(**common, gram_ns5_use_kernels=False)
+    nmm_no_kernels_2 = NeuralMemoryModule(**common, gram_ns5_use_kernels=False)
+    nmm_kernels = NeuralMemoryModule(**common, gram_ns5_use_kernels=True)
+
+    base_no_k_1 = nmm_no_kernels_1._ns5_fn.__defaults__[0]
+    base_no_k_2 = nmm_no_kernels_2._ns5_fn.__defaults__[0]
+    base_k = nmm_kernels._ns5_fn.__defaults__[0]
+
+    # Same setting → cached singleton shared.
+    assert base_no_k_1 is base_no_k_2
+    # Different setting → distinct wrapper instance.
+    assert base_no_k_1 is not base_k
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Gram-NS5 requires CUDA")

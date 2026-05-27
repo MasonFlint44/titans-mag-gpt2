@@ -140,8 +140,9 @@ passed to `TitansConfig`. Quick reference:
 | `--nmm-layer-indices I,J,K` | csv ints | Subset of blocks that get NMM (others become plain GPT-2 blocks) |
 | `--nmm-detach-state-between-blocks` | flag | Truncated BPTT at block boundaries (requires `--nmm-block-size > 1`) |
 | `--nmm-ns5-steps N` | int | Newton-Schulz iteration count (default 5). **Lowering speeds up training significantly but drifts the spectral norm of NS5(g) — measured at gpt2_small: steps=4 ~16% faster + ~12% LR drift; steps=3 ~33% faster + ~20% LR drift.** Validate convergence on your data before lowering. |
-| `--nmm-use-gram-ns5` | flag | Replace stock NS5 with Tri Dao's Gram-Newton-Schulz (Dao-AILab/gram-newton-schulz). **Not recommended for the default recipe.** Gram-NS5 is faster at batch≥4 but our NMM calls NS5 with batch=1 (block-aggregate gradient), where gram-NS5 has higher CUDA kernel overhead and runs ~1.75× slower than stock NS5. Requires `pip install gram-newton-schulz`, PyTorch 2.7+, CUDA 12.9+, and Hopper/Blackwell GPU. Mutually exclusive with `--nmm-use-cans`. |
-| `--nmm-use-cans` | flag | Replace stock NS5 with 3-step CANS-stationary (arxiv 2506.10935). Same polynomial form as NS5 but with `(a, b, c) = (3.8641, -9.7196, 9.7101)` — minimax-optimised over the post-F-norm singular value range of gpt2_small NMM gradients. At recipe shapes (768×3072 / 3072×768, batch=1): **~4.6× better orthogonalisation error in 3 iterations than NS5 in 5, at ~1.6× the kernel speed.** No extra dependency, pure PyTorch. Coefficients are recipe-specific — re-derive via `scripts/benchmark_ns5.py` if you change d / expansion / low_rank. Overrides `--nmm-ns5-steps`. Mutually exclusive with `--nmm-use-gram-ns5`. |
+| `--nmm-use-gram-ns5` | flag | Replace stock NS5 with Tri Dao's Gram-Newton-Schulz (Dao-AILab/gram-newton-schulz). **Recommended for the default recipe** when paired with the default `nmm_gram_ns5_use_kernels=False` (pure PyTorch). Measured ~2x faster than NS5-5 at batch=1 NMM shapes (1.00 ms vs 2.10 ms / pair). Requires `pip install gram-newton-schulz`. Overrides `--nmm-ns5-steps`. Mutually exclusive with `--nmm-use-cans`. |
+| `--nmm-gram-ns5-use-kernels` | flag | When `--nmm-use-gram-ns5` is set, also enable the library's quack-based CuTeDSL kernels. Default OFF — at our recipe's batch=1 shapes pure-PyTorch matmul + baddbmm is ~2.3× faster than the kernels. Enable only at batch≥4 with much larger matrices than gpt2_small. Requires PyTorch 2.7+, CUDA 12.9+, and Hopper/Blackwell GPU. No effect when `--nmm-use-gram-ns5` is off. |
+| `--nmm-use-cans` | flag | Replace stock NS5 with 3-step CANS-stationary (arxiv 2506.10935). Same polynomial form as NS5 but with `(a, b, c) = (3.8641, -9.7196, 9.7101)` — minimax-optimised over the post-F-norm singular value range of gpt2_small NMM gradients. At recipe shapes (768×3072 / 3072×768, batch=1): **~4.6× better orthogonalisation error in 3 iterations than NS5 in 5, at ~1.6× the kernel speed.** Slower than gram-NS5 (torch backend) but better quality. No extra dependency, pure PyTorch. Coefficients are recipe-specific — re-derive via `scripts/benchmark_ns5.py` if you change d / expansion / low_rank. Overrides `--nmm-ns5-steps`. Mutually exclusive with `--nmm-use-gram-ns5`. |
 
 ### Recommended consumer-GPU recipe (T=1024, full-rank, 16 GiB card)
 
@@ -156,13 +157,13 @@ python -m train --data corpus.txt \
     --nmm-block-size 64 \
     --nmm-state-dtype bf16 \
     --nmm-detach-state-between-blocks \
-    --nmm-use-cans \
+    --nmm-use-gram-ns5 \
     --compile-model \
     --optim8bit
 ```
 
 **Measured on RTX 5070 Ti (15.5 GiB VRAM), baseline without
-`--nmm-use-cans`:**
+`--nmm-use-gram-ns5`:**
 
 | Metric | Value |
 |---|---|
@@ -174,11 +175,12 @@ python -m train --data corpus.txt \
 | 1k optimizer steps | ~5 h |
 | 50k optimizer steps | ~10 days |
 
-With `--nmm-use-cans`: NS5 (~78% of CUDA time) runs ~1.6× faster at
-kernel level (CANS-3 vs NS5-5 at the W1/W2 shapes). End-to-end gain is
-smaller than 1.6× since non-NS work is unchanged; the exact step time
-depends on what fraction of your run is NMM. See `--nmm-use-cans` row
-in the flag table and the "Faster polar decomposition" section below.
+With `--nmm-use-gram-ns5` (kernels off by default): NS5 (~78% of CUDA
+time) runs ~2× faster at kernel level (1.00 ms vs 2.10 ms / pair at
+the W1/W2 shapes). End-to-end gain is smaller than 2× since non-NS
+work is unchanged; the exact step time depends on what fraction of
+your run is NMM. See the "Faster polar decomposition" sections below
+for the kernel-vs-torch tradeoffs and the gram-NS5-vs-CANS choice.
 
 **What each flag buys you:**
 
@@ -196,7 +198,55 @@ in the flag table and the "Faster polar decomposition" section below.
    state savings on this model. Requires `pip install bitsandbytes`.
 
 
-### Faster polar decomposition: `--nmm-use-cans`
+### Faster polar decomposition: `--nmm-use-gram-ns5` (recommended)
+
+Tri Dao's Gram-Newton-Schulz reformulates NS5 so that the inner loop
+operates on the small `n × n` Gram matrix (`R = X X^T`) instead of full
+rectangular matmuls — 2 rectangular matmuls + T iterations on the
+small Gram matrix, vs stock NS5's 2T rectangular matmuls. The library
+also adds a "reset" at iteration 2 that re-orthogonalises the
+intermediate result, which is why it converges in fewer effective
+iterations than stock NS5.
+
+**Why it's the recipe default:** At our batch=1 NMM shapes (768×3072,
+3072×768) with `nmm_gram_ns5_use_kernels=False` (default — pure-
+PyTorch backend), the algorithm beats every other variant on speed
+while keeping NS5-comparable quality:
+
+| Method | Steps | W1 ms | W2 ms | Total ms | `‖XᵀX−I‖_F` |
+|---|---|---|---|---|---|
+| NS5 | 5 | 2.10 | 2.10 | 4.20 | 8.21 |
+| CANS-stat | 3 | 1.28 | 1.28 | 2.56 | 1.78 |
+| gram-NS5 (kernels=True) | 5* | 1.16 | 1.16 | 2.32 | 5.35 |
+| **gram-NS5 (kernels=False)** | **5*** | **0.50** | **0.50** | **1.00** | **5.35** |
+
+(*Gram-NS5 uses a Gram-matrix iteration with reset at step 2 — not
+directly comparable to NS5 step counts.)
+
+**Kernels vs pure-PyTorch (`--nmm-gram-ns5-use-kernels`):** The library
+ships custom CuTeDSL (quack) symmetric-GEMM kernels for the inner
+Gram-matrix iteration. They're tuned for very-large matrices and lose
+to cuBLAS at our 768/3072-class shapes — especially at batch=1 where
+the fixed kernel launch overhead is a big fraction of total work.
+Same math, same quality. Default `kernels=False`; enable at batch≥4
+with much larger matrices.
+
+**Requirements:**
+
+* Always: `pip install gram-newton-schulz`. With `kernels=False` (default)
+  this is the only requirement and the path works on any GPU (or CPU).
+* With `kernels=True`: PyTorch 2.7+, CUDA 12.9+, and a Hopper or
+  Blackwell GPU (the quack kernels target sm_90+).
+
+**Quality caveat:** gram-NS5's orthogonalisation error (~5.35) is
+worse than CANS-stationary (~1.78) but better than NS5-3 (~8.6 — i.e.
+NS5 stopped early). If kernel-level orthogonalisation precision
+matters for your run, prefer CANS.
+
+**Mutually exclusive with `--nmm-use-cans`.** Overrides
+`--nmm-ns5-steps`.
+
+### `--nmm-use-cans` (quality-favouring alternative)
 
 CANS-stationary (Chebyshev-optimised Newton-Schulz; arxiv 2506.10935)
 keeps the same polynomial form as NS5 but replaces the coefficients
@@ -218,17 +268,10 @@ via `scipy.optimize.differential_evolution`. The optimiser converged on
 `(a, b, c) = (3.8641, -9.7196, 9.7101)`. See `scripts/benchmark_ns5.py`
 for the exact procedure.
 
-**Isolated kernel benchmarks** (RTX 5070 Ti, F-norm-normalised
-gradients of NMM weight shapes, batch=1):
-
-| Method | Steps | W1 ms | W2 ms | Total ms | `‖XᵀX−I‖_F` |
-|---|---|---|---|---|---|
-| NS5 (default) | 5 | 0.661 | 0.876 | 1.537 | 8.30 |
-| **CANS-stat** | **3** | **0.413** | **0.538** | **0.951** | **1.81** |
-
-That's ~1.6× faster *and* ~4.6× better orthogonalisation. NS5 with 3
-steps would be similar speed but the same 8.5 error — the CANS coefficients
-are what give the quality.
+**Why it's not the recipe default:** gram-NS5 (torch backend) is ~2.5×
+faster at our shapes for similar quality. CANS only wins if you need
+the extra orthogonalisation precision (~1.78 error vs gram-NS5's
+~5.35).
 
 **Caveats:**
 
@@ -245,34 +288,6 @@ are what give the quality.
 
 **Mutually exclusive with `--nmm-use-gram-ns5`.** Overrides
 `--nmm-ns5-steps`.
-
-### `--nmm-use-gram-ns5` (not recommended for default recipe)
-
-Tri Dao's Gram-Newton-Schulz reformulates NS5 so that the inner loop
-operates on the small `n × n` Gram matrix (`R = X X^T`) instead of full
-rectangular matmuls. The FLOP reduction is real (42% claimed at gpt2_small
-dims), but whether it translates to wall-clock speedup depends on batch size.
-
-**Why it's off by default:** Our NMM calls NS5 once per block with the
-block-aggregate gradient — shape `(1, n, m)` i.e. batch=1. At batch=1,
-gram-NS5's CUDA kernel launch overhead dominates and it runs **~1.75× slower**
-than stock NS5. The break-even is around batch=4; at batch=16 it is ~1.4×
-faster. Reaching batch=16 in our recipe would require ~10× more VRAM,
-which OOMs a 16 GiB card.
-
-**When it could help:** If you have a 40+ GiB card and can run `--batch-size
-8` or higher, enable `--nmm-use-gram-ns5`. Otherwise leave it off.
-
-**Isolated kernel benchmarks** (RTX 5070 Ti, shape (B, 768, 3072)):
-
-| Batch | NS5 (ms) | gram-NS5 (ms) | Ratio |
-|---|---|---|---|
-| 1 | 0.658 | 1.415 | 0.46× |
-| 4 | 0.789 | 0.812 | 0.97× |
-| 16 | 1.328 | 0.937 | 1.42× |
-
-**Requirements:** PyTorch 2.7+, CUDA 12.9+, Hopper or Blackwell GPU.
-Install via `pip install gram-newton-schulz`.
 
 ### Speed-quality tradeoff: `--nmm-ns5-steps`
 
@@ -546,7 +561,7 @@ TitansConfig.gpt2_small(
     nmm_block_size=64,
     nmm_low_rank=64,
 )
-# Combine with `--compile-model --optim8bit --nmm-use-cans` at the
+# Combine with `--compile-model --optim8bit --nmm-use-gram-ns5` at the
 # CLI for the documented consumer-GPU recipe (README.md, RUNBOOK.md).
 ```
 
