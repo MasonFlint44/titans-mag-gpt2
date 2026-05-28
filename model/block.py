@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import cat
 
-from model.delta_product import DeltaProductMemory, MultiHeadDeltaProduct
+from model.delta_product import DeltaProductMemory
 from model.nmm import MultiHeadNMM, NeuralMemoryModule
 
 
@@ -491,21 +491,17 @@ class TitansMAGBlock(nn.Module):
         # satisfy the {init_state, forward_chunk, step_with_conv} contract.
         self.memory_type = config.memory_type
         if config.memory_type == "delta_product":
-            dp_kwargs = dict(
+            # DeltaProductMemory is multi-head native via the `n_heads`
+            # ctor arg — no separate wrapper class needed. At n_heads=1
+            # it acts as single-head; at n_heads>1 it runs heads in
+            # parallel via batched einsum + WY solve.
+            self.nmm = DeltaProductMemory(
+                n_embd=config.n_embd,
+                n_heads=config.delta_n_heads,
                 order=config.delta_order,
                 finetune_mode=config.finetune_mode,
                 block_size=config.delta_block_size,
             )
-            if config.delta_n_heads > 1:
-                self.nmm = MultiHeadDeltaProduct(
-                    n_embd=config.n_embd,
-                    n_heads=config.delta_n_heads,
-                    **dp_kwargs,
-                )
-            else:
-                self.nmm = DeltaProductMemory(
-                    n_embd=config.n_embd, **dp_kwargs,
-                )
         else:
             # Default: paper-strict NMM (memory_type="nmm").
             nmm_kwargs = dict(

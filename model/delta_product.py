@@ -16,8 +16,16 @@ Per-token recurrence (single head, order N), write-then-read:
         M ← M + β_i · (v_i − M·k_i) · k_iᵀ
     y_t = M · Q(x_t)
 
-State: a 1-tuple `(M,)` with `M ∈ R^(B, d, d)`. No momentum stack, no
-depthwise conv buffer — DeltaProduct's update is closed-form per token.
+Multi-head fusion: `n_heads > 1` splits `n_embd` into `n_heads × head_dim`
+parallel memory heads, each with its own [head_dim × head_dim] M matrix
+and independent per-head projection weights. The forward runs all heads
+in parallel via batched einsum projections and a WY solve with batch
+dim = B·n_heads — substantially fewer kernel launches than running
+n_heads single-head modules in a Python loop.
+
+State: a 1-tuple `(M,)` with `M ∈ R^(B, n_heads, head_dim, head_dim)`.
+No momentum stack, no depthwise conv buffer — DeltaProduct's update is
+closed-form per token.
 
 Interface mirrors `NeuralMemoryModule` so `TitansMAGBlock` can pick
 between the two via `config.memory_type` without other changes:
@@ -26,34 +34,47 @@ between the two via `config.memory_type` without other changes:
     step_with_conv(x_t, state) -> (y_t, new_state)
 """
 
+import math
+
 import torch
 import torch.nn as nn
 
 
 class DeltaProductMemory(nn.Module):
-    """Single-head DeltaProduct memory, order >= 1.
+    """Multi-head DeltaProduct memory, order >= 1.
 
-    For multi-head use, wrap copies of this module via
-    `MultiHeadDeltaProduct` (separate file / class).
+    `n_heads=1` is the single-head case (memory operates on the full
+    n_embd dim). `n_heads>1` runs n_heads parallel head_dim-sized memory
+    modules, fused into batched einsum projections + batched WY solve.
+    The math per head is identical to running n_heads independent
+    single-head modules; the speedup is purely in kernel launches and
+    tensor-core utilization.
 
     Args:
-        n_embd: input dim. M lives in R^(n_embd × n_embd).
+        n_embd: input/output dim.
+        n_heads: number of parallel memory heads. Must divide n_embd.
+            Default 1 = single-head with `head_dim = n_embd`.
         order: number of delta sub-steps applied per token (1 = DeltaNet,
-            2 = matches Titans per TPTT).
+            2 = matches Titans per TPTT). Default 2.
         finetune_mode: when True, `out_scale` initializes to zero so that
             y_mem = 0 at step 0 and the pretrained backbone's residual is
             preserved exactly until training picks up the gate. Mirrors
             NMM's `out_scale` semantics.
-        block_size: chunked-update aggregation size for the blockwise
-            forward path. `block_size=1` always runs the sequential
-            per-token recurrence (paper-strict reference). `block_size>1`
-            routes through the blockwise parallel path (added in a
-            separate task; raises NotImplementedError until then).
+        block_size: forward-path selector. `block_size=1` runs the
+            sequential per-token recurrence (reference correctness path,
+            slow but bit-exact; useful as a baseline and as the decode
+            path). `block_size>1` routes through the closed-form
+            chunkwise WY parallel path (training-time speed path, bit-
+            equivalent to sequential, one triangular solve per document
+            segment). The numeric value above 1 is currently unused —
+            reserved for a future memory-bounded sub-chunking path; see
+            `config.delta_block_size` docstring.
     """
 
     def __init__(
         self,
         n_embd: int,
+        n_heads: int = 1,
         order: int = 2,
         finetune_mode: bool = True,
         block_size: int = 1,
@@ -61,85 +82,263 @@ class DeltaProductMemory(nn.Module):
         super().__init__()
         if order < 1:
             raise ValueError(f"order must be >= 1 (got {order})")
+        if n_heads < 1:
+            raise ValueError(f"n_heads must be >= 1 (got {n_heads})")
+        if n_embd % n_heads != 0:
+            head_dim = n_embd // n_heads
+            raise ValueError(
+                f"n_embd ({n_embd}) must be divisible by n_heads ({n_heads}); "
+                f"head_dim would be {head_dim} but {n_heads} * {head_dim} = "
+                f"{n_heads * head_dim}, not {n_embd}."
+            )
         if block_size < 1:
             raise ValueError(f"block_size must be >= 1 (got {block_size})")
 
         self.n_embd = int(n_embd)
+        self.n_heads = int(n_heads)
+        self.head_dim = self.n_embd // self.n_heads
         self.order = int(order)
         self.block_size = int(block_size)
         self.finetune_mode = bool(finetune_mode)
 
-        # One read query per token — the read happens AFTER all N
-        # write sub-steps, so a single Q projection suffices.
-        self.q_proj = nn.Linear(n_embd, n_embd, bias=False)
+        H, hd = self.n_heads, self.head_dim
 
-        # N independent (K, V, β) projection sets — each sub-step writes
-        # into M with its own key, value, and write-strength. β passes
-        # through a sigmoid at call time (so β ∈ [0, 1]).
-        self.k_projs = nn.ModuleList(
-            [nn.Linear(n_embd, n_embd, bias=False) for _ in range(self.order)]
+        # Stacked per-head projection weights. Mathematically equivalent
+        # to N independent per-head Linear modules — same parameter
+        # count, same per-head [hd, hd] mapping — but stored as one
+        # contiguous tensor so the forward fuses N projections into one
+        # einsum kernel per role. ~3-5× kernel-launch reduction vs the
+        # earlier Python-loop-over-heads design.
+        self.q_proj_weight = nn.Parameter(torch.empty(H, hd, hd))
+        self.k_proj_weights = nn.ParameterList(
+            [nn.Parameter(torch.empty(H, hd, hd)) for _ in range(order)]
         )
-        self.v_projs = nn.ModuleList(
-            [nn.Linear(n_embd, n_embd, bias=False) for _ in range(self.order)]
+        self.v_proj_weights = nn.ParameterList(
+            [nn.Parameter(torch.empty(H, hd, hd)) for _ in range(order)]
         )
-        self.beta_heads = nn.ModuleList(
-            [nn.Linear(n_embd, 1, bias=True) for _ in range(self.order)]
+        # β: per-token, per-head scalar write strength. Weight is
+        # [H, hd, 1] (head_dim → 1 per head); bias is [H, 1].
+        self.beta_proj_weights = nn.ParameterList(
+            [nn.Parameter(torch.empty(H, hd, 1)) for _ in range(order)]
+        )
+        self.beta_proj_biases = nn.ParameterList(
+            [nn.Parameter(torch.empty(H, 1)) for _ in range(order)]
         )
 
-        # Output scale gate. Zero-init under finetune_mode so the
-        # pretrained backbone's residual is preserved at step 0 (matches
-        # NMM `out_scale` convention).
+        # Per-head output scale gate. Zero-init under finetune_mode so
+        # the pretrained backbone's residual is preserved at step 0.
         if finetune_mode:
-            self.out_scale = nn.Parameter(torch.zeros(n_embd))
+            self.out_scale = nn.Parameter(torch.zeros(H, hd))
         else:
-            self.out_scale = nn.Parameter(torch.ones(n_embd))
+            self.out_scale = nn.Parameter(torch.ones(H, hd))
+
+        self._init_weights()
+
+        # Backward-compat: migrate legacy state-dict layouts to the
+        # stacked-parameter layout used by this class. Two legacy shapes
+        # are recognized:
+        #   1. Pre-fusion multi-head: MultiHeadDeltaProduct wrapped N
+        #      per-head DeltaProductMemory submodules under `heads.{h}.`.
+        #   2. Pre-fusion single-head: DeltaProductMemory used `q_proj`,
+        #      `k_projs.{i}`, etc. as Linear modules.
+        # See `_migrate_legacy_format` for the per-key mapping.
+        self.register_load_state_dict_pre_hook(self._migrate_legacy_format)
+
+    def _init_weights(self) -> None:
+        """Match PyTorch Linear's default init for each per-head slice.
+
+        Linear(in_features=hd) uses kaiming_uniform_(a=√5) on its weight
+        — uniform(-1/√hd, 1/√hd) — and the same bound for the bias.
+        We replicate that distribution per-head on the stacked tensors
+        so n_heads × stacked-DeltaProduct(n_heads=H) is statistically
+        indistinguishable from H independent Linear-based single-head
+        DeltaProducts at init.
+        """
+        hd = self.head_dim
+        bound_proj = 1.0 / math.sqrt(hd)
+        with torch.no_grad():
+            nn.init.uniform_(self.q_proj_weight, -bound_proj, bound_proj)
+            for i in range(self.order):
+                nn.init.uniform_(self.k_proj_weights[i], -bound_proj, bound_proj)
+                nn.init.uniform_(self.v_proj_weights[i], -bound_proj, bound_proj)
+                nn.init.uniform_(self.beta_proj_weights[i], -bound_proj, bound_proj)
+                nn.init.uniform_(self.beta_proj_biases[i], -bound_proj, bound_proj)
+
+    # ------------------------------------------------------------------
+    # Legacy state-dict migration
+    # ------------------------------------------------------------------
+
+    def _migrate_legacy_format(
+        self,
+        module,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        """Detect-and-rewrite pre-fusion checkpoint layouts.
+
+        New format keys are unchanged; we only act when sentinel keys
+        from a legacy layout are present. State_dict is mutated in
+        place (PyTorch's load contract).
+
+        Signature note: PyTorch's public `register_load_state_dict_pre_hook`
+        wraps the hook with `with_module=True`, so `module` is passed in
+        first. It refers to the same instance as `self` here; the
+        parameter exists to match the API contract.
+        """
+        H = self.n_heads
+        order = self.order
+        hd = self.head_dim
+
+        if f"{prefix}heads.0.q_proj.weight" in state_dict:
+            # Multi-head: MultiHeadDeltaProduct wrapping per-head submodules.
+            self._migrate_multihead_legacy(state_dict, prefix, H, order)
+            return
+
+        if f"{prefix}q_proj.weight" in state_dict and H == 1:
+            # Single-head pre-fusion: q_proj was a Linear module.
+            self._migrate_singlehead_legacy(state_dict, prefix, order, hd)
+            return
+
+    @staticmethod
+    def _migrate_multihead_legacy(state_dict, prefix, H, order) -> None:
+        """Stack per-head Linear weights into the [H, *, *] layout."""
+        q_list = [
+            state_dict.pop(f"{prefix}heads.{h}.q_proj.weight") for h in range(H)
+        ]
+        state_dict[f"{prefix}q_proj_weight"] = torch.stack(q_list, dim=0)
+
+        for i in range(order):
+            k_list = [
+                state_dict.pop(f"{prefix}heads.{h}.k_projs.{i}.weight")
+                for h in range(H)
+            ]
+            state_dict[f"{prefix}k_proj_weights.{i}"] = torch.stack(k_list, dim=0)
+
+            v_list = [
+                state_dict.pop(f"{prefix}heads.{h}.v_projs.{i}.weight")
+                for h in range(H)
+            ]
+            state_dict[f"{prefix}v_proj_weights.{i}"] = torch.stack(v_list, dim=0)
+
+            # β: old per-head Linear(hd, 1) stored weight as [1, hd];
+            # new layout uses [H, hd, 1]. Transpose each, then stack.
+            bw_list = [
+                state_dict.pop(f"{prefix}heads.{h}.beta_heads.{i}.weight")
+                for h in range(H)
+            ]
+            state_dict[f"{prefix}beta_proj_weights.{i}"] = torch.stack(
+                [w.t() for w in bw_list], dim=0,
+            )
+
+            bb_list = [
+                state_dict.pop(f"{prefix}heads.{h}.beta_heads.{i}.bias")
+                for h in range(H)
+            ]
+            state_dict[f"{prefix}beta_proj_biases.{i}"] = torch.stack(bb_list, dim=0)
+
+        os_list = [
+            state_dict.pop(f"{prefix}heads.{h}.out_scale") for h in range(H)
+        ]
+        state_dict[f"{prefix}out_scale"] = torch.stack(os_list, dim=0)
+
+    @staticmethod
+    def _migrate_singlehead_legacy(state_dict, prefix, order, hd) -> None:
+        """Wrap single-head Linear weights into the [1, *, *] layout."""
+        q_w = state_dict.pop(f"{prefix}q_proj.weight")  # [hd, hd]
+        state_dict[f"{prefix}q_proj_weight"] = q_w.unsqueeze(0)
+
+        for i in range(order):
+            k_w = state_dict.pop(f"{prefix}k_projs.{i}.weight")
+            state_dict[f"{prefix}k_proj_weights.{i}"] = k_w.unsqueeze(0)
+
+            v_w = state_dict.pop(f"{prefix}v_projs.{i}.weight")
+            state_dict[f"{prefix}v_proj_weights.{i}"] = v_w.unsqueeze(0)
+
+            bw = state_dict.pop(f"{prefix}beta_heads.{i}.weight")  # [1, hd]
+            state_dict[f"{prefix}beta_proj_weights.{i}"] = bw.t().unsqueeze(0)
+
+            bb = state_dict.pop(f"{prefix}beta_heads.{i}.bias")  # [1]
+            state_dict[f"{prefix}beta_proj_biases.{i}"] = bb.unsqueeze(0)
+
+        os_p = state_dict.pop(f"{prefix}out_scale")  # [hd]
+        state_dict[f"{prefix}out_scale"] = os_p.unsqueeze(0)
+
+    # ------------------------------------------------------------------
+    # State + projections
+    # ------------------------------------------------------------------
 
     def init_state(self, B: int, device) -> tuple:
         """Per-sample-batched zero-initialized M.
 
-        Returns a 1-tuple `(M,)` — kept as a tuple for shape parity with
-        the NMM's `(M, S, conv_buf)` triple at the call-site dispatch
-        layer (model/nmm.py reset_state / _detach_per_layer dispatch on
-        tuple length).
+        Returns a 1-tuple `(M,)` with M shape `[B, n_heads, head_dim,
+        head_dim]`. Tuple-of-one layout is kept for parity with the NMM's
+        `(M, S, conv_buf)` triple at the model-level dispatch layer (see
+        `model/nmm.py::_detach_per_layer`).
         """
         M = torch.zeros(
-            B, self.n_embd, self.n_embd, device=device, dtype=torch.float32,
+            B, self.n_heads, self.head_dim, self.head_dim,
+            device=device, dtype=torch.float32,
         )
         return (M,)
 
     def _project_kvb(self, x_chunk: torch.Tensor):
-        """Batched projections for the whole chunk, all order sub-steps.
+        """Batched per-head projections for the whole chunk.
 
+        x_chunk: [B, T, n_embd]
         Returns:
-            q [B, T, d]
-            ks: list[order] of [B, T, d] — L2-normalized along last dim
-            vs: list[order] of [B, T, d]
-            bs: list[order] of [B, T, 1] (after sigmoid)
+            q  [B, T, H, hd]
+            ks list[order] of [B, T, H, hd] — L2-normalized along hd
+            vs list[order] of [B, T, H, hd]
+            bs list[order] of [B, T, H, 1] (after sigmoid)
 
-        Keys are L2-normalized so ||k_t|| = 1 and the Gram matrix K·Kᵀ
-        has entries bounded in [-1, 1]. This bounds the spectral norm of
-        β·K·Kᵀ inside the chunkwise WY solve and keeps `(I + G)` well-
-        conditioned regardless of chunk length. Without this the
-        triangular solve diverges at training scale (T·N >> 1) — the
-        canonical DeltaNet / DeltaProduct formulation requires it. The
-        sequential path also benefits: M's spectral norm stays bounded
-        across the chunk.
-
-        Done outside the per-token loop so the loop body only does the
-        recurrent state update — every projection is one batched matmul
-        across the (B, T) dims.
+        Keys are L2-normalized so ||k|| = 1 and the Gram K·Kᵀ has
+        entries bounded in [-1, 1]. This bounds the spectral norm of
+        β·K·Kᵀ inside the WY solve and keeps `(I + G)` well-conditioned
+        at any T·N — required for the chunkwise path to stay finite at
+        training scale.
         """
-        q = self.q_proj(x_chunk)
-        ks = [
-            torch.nn.functional.normalize(self.k_projs[i](x_chunk), dim=-1)
+        B, T, _ = x_chunk.shape
+        H, hd = self.n_heads, self.head_dim
+        x_h = x_chunk.view(B, T, H, hd)
+
+        q = torch.einsum("bthd,hde->bthe", x_h, self.q_proj_weight)
+
+        ks = []
+        for i in range(self.order):
+            k_raw = torch.einsum("bthd,hde->bthe", x_h, self.k_proj_weights[i])
+            ks.append(torch.nn.functional.normalize(k_raw, dim=-1))
+
+        vs = [
+            torch.einsum("bthd,hde->bthe", x_h, self.v_proj_weights[i])
             for i in range(self.order)
         ]
-        vs = [self.v_projs[i](x_chunk) for i in range(self.order)]
-        bs = [
-            torch.sigmoid(self.beta_heads[i](x_chunk))
-            for i in range(self.order)
-        ]
+
+        bs = []
+        for i in range(self.order):
+            b_raw = torch.einsum("bthd,hde->bthe", x_h, self.beta_proj_weights[i])
+            # bias broadcasts over (B, T): [H, 1] -> [1, 1, H, 1]
+            b_raw = b_raw + self.beta_proj_biases[i].view(1, 1, H, 1)
+            bs.append(torch.sigmoid(b_raw))
+
         return q, ks, vs, bs
+
+    def _apply_out_scale(self, y_BHTd: torch.Tensor, dtype) -> torch.Tensor:
+        """Apply per-head out_scale and reshape to [B, T, n_embd].
+
+        y_BHTd: [B, T, H, hd] (raw read).
+        """
+        H, hd = self.n_heads, self.head_dim
+        y = y_BHTd.to(dtype) * self.out_scale.to(dtype).view(1, 1, H, hd)
+        return y.reshape(y.shape[0], y.shape[1], H * hd)
+
+    # ------------------------------------------------------------------
+    # Sequential reference path
+    # ------------------------------------------------------------------
 
     def _forward_chunk_sequential(
         self,
@@ -149,71 +348,54 @@ class DeltaProductMemory(nn.Module):
     ) -> tuple:
         """Per-token recurrent forward — reference correctness path.
 
-        Bit-equivalent to T calls to `step_with_conv`. The blockwise path
-        (added separately) is checked against this for correctness.
-
-        Args:
-            x_chunk: [B, T, d] — post-LN inputs (ln_nmm applied upstream
-                by `TitansMAGBlock`).
-            state_in: (M,) 1-tuple with M ∈ [B, d, d].
-            doc_boundaries: [B, T] bool or None. When True at (b, t), M[b]
-                is reset to zero BEFORE applying token t's update.
-
-        Returns:
-            (y_mem [B, T, d], (M_out,)) where M_out is the post-chunk state.
+        Bit-equivalent to T calls to `step_with_conv`. The chunkwise path
+        (block_size>1) is checked against this for correctness.
         """
-        (M,) = state_in
-        B, T, d = x_chunk.shape
+        (M,) = state_in  # [B, H, hd, hd]
+        B, T, _ = x_chunk.shape
+        H, hd = self.n_heads, self.head_dim
 
-        # Run M arithmetic in M's dtype (typically fp32); cast projections
-        # in as needed. autocast-aware: under bf16 autocast the Linear
-        # projections will be bf16 and we promote on the bmm input.
         M_dtype = M.dtype
-
         q, ks, vs, bs = self._project_kvb(x_chunk)
+
+        # Flatten (B, H) into the bmm batch dim.
+        M_v = M.reshape(B * H, hd, hd)
 
         y_steps = []
         for t in range(T):
-            # Doc-boundary reset for any batch row that starts a new doc.
             if doc_boundaries is not None:
                 reset_mask = doc_boundaries[:, t]  # [B] bool
                 if reset_mask.any():
-                    M = torch.where(
-                        reset_mask.view(B, 1, 1),
-                        torch.zeros_like(M),
-                        M,
-                    )
+                    # Broadcast per-batch mask across the H dim, then
+                    # flatten to (B*H, 1, 1) for the where.
+                    rm = reset_mask.view(B, 1).expand(B, H).reshape(B * H, 1, 1)
+                    M_v = torch.where(rm, torch.zeros_like(M_v), M_v)
 
-            # N sequential delta sub-steps. Each uses the M produced by
-            # the previous sub-step (order matters).
             for i in range(self.order):
-                k_i = ks[i][:, t, :].to(M_dtype)          # [B, d]
-                v_i = vs[i][:, t, :].to(M_dtype)          # [B, d]
-                beta_i = bs[i][:, t, :].to(M_dtype)       # [B, 1]
+                k_i = ks[i][:, t].to(M_dtype).reshape(B * H, hd)
+                v_i = vs[i][:, t].to(M_dtype).reshape(B * H, hd)
+                beta_i = bs[i][:, t].to(M_dtype).reshape(B * H, 1)
 
-                # M · k_i  ->  [B, d, d] @ [B, d, 1] -> [B, d, 1] -> [B, d]
-                Mk = torch.bmm(M, k_i.unsqueeze(-1)).squeeze(-1)
-                # error = v_i - M·k_i        [B, d]
+                Mk = torch.bmm(M_v, k_i.unsqueeze(-1)).squeeze(-1)
                 err = v_i - Mk
-                # rank-1 outer-product update, scaled by β_i:
-                #   delta = β_i · err ⊗ k_i        [B, d, d]
                 delta = torch.bmm(
-                    (beta_i * err).unsqueeze(-1),     # [B, d, 1]
-                    k_i.unsqueeze(-2),                 # [B, 1, d]
+                    (beta_i * err).unsqueeze(-1),
+                    k_i.unsqueeze(-2),
                 )
-                M = M + delta
+                M_v = M_v + delta
 
-            # Write-then-read: y_t uses M AFTER all N sub-steps.
-            q_t = q[:, t, :].to(M_dtype)               # [B, d]
-            y_t = torch.bmm(M, q_t.unsqueeze(-1)).squeeze(-1)  # [B, d]
-            y_steps.append(y_t)
+            q_t = q[:, t].to(M_dtype).reshape(B * H, hd)
+            y_t = torch.bmm(M_v, q_t.unsqueeze(-1)).squeeze(-1)
+            y_steps.append(y_t.view(B, H, hd))
 
-        y = torch.stack(y_steps, dim=1)                # [B, T, d]
-        # Cast back to chunk's dtype before the out_scale gate (which is
-        # in module's parameter dtype, typically fp32 — autocast handles
-        # the rest).
-        y = y.to(x_chunk.dtype) * self.out_scale.to(x_chunk.dtype)
-        return y, (M,)
+        y_BTHhd = torch.stack(y_steps, dim=1)  # [B, T, H, hd]
+        y = self._apply_out_scale(y_BTHhd, x_chunk.dtype)
+        M_out = M_v.view(B, H, hd, hd)
+        return y, (M_out,)
+
+    # ------------------------------------------------------------------
+    # Chunkwise WY parallel path
+    # ------------------------------------------------------------------
 
     def _forward_chunk_blockwise(
         self,
@@ -223,40 +405,21 @@ class DeltaProductMemory(nn.Module):
     ) -> tuple:
         """Chunkwise parallel forward — closed-form WY representation.
 
-        Bit-equivalent to the sequential per-token recurrence: the WY
-        solve produces exactly the sequential outputs for the whole
-        chunk (L2-normalized K bounds the Gram matrix and keeps the
-        triangular solve well-conditioned at any T·N).
-
-        One WY solve per contiguous document segment. With no doc
-        boundaries, the whole chunk is solved in a single WY system —
-        one large, tensor-core-friendly triangular solve per layer per
-        head per forward. With doc boundaries, the chunk is split at
-        boundary positions and one WY solve runs per segment, threading
-        M between segments with per-row reset where needed.
-
-        Why one solve instead of fixed-size sub-chunks: sub-chunking
-        adds Python-loop overhead and replaces one large solve with many
-        small ones, with ~6× wall-clock penalty at chunk_size=1024 (the
-        smoke-test observed regression). The WY solve's O(T²·N²) cost
-        is dominated by the single triangular solve kernel, which
-        parallelizes natively on tensor cores; sub-chunking trades that
-        for kernel-launch overhead with no compensating throughput win.
-
-        Memory bound (peak): the (I + G) matrix is [B, T·N, T·N] fp32.
-        At chunk_size=1024, T·N=2048 → ~16 MB per head per layer per
-        batch element — well within budget. Watch this if you raise
-        chunk_size past ~4096; we may then need a memory-bounded
-        chunked path.
+        Bit-equivalent to the sequential per-token recurrence: one WY
+        triangular solve per contiguous document segment. With no doc
+        boundaries that's one solve over the whole chunk; with
+        boundaries we split at boundary positions and run one solve per
+        segment, threading M between segments with per-row reset where
+        needed.
         """
-        (M,) = state_in
-        B, T, d = x_chunk.shape
+        (M,) = state_in  # [B, H, hd, hd]
+        B, T, _ = x_chunk.shape
 
-        # Project once for the whole chunk.
         q_all, ks_all, vs_all, bs_all = self._project_kvb(x_chunk)
 
-        # Split set: just doc-boundary positions (no fixed-size sub-chunks).
-        # 0 and T frame the segments implicitly.
+        # Split positions: 0 (implicit start), T (implicit end), and any
+        # position where any row has a doc boundary. Each segment gets
+        # one WY solve; the head of each segment may reset M per-row.
         splits = {0, T}
         if doc_boundaries is not None and doc_boundaries.any():
             any_boundary = doc_boundaries.any(dim=0)  # [T]
@@ -264,40 +427,40 @@ class DeltaProductMemory(nn.Module):
                 splits.add(int(t.item()))
         split_list = sorted(splits)
 
-        # Fast path: no doc boundaries → one solve over the whole chunk.
-        if len(split_list) == 2:
-            y_raw, M_out = self._chunkwise_solve_raw(
-                M, q_all, ks_all, vs_all, bs_all,
-            )
-            y = y_raw.to(x_chunk.dtype) * self.out_scale.to(x_chunk.dtype)
-            return y, (M_out,)
-
-        # Slow path: per-document-segment WY solves with M reset at
-        # boundary positions for any row that crossed one.
+        # Reset M unconditionally at every segment head where a boundary
+        # fires — INCLUDING t_lo=0. The sequential path resets per token
+        # without a t>0 guard; the chunkwise must match to stay bit-
+        # equivalent. The data loader sets doc_boundaries[:, 0]=True at
+        # every per-rank stream start and whenever EOT aligns with a
+        # chunk boundary, so position-0 resets fire more than they might
+        # seem to.
         y_segments = []
         for seg_i in range(len(split_list) - 1):
             t_lo, t_hi = split_list[seg_i], split_list[seg_i + 1]
             if t_hi == t_lo:
                 continue
-            if t_lo > 0 and doc_boundaries is not None:
-                reset_mask = doc_boundaries[:, t_lo]  # [B] bool
+            if doc_boundaries is not None:
+                reset_mask = doc_boundaries[:, t_lo]  # [B]
                 if reset_mask.any():
                     M = torch.where(
-                        reset_mask.view(B, 1, 1),
+                        reset_mask.view(B, 1, 1, 1),
                         torch.zeros_like(M),
                         M,
                     )
-            q_seg = q_all[:, t_lo:t_hi, :]
-            ks_seg = [k[:, t_lo:t_hi, :] for k in ks_all]
-            vs_seg = [v[:, t_lo:t_hi, :] for v in vs_all]
-            bs_seg = [b[:, t_lo:t_hi, :] for b in bs_all]
+            q_seg = q_all[:, t_lo:t_hi]
+            ks_seg = [k[:, t_lo:t_hi] for k in ks_all]
+            vs_seg = [v[:, t_lo:t_hi] for v in vs_all]
+            bs_seg = [b[:, t_lo:t_hi] for b in bs_all]
             y_seg_raw, M = self._chunkwise_solve_raw(
                 M, q_seg, ks_seg, vs_seg, bs_seg,
             )
             y_segments.append(y_seg_raw)
 
-        y_raw = torch.cat(y_segments, dim=1)
-        y = y_raw.to(x_chunk.dtype) * self.out_scale.to(x_chunk.dtype)
+        y_raw = (
+            y_segments[0] if len(y_segments) == 1
+            else torch.cat(y_segments, dim=1)
+        )
+        y = self._apply_out_scale(y_raw, x_chunk.dtype)
         return y, (M,)
 
     def _chunkwise_solve_raw(
@@ -308,70 +471,90 @@ class DeltaProductMemory(nn.Module):
         vs: list,
         bs: list,
     ) -> tuple:
-        """Core WY chunkwise solve — no gate, no dtype cast on output.
+        """Core WY chunkwise solve, all heads batched.
 
-        Used by both the no-boundary path (one solve covers the whole
-        chunk) and the boundary-aware path (one solve per segment).
-        Returns (y_raw [B, T, d], M_out [B, d, d]) — caller composes the
-        gate / cast at the end.
+        M_in: [B, H, hd, hd]; q: [B, T, H, hd]; ks/vs: list of [B, T, H, hd];
+        bs: list of [B, T, H, 1].
+
+        Returns (y_raw [B, T, H, hd], M_out [B, H, hd, hd]).
+
+        Math derivation (per (B, H) slice):
+            u_t = β_t · (v_t − M_{t-1} · k_t)
+            (I + G) U = R   where
+              G[t, j] = β_t · (k_t · k_j)   for j < t
+              R[t]    = β_t · (v_t − M_in · k_t)
+            M_out = M_in + Uᵀ · K
+            y[t]  = M_in · q_t + Σ_{s ≤ (t+1)N − 1} (q_t · k_s) · u_s
         """
         M_dtype = M_in.dtype
-        B, T, d = q.shape
+        B, T, H, hd = q.shape
         N = len(ks)
         TN = T * N
 
-        # Stack into virtual sequence: virtual position s = N*t + i
-        # corresponds to real token t, sub-step i.
-        K_stack = torch.stack(ks, dim=2)         # [B, T, N, d]
-        V_stack = torch.stack(vs, dim=2)         # [B, T, N, d]
-        beta_stack = torch.stack(bs, dim=2)      # [B, T, N, 1]
-        K_virt = K_stack.reshape(B, TN, d).to(M_dtype)        # [B, TN, d]
-        V_virt = V_stack.reshape(B, TN, d).to(M_dtype)        # [B, TN, d]
-        beta_virt = beta_stack.reshape(B, TN, 1).to(M_dtype)  # [B, TN, 1]
-        Q = q.to(M_dtype)                                     # [B, T, d]
+        # Stack into virtual sequence: [B, T, N, H, hd] then transpose
+        # head before the virtual time so (B, H) flattens cleanly.
+        K_stack = torch.stack(ks, dim=2)
+        V_stack = torch.stack(vs, dim=2)
+        beta_stack = torch.stack(bs, dim=2)  # [B, T, N, H, 1]
+
+        K_virt = (
+            K_stack.permute(0, 3, 1, 2, 4).reshape(B, H, TN, hd).to(M_dtype)
+        )
+        V_virt = (
+            V_stack.permute(0, 3, 1, 2, 4).reshape(B, H, TN, hd).to(M_dtype)
+        )
+        beta_virt = (
+            beta_stack.permute(0, 3, 1, 2, 4).reshape(B, H, TN, 1).to(M_dtype)
+        )
+        Q_BH = q.permute(0, 2, 1, 3).to(M_dtype)  # [B, H, T, hd]
+
+        # Flatten (B, H) into the bmm/solve batch dim.
+        K_v = K_virt.reshape(B * H, TN, hd)
+        V_v = V_virt.reshape(B * H, TN, hd)
+        beta_v = beta_virt.reshape(B * H, TN, 1)
+        Q_v = Q_BH.reshape(B * H, T, hd)
+        M_in_v = M_in.reshape(B * H, hd, hd)
 
         # R[b, s] = β_s · (v_s − M_in · k_s)
-        # Mk_virt = K_virt @ M_in^T  ->  [B, TN, d]
-        Mk_virt = torch.bmm(K_virt, M_in.transpose(-1, -2))
-        R = beta_virt * (V_virt - Mk_virt)                    # [B, TN, d]
+        Mk_virt = torch.bmm(K_v, M_in_v.transpose(-1, -2))
+        R = beta_v * (V_v - Mk_virt)
 
         # G[b, s, j] = β_s · (k_s · k_j) for j < s (strict lower tri)
-        KKt = torch.bmm(K_virt, K_virt.transpose(-1, -2))     # [B, TN, TN]
-        # Mask to strict lower triangle then apply β scaling on the s
-        # axis (the "row index" of G).
+        KKt = torch.bmm(K_v, K_v.transpose(-1, -2))
         mask_lt = torch.tril(
-            torch.ones(TN, TN, device=K_virt.device, dtype=torch.bool),
+            torch.ones(TN, TN, device=K_v.device, dtype=torch.bool),
             diagonal=-1,
         )
-        # KKt is symmetric — masking + β broadcast over rows gives the
-        # strict-lower-triangular G we want.
-        G = (beta_virt * KKt) * mask_lt  # [B, TN, TN]
+        G = (beta_v * KKt) * mask_lt
 
-        # Solve (I + G) U = R for U via triangular solve.
-        I_TN = torch.eye(TN, device=K_virt.device, dtype=M_dtype)
-        LhS = I_TN.unsqueeze(0) + G                            # [B, TN, TN]
+        # (I + G) U = R  via unit-lower-triangular solve.
+        I_TN = torch.eye(TN, device=K_v.device, dtype=M_dtype)
+        LhS = I_TN.unsqueeze(0) + G
         U = torch.linalg.solve_triangular(
             LhS, R, upper=False, unitriangular=True,
-        )  # [B, TN, d]
+        )
 
-        # Final state: M_out = M_in + U^T @ K_virt
-        # U^T: [B, d, TN]; K_virt: [B, TN, d]; product: [B, d, d]
-        M_out = M_in + torch.bmm(U.transpose(-1, -2), K_virt)
+        # M_out = M_in + Uᵀ K
+        M_out_v = M_in_v + torch.bmm(U.transpose(-1, -2), K_v)
 
-        # Reads — y_t uses M after token t's N writes.
-        # y[t] = M_in · q_t + Σ_{s < (t+1)·N} (q_t · k_s) · u_s
-        QKt = torch.bmm(Q, K_virt.transpose(-1, -2))           # [B, T, TN]
-        # Mask: row t allows columns 0 .. (t+1)·N - 1.
-        s_idx = torch.arange(TN, device=Q.device).unsqueeze(0)  # [1, TN]
-        t_idx = torch.arange(T, device=Q.device).unsqueeze(1)   # [T, 1]
-        real_mask = (s_idx < (t_idx + 1) * N).to(M_dtype)       # [T, TN]
-        A_rv = QKt * real_mask                                  # [B, T, TN]
+        # Reads
+        QKt = torch.bmm(Q_v, K_v.transpose(-1, -2))  # [B*H, T, TN]
+        s_idx = torch.arange(TN, device=Q_v.device).unsqueeze(0)
+        t_idx = torch.arange(T, device=Q_v.device).unsqueeze(1)
+        real_mask = (s_idx < (t_idx + 1) * N).to(M_dtype)
+        A_rv = QKt * real_mask
+        y_init = torch.bmm(Q_v, M_in_v.transpose(-1, -2))
+        y_acc = torch.bmm(A_rv, U)
+        y_raw_v = y_init + y_acc  # [B*H, T, hd]
 
-        y_init = torch.bmm(Q, M_in.transpose(-1, -2))           # [B, T, d]
-        y_acc = torch.bmm(A_rv, U)                              # [B, T, d]
-        y_raw = y_init + y_acc                                  # [B, T, d]
-
+        # Unflatten back to [B, T, H, hd].
+        M_out = M_out_v.view(B, H, hd, hd)
+        y_raw = y_raw_v.view(B, H, T, hd).permute(0, 2, 1, 3).contiguous()
         return y_raw, M_out
+
+    # ------------------------------------------------------------------
+    # Public dispatch
+    # ------------------------------------------------------------------
 
     def forward_chunk(self, x_chunk, state_in, doc_boundaries=None) -> tuple:
         """Dispatch sequential (block_size=1) vs blockwise (block_size>1)."""
@@ -391,111 +574,14 @@ class DeltaProductMemory(nn.Module):
         call site — DeltaProduct itself has no conv preprocessing.
 
         Args:
-            x_t: [B, d] — single-token post-LN input.
+            x_t: [B, n_embd] — single-token post-LN input.
             state: (M,) — current recurrent state.
 
         Returns:
-            (y_t [B, d], new_state).
+            (y_t [B, n_embd], new_state).
         """
-        # Reuse sequential path with T=1 to avoid code duplication.
-        x_unsq = x_t.unsqueeze(1)  # [B, 1, d]
+        x_unsq = x_t.unsqueeze(1)
         y_chunk, new_state = self._forward_chunk_sequential(
             x_unsq, state, doc_boundaries=None,
         )
         return y_chunk.squeeze(1), new_state
-
-
-class MultiHeadDeltaProduct(nn.Module):
-    """N parallel `DeltaProductMemory` heads on `head_dim = n_embd // n_heads`.
-
-    Mirrors `MultiHeadNMM`: splits the input along the last dim into
-    n_heads × head_dim, dispatches per-head, concatenates outputs.
-
-    State is `list[n_heads]` of per-head `(M,)` tuples — same nested
-    layout the multi-head NMM uses (model/nmm.py `MultiHeadNMM`), so the
-    block-level state plumbing handles both polymorphically via tuple-vs-
-    list dispatch.
-
-    Why parallel single-head modules rather than a fused multi-head
-    matmul: matches the NMM's per-head layout (each head has its own
-    Q/K/V projections), keeps per-head DeltaProductMemory the single
-    source of truth for the recurrence, and makes
-    forward(MultiHeadDeltaProduct) == concat per-head forward(DPM) an
-    exact identity that's straightforward to test.
-    """
-
-    def __init__(
-        self,
-        n_embd: int,
-        n_heads: int,
-        order: int = 2,
-        finetune_mode: bool = True,
-        block_size: int = 1,
-    ):
-        super().__init__()
-        if n_heads < 1:
-            raise ValueError(f"n_heads must be >= 1 (got {n_heads})")
-        if n_embd % n_heads != 0:
-            head_dim = n_embd // n_heads
-            raise ValueError(
-                f"n_embd ({n_embd}) must be divisible by n_heads ({n_heads}); "
-                f"head_dim would be {head_dim} but {n_heads} * {head_dim} = "
-                f"{n_heads * head_dim}, not {n_embd}."
-            )
-        self.n_embd = int(n_embd)
-        self.n_heads = int(n_heads)
-        self.head_dim = self.n_embd // self.n_heads
-        self.order = int(order)
-        self.block_size = int(block_size)
-        self.finetune_mode = bool(finetune_mode)
-
-        self.heads = nn.ModuleList(
-            [
-                DeltaProductMemory(
-                    n_embd=self.head_dim,
-                    order=order,
-                    finetune_mode=finetune_mode,
-                    block_size=block_size,
-                )
-                for _ in range(self.n_heads)
-            ]
-        )
-
-    def init_state(self, B: int, device) -> list:
-        """Per-head init states. Returns `list[n_heads]` of `(M,)` tuples."""
-        return [h.init_state(B, device) for h in self.heads]
-
-    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
-        """Reshape last dim into (n_heads, head_dim). Works for [B, T, d]
-        or [B, d] inputs (the step path)."""
-        return x.view(*x.shape[:-1], self.n_heads, self.head_dim)
-
-    def _merge_heads(self, head_outputs: list) -> torch.Tensor:
-        """Concatenate per-head outputs back into a d_model tensor along
-        the last dim."""
-        return torch.cat(head_outputs, dim=-1)
-
-    def forward_chunk(self, x_chunk, state_in, doc_boundaries=None) -> tuple:
-        """Per-head dispatch of `forward_chunk`. doc_boundaries is shared
-        across heads (a token-level event is the same for every head)."""
-        x_split = self._split_heads(x_chunk)  # [B, T, n_heads, head_dim]
-        outputs = []
-        new_states = []
-        for i, head in enumerate(self.heads):
-            x_h = x_split[..., i, :].contiguous()  # [B, T, head_dim]
-            y_h, state_h = head.forward_chunk(x_h, state_in[i], doc_boundaries)
-            outputs.append(y_h)
-            new_states.append(state_h)
-        return self._merge_heads(outputs), new_states
-
-    def step_with_conv(self, x_t, state) -> tuple:
-        """Per-head decode-step dispatch."""
-        x_split = self._split_heads(x_t)  # [B, n_heads, head_dim]
-        outputs = []
-        new_states = []
-        for i, head in enumerate(self.heads):
-            x_h = x_split[..., i, :].contiguous()  # [B, head_dim]
-            y_h, s_h = head.step_with_conv(x_h, state[i])
-            outputs.append(y_h)
-            new_states.append(s_h)
-        return self._merge_heads(outputs), new_states

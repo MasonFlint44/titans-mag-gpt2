@@ -262,12 +262,25 @@ mechanism can't silently load into the other.
 
 ### Multi-head (`delta_n_heads > 1`)
 
-`MultiHeadDeltaProduct` wraps N parallel single-head `DeltaProductMemory`
-instances on `head_dim = n_embd / n_heads`. For training, prefer
-`delta_n_heads = n_head` (matches attention) so M per head is
-`head_dim × head_dim` — dramatically smaller state vs single-head
-`n_embd × n_embd`. Default 1 = simplest case, but the production recipe
-should match attention's head count.
+`DeltaProductMemory` is multi-head native — `n_heads` is a ctor arg, no
+wrapper class involved. Per-head architecture is unchanged from the
+single-head case (each head has its own [head_dim × head_dim] M, Q, K,
+V, β projections; heads share no parameters and see only their own
+slice of `x`), but parameters are stored as stacked tensors of shape
+`[n_heads, head_dim, *]` so projections fuse into one einsum call per
+role and the WY solve runs with batch dim = B × n_heads. This avoids
+the Python-loop-over-heads overhead in the old per-head-module design.
+
+For training, prefer `delta_n_heads = n_head` (matches attention) so M
+per head is `head_dim × head_dim` — dramatically smaller state vs
+single-head `n_embd × n_embd`. Default 1 = simplest case, but the
+production recipe should match attention's head count.
+
+A `register_load_state_dict_pre_hook` migrates checkpoints saved when
+DeltaProduct was using per-head Linear submodules (pre-fusion: either
+`MultiHeadDeltaProduct` wrapping per-head `DeltaProductMemory`s, or a
+single-head `DeltaProductMemory` with Linear modules) — they load
+transparently into the stacked-parameter layout.
 
 ### Compatibility with existing training-regime flags
 

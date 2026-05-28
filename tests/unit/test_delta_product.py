@@ -1,14 +1,13 @@
 """DeltaProductMemory unit tests.
 
-Covers the sequential reference path (block_size=1). Blockwise-vs-
-sequential equivalence and MultiHeadDeltaProduct tests live alongside
-once those paths land.
+Covers the sequential reference path, the chunkwise WY parallel path,
+multi-head fusion, and legacy state-dict migration.
 """
 
 import pytest
 import torch
 
-from model.delta_product import DeltaProductMemory, MultiHeadDeltaProduct
+from model.delta_product import DeltaProductMemory
 
 
 # -- Module construction --------------------------------------------------
@@ -24,14 +23,25 @@ def test_construct_rejects_bad_block_size():
         DeltaProductMemory(n_embd=8, order=2, block_size=0)
 
 
+def test_construct_rejects_bad_n_heads():
+    with pytest.raises(ValueError, match="n_heads must be >= 1"):
+        DeltaProductMemory(n_embd=8, n_heads=0)
+
+
+def test_construct_rejects_indivisible_n_embd():
+    with pytest.raises(ValueError, match="must be divisible"):
+        DeltaProductMemory(n_embd=10, n_heads=3)
+
+
 def test_param_count_scales_with_order():
-    """Order-N adds (N-1) extra (K, V, β) projection sets."""
+    """Order-N adds (N-1) extra (K, V, β) projection sets per head."""
     n_embd = 16
     p1 = sum(p.numel() for p in DeltaProductMemory(n_embd, order=1).parameters())
     p2 = sum(p.numel() for p in DeltaProductMemory(n_embd, order=2).parameters())
     p3 = sum(p.numel() for p in DeltaProductMemory(n_embd, order=3).parameters())
-    # Each extra order adds: 1 K (d²) + 1 V (d²) + 1 β head (d+1)
-    extra_per_order = 2 * n_embd * n_embd + (n_embd + 1)
+    # n_heads=1, head_dim=16. Per extra order: K + V + β weight + β bias:
+    #   K [1, 16, 16] = 256, V same, β weight [1, 16, 1] = 16, β bias [1, 1] = 1
+    extra_per_order = 2 * n_embd * n_embd + n_embd + 1
     assert p2 - p1 == extra_per_order
     assert p3 - p2 == extra_per_order
 
@@ -59,12 +69,22 @@ def test_finetune_mode_produces_zero_output_at_init():
 # -- init_state -----------------------------------------------------------
 
 
-def test_init_state_shape_and_zero():
+def test_init_state_shape_and_zero_singlehead():
     m = DeltaProductMemory(n_embd=8, order=2)
     state = m.init_state(B=3, device="cpu")
     assert isinstance(state, tuple) and len(state) == 1
     (M,) = state
-    assert M.shape == (3, 8, 8)
+    # Single-head case: M shape [B, 1, n_embd, n_embd].
+    assert M.shape == (3, 1, 8, 8)
+    assert torch.all(M == 0.0)
+
+
+def test_init_state_shape_multihead():
+    """Multi-head state is [B, H, head_dim, head_dim]."""
+    m = DeltaProductMemory(n_embd=12, n_heads=3, order=2)
+    state = m.init_state(B=2, device="cpu")
+    (M,) = state
+    assert M.shape == (2, 3, 4, 4)  # head_dim = 12 / 3
     assert torch.all(M == 0.0)
 
 
@@ -79,19 +99,20 @@ def test_order1_one_token_matches_delta_rule_formula():
     """
     torch.manual_seed(0)
     d = 4
-    m = DeltaProductMemory(n_embd=d, order=1, finetune_mode=False)
-    # Make sure we don't zero out the output.
+    m = DeltaProductMemory(
+        n_embd=d, n_heads=1, order=1, finetune_mode=False,
+    )
+    # out_scale per-head [1, d], all ones in scratch mode.
     assert torch.all(m.out_scale == 1.0)
 
-    # Set Q, K, V to identity so the math is direct on the input.
+    # Set Q, K, V to identity per-head so the math is direct on input.
     with torch.no_grad():
-        m.q_proj.weight.copy_(torch.eye(d))
-        m.k_projs[0].weight.copy_(torch.eye(d))
-        m.v_projs[0].weight.copy_(torch.eye(d))
-        # Set β bias so sigmoid(0 + b) is a known value; pick b such that
-        # σ(b) = 0.5 (i.e., b = 0). Weight already zeros input contribution.
-        m.beta_heads[0].weight.zero_()
-        m.beta_heads[0].bias.zero_()
+        m.q_proj_weight[0].copy_(torch.eye(d))
+        m.k_proj_weights[0][0].copy_(torch.eye(d))
+        m.v_proj_weights[0][0].copy_(torch.eye(d))
+        # β weight zeros + bias zero -> σ(0) = 0.5
+        m.beta_proj_weights[0].zero_()
+        m.beta_proj_biases[0].zero_()
 
     state = m.init_state(B=1, device="cpu")
     x = torch.tensor([[[1.0, 0.0, 0.0, 0.0]]])  # [1, 1, 4]
@@ -99,10 +120,10 @@ def test_order1_one_token_matches_delta_rule_formula():
 
     # k = v = q = x[0,0] = [1,0,0,0]; β = 0.5
     # M_1 = 0.5 * v * kᵀ -> rank-1 with M_1[0,0]=0.5
-    # y = M_1 · q = M_1 · [1,0,0,0]ᵀ = [0.5, 0, 0, 0]
+    # y = M_1 · q = [0.5, 0, 0, 0]
     expected_y = torch.tensor([[[0.5, 0.0, 0.0, 0.0]]])
-    expected_M = torch.zeros(1, d, d)
-    expected_M[0, 0, 0] = 0.5
+    expected_M = torch.zeros(1, 1, d, d)
+    expected_M[0, 0, 0, 0] = 0.5
 
     assert torch.allclose(y, expected_y, atol=1e-6)
     assert torch.allclose(M_out, expected_M, atol=1e-6)
@@ -117,14 +138,13 @@ def test_order2_differs_from_order1_with_distinct_beta2():
 
     # Copy m1's projections into m2's slot-0 so the first sub-step is identical.
     with torch.no_grad():
-        m2.q_proj.weight.copy_(m1.q_proj.weight)
-        m2.k_projs[0].weight.copy_(m1.k_projs[0].weight)
-        m2.v_projs[0].weight.copy_(m1.v_projs[0].weight)
-        m2.beta_heads[0].weight.copy_(m1.beta_heads[0].weight)
-        m2.beta_heads[0].bias.copy_(m1.beta_heads[0].bias)
-        # Slot-1 projections random; β_2 head bias = +3 so σ(+3) ≈ 0.95 -> very
-        # different M after the second sub-step.
-        m2.beta_heads[1].bias.fill_(3.0)
+        m2.q_proj_weight.copy_(m1.q_proj_weight)
+        m2.k_proj_weights[0].copy_(m1.k_proj_weights[0])
+        m2.v_proj_weights[0].copy_(m1.v_proj_weights[0])
+        m2.beta_proj_weights[0].copy_(m1.beta_proj_weights[0])
+        m2.beta_proj_biases[0].copy_(m1.beta_proj_biases[0])
+        # Slot-1 β bias = +3 so σ(+3) ≈ 0.95 -> very different M.
+        m2.beta_proj_biases[1].fill_(3.0)
 
     state1 = m1.init_state(B=1, device="cpu")
     state2 = m2.init_state(B=1, device="cpu")
@@ -133,7 +153,6 @@ def test_order2_differs_from_order1_with_distinct_beta2():
     y1, (M1,) = m1.forward_chunk(x, state1)
     y2, (M2,) = m2.forward_chunk(x, state2)
 
-    # Order-2 must diverge from order-1.
     assert not torch.allclose(y1, y2, atol=1e-3)
     assert not torch.allclose(M1, M2, atol=1e-3)
 
@@ -197,12 +216,9 @@ def test_doc_boundaries_reset_M_to_zero():
     x = torch.randn(1, 5, d)
     doc_boundaries = torch.tensor([[False, False, True, False, False]])
 
-    # Forward with the boundary.
     s = m.init_state(B=1, device="cpu")
     _, (M_with_boundary,) = m.forward_chunk(x, s, doc_boundaries=doc_boundaries)
 
-    # Forward only the post-boundary tokens (starting from zero state)
-    # — should yield the same M_out as the boundary-respecting run.
     s2 = m.init_state(B=1, device="cpu")
     _, (M_post,) = m.forward_chunk(x[:, 2:, :], s2)
 
@@ -250,35 +266,52 @@ def test_output_shape_matches_input():
     x = torch.randn(2, 7, d)
     y, (M_out,) = m.forward_chunk(x, s)
     assert y.shape == (2, 7, d)
-    assert M_out.shape == (2, d, d)
+    # Single-head -> M_out shape [B, 1, d, d].
+    assert M_out.shape == (2, 1, d, d)
 
 
-# -- block_size > 1 raises until blockwise lands --------------------------
+def test_keys_are_l2_normalized():
+    """K must be L2-normalized along the last dim — required for the
+    chunkwise WY solve's numerical stability and matches the standard
+    DeltaNet / DeltaProduct formulation in Yang et al. and TPTT."""
+    torch.manual_seed(0)
+    d = 16
+    m = DeltaProductMemory(n_embd=d, order=2, finetune_mode=False)
+    x = torch.randn(2, 5, d)
+    _, ks, _, _ = m._project_kvb(x)
+    for k in ks:
+        # ks[i] shape: [B, T, H, head_dim]; norm over head_dim.
+        norms = k.norm(dim=-1)  # [B, T, H]
+        assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5), (
+            f"K not L2-normalized: norms={norms}"
+        )
 
 
 # -- Blockwise (chunkwise WY) parallel path -------------------------------
 
 
-def _make_pair(d=6, order=2, finetune_mode=False, block_size=8, seed=0):
+def _make_pair(
+    d=6, n_heads=1, order=2, finetune_mode=False, block_size=8, seed=0,
+):
     """Build two DeltaProductMemory instances with identical weights —
     one in sequential mode, one in blockwise mode. Used to verify
     blockwise == sequential at the math level."""
     torch.manual_seed(seed)
     m_seq = DeltaProductMemory(
-        n_embd=d, order=order, finetune_mode=finetune_mode, block_size=1,
+        n_embd=d, n_heads=n_heads, order=order,
+        finetune_mode=finetune_mode, block_size=1,
     )
     torch.manual_seed(seed)
     m_blk = DeltaProductMemory(
-        n_embd=d, order=order, finetune_mode=finetune_mode,
-        block_size=block_size,
+        n_embd=d, n_heads=n_heads, order=order,
+        finetune_mode=finetune_mode, block_size=block_size,
     )
     return m_seq, m_blk
 
 
 def test_blockwise_matches_sequential_no_boundaries_order1():
     """Order=1 chunkwise WY form is bit-equivalent to per-token sequential
-    on the same (q, k, v, β) projections. This is the DeltaNet chunkwise
-    correctness test."""
+    on the same (q, k, v, β) projections (DeltaNet chunkwise correctness)."""
     m_seq, m_blk = _make_pair(d=4, order=1, block_size=8, seed=1)
     x = torch.randn(2, 6, 4)
     s0 = m_seq.init_state(B=2, device="cpu")
@@ -290,7 +323,6 @@ def test_blockwise_matches_sequential_no_boundaries_order1():
 
 
 def test_blockwise_matches_sequential_no_boundaries_order2():
-    """Order=2 (DeltaProduct) chunkwise must match sequential."""
     m_seq, m_blk = _make_pair(d=4, order=2, block_size=8, seed=2)
     x = torch.randn(2, 6, 4)
     s0 = m_seq.init_state(B=2, device="cpu")
@@ -302,7 +334,6 @@ def test_blockwise_matches_sequential_no_boundaries_order2():
 
 
 def test_blockwise_matches_sequential_order3():
-    """Higher orders compose correctly."""
     m_seq, m_blk = _make_pair(d=4, order=3, block_size=8, seed=3)
     x = torch.randn(2, 5, 4)
     s0 = m_seq.init_state(B=2, device="cpu")
@@ -317,18 +348,38 @@ def test_blockwise_matches_sequential_with_nonzero_initial_state():
     """The chunkwise formula must handle non-zero initial M correctly."""
     m_seq, m_blk = _make_pair(d=4, order=2, block_size=8, seed=4)
     x = torch.randn(2, 5, 4)
-    # Warm both modules to a non-zero state.
     s0_seq = m_seq.init_state(B=2, device="cpu")
     s0_blk = m_blk.init_state(B=2, device="cpu")
     _, s_warm_seq = m_seq.forward_chunk(torch.randn(2, 3, 4), s0_seq)
     _, s_warm_blk = m_blk.forward_chunk(torch.randn(2, 3, 4), s0_blk)
-    # Now feed the same M_in (use the seq-warmed M for both).
+    # Use the same warmed state for both (identical weights → identical M).
     (M_warm,) = s_warm_seq
     state_in = (M_warm,)
     y_seq, (M_seq,) = m_seq.forward_chunk(x, state_in)
     y_blk, (M_blk,) = m_blk.forward_chunk(x, state_in)
     assert torch.allclose(y_seq, y_blk, atol=1e-5)
     assert torch.allclose(M_seq, M_blk, atol=1e-5)
+
+
+def test_blockwise_boundary_at_position_zero_resets_M():
+    """Regression for the chunkwise-vs-sequential divergence at
+    doc_boundaries[:, 0]=True. The data loader sets this whenever
+    EOT aligns with a chunk boundary; earlier chunkwise code skipped
+    the reset for the t_lo=0 segment, leaking the prior chunk's M
+    state into the new document. The sequential path resets
+    unconditionally — chunkwise must match."""
+    m_seq, m_blk = _make_pair(d=4, order=2, block_size=8, seed=42)
+    x = torch.randn(2, 5, 4)
+    s0 = m_seq.init_state(B=2, device="cpu")
+    _, s_warm = m_seq.forward_chunk(torch.randn(2, 3, 4), s0)
+    db = torch.tensor([
+        [True,  False, False, False, False],
+        [False, False, False, False, False],
+    ])
+    y_seq, s_seq = m_seq.forward_chunk(x, s_warm, doc_boundaries=db)
+    y_blk, s_blk = m_blk.forward_chunk(x, s_warm, doc_boundaries=db)
+    assert torch.allclose(y_seq, y_blk, atol=1e-5)
+    assert torch.allclose(s_seq[0], s_blk[0], atol=1e-5)
 
 
 def test_blockwise_with_doc_boundaries_matches_sequential():
@@ -348,8 +399,6 @@ def test_blockwise_with_doc_boundaries_matches_sequential():
 
 
 def test_blockwise_state_continuity_split_chunk():
-    """Blockwise forward over two halves of a chunk threaded by state
-    must equal blockwise forward over the full chunk."""
     _, m_blk = _make_pair(d=4, order=2, block_size=8, seed=6)
     x = torch.randn(2, 7, 4)
     s0 = m_blk.init_state(B=2, device="cpu")
@@ -365,7 +414,6 @@ def test_blockwise_state_continuity_split_chunk():
 
 
 def test_blockwise_gradient_flow():
-    """Backward through the chunkwise solver must reach every parameter."""
     _, m_blk = _make_pair(d=4, order=2, block_size=8, seed=7)
     x = torch.randn(2, 5, 4, requires_grad=True)
     s = m_blk.init_state(B=2, device="cpu")
@@ -382,134 +430,61 @@ def test_blockwise_gradient_flow():
 
 
 def test_blockwise_stable_at_training_scale_long_chunk():
-    """Regression for the NaN-loss bug in the first smoke run: at training
-    chunk length (T·N >> 1), the WY triangular solve diverges unless
-    keys are L2-normalized to bound K·Kᵀ. This test runs at training
-    chunk shape (chunk_size=1024 + persistent_prefix=4 = 1028, head_dim=64,
+    """Regression for the original NaN-loss bug: at training chunk
+    length (T·N >> 1), the WY triangular solve diverges unless keys
+    are L2-normalized to bound K·Kᵀ. Runs at training chunk shape
+    (chunk_size=1024 + persistent_prefix=4 = 1028, head_dim=64,
     order=2 → T·N = 2056) and asserts finite outputs."""
     torch.manual_seed(0)
     d, order = 64, 2
-    T = 1028  # chunk_size 1024 + 4 persistent prefix positions
+    T = 1028
     m = DeltaProductMemory(
-        n_embd=d, order=order, finetune_mode=False, block_size=64,
+        n_embd=d, n_heads=1, order=order,
+        finetune_mode=False, block_size=64,
     )
     s = m.init_state(B=1, device="cpu")
     x = torch.randn(1, T, d)
     y, (M_out,) = m.forward_chunk(x, s)
-    assert torch.isfinite(y).all(), "y has non-finite entries"
-    assert torch.isfinite(M_out).all(), "M_out has non-finite entries"
-    # Also sanity-check magnitudes haven't blown up to absurd scales —
-    # if K is L2-normalized the per-element output should be O(1)–O(50).
+    assert torch.isfinite(y).all()
+    assert torch.isfinite(M_out).all()
     assert y.abs().max() < 1e3, f"y magnitude {y.abs().max()} too large"
 
 
-def test_keys_are_l2_normalized():
-    """K must be L2-normalized along the last dim — required for the
-    chunkwise WY solve's numerical stability and matches the standard
-    DeltaNet / DeltaProduct formulation in Yang et al. and TPTT."""
-    torch.manual_seed(0)
-    d = 16
-    m = DeltaProductMemory(n_embd=d, order=2, finetune_mode=False)
-    x = torch.randn(2, 5, d)
-    _, ks, _, _ = m._project_kvb(x)
-    for k in ks:
-        norms = k.norm(dim=-1)  # [B, T]
-        assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5), (
-            f"K not L2-normalized: norms={norms}"
-        )
-
-
-# -- MultiHeadDeltaProduct ------------------------------------------------
-
-
-def test_multihead_construct_rejects_bad_n_heads():
-    with pytest.raises(ValueError, match="n_heads must be >= 1"):
-        MultiHeadDeltaProduct(n_embd=8, n_heads=0)
-
-
-def test_multihead_construct_rejects_indivisible_dim():
-    with pytest.raises(ValueError, match="must be divisible"):
-        MultiHeadDeltaProduct(n_embd=10, n_heads=3)
-
-
-def test_multihead_init_state_returns_per_head_list():
-    m = MultiHeadDeltaProduct(n_embd=12, n_heads=3, order=2)
-    state = m.init_state(B=2, device="cpu")
-    assert isinstance(state, list)
-    assert len(state) == 3
-    for s in state:
-        assert isinstance(s, tuple) and len(s) == 1
-        (M_head,) = s
-        assert M_head.shape == (2, 4, 4)  # head_dim = 12 / 3
+# -- Multi-head fusion ----------------------------------------------------
 
 
 def test_multihead_output_shape():
+    """Multi-head forward returns [B, T, n_embd] regardless of n_heads."""
     d, nh = 12, 3
-    m = MultiHeadDeltaProduct(n_embd=d, n_heads=nh, order=2)
+    m = DeltaProductMemory(n_embd=d, n_heads=nh, order=2)
     s = m.init_state(B=2, device="cpu")
     x = torch.randn(2, 5, d)
-    y, ns = m.forward_chunk(x, s)
+    y, (M_out,) = m.forward_chunk(x, s)
     assert y.shape == (2, 5, d)
-    assert len(ns) == nh
-
-
-def test_multihead_equals_concat_of_singlehead_calls():
-    """MultiHeadDeltaProduct forward must equal concat of per-head
-    DeltaProductMemory forwards run on the corresponding head_dim
-    slice. Identity test guaranteeing the wrapper is structurally
-    correct."""
-    torch.manual_seed(0)
-    d, nh = 8, 2
-    head_dim = d // nh
-    mh = MultiHeadDeltaProduct(
-        n_embd=d, n_heads=nh, order=2, finetune_mode=False,
-    )
-    x = torch.randn(2, 4, d)
-
-    # Reference: run each head's underlying DeltaProductMemory directly on
-    # the corresponding head_dim slice of x.
-    head_outs = []
-    head_states_out = []
-    for i, head in enumerate(mh.heads):
-        x_h = x[..., i * head_dim : (i + 1) * head_dim].contiguous()
-        s_h = head.init_state(B=2, device="cpu")
-        y_h, ns_h = head.forward_chunk(x_h, s_h)
-        head_outs.append(y_h)
-        head_states_out.append(ns_h)
-    y_ref = torch.cat(head_outs, dim=-1)
-
-    s = mh.init_state(B=2, device="cpu")
-    y_mh, ns_mh = mh.forward_chunk(x, s)
-
-    assert torch.allclose(y_mh, y_ref, atol=1e-6)
-    for i in range(nh):
-        assert torch.allclose(ns_mh[i][0], head_states_out[i][0], atol=1e-6)
+    assert M_out.shape == (2, nh, d // nh, d // nh)
 
 
 def test_multihead_step_matches_forward_chunk_per_position():
     torch.manual_seed(0)
     d, nh = 12, 3
-    m = MultiHeadDeltaProduct(
+    m = DeltaProductMemory(
         n_embd=d, n_heads=nh, order=2, finetune_mode=False,
     )
     x = torch.randn(2, 4, d)
-
     s = m.init_state(B=2, device="cpu")
     y_chunk, _ = m.forward_chunk(x, s)
-
     s2 = m.init_state(B=2, device="cpu")
     y_steps = []
     for t in range(4):
         y_t, s2 = m.step_with_conv(x[:, t, :], s2)
         y_steps.append(y_t)
     y_step = torch.stack(y_steps, dim=1)
-
     assert torch.allclose(y_chunk, y_step, atol=1e-5)
 
 
 def test_multihead_finetune_mode_zero_output_at_init():
     torch.manual_seed(0)
-    m = MultiHeadDeltaProduct(
+    m = DeltaProductMemory(
         n_embd=12, n_heads=3, order=2, finetune_mode=True,
     )
     s = m.init_state(B=2, device="cpu")
@@ -518,23 +493,156 @@ def test_multihead_finetune_mode_zero_output_at_init():
     assert torch.allclose(y, torch.zeros_like(y))
 
 
+def test_multihead_blockwise_matches_sequential():
+    """Multi-head chunkwise must equal multi-head sequential per token,
+    head, and batch element."""
+    m_seq, m_blk = _make_pair(
+        d=12, n_heads=3, order=2, block_size=8, seed=7,
+    )
+    x = torch.randn(2, 6, 12)
+    s0 = m_seq.init_state(B=2, device="cpu")
+    y_seq, (M_seq,) = m_seq.forward_chunk(x, s0)
+    y_blk, (M_blk,) = m_blk.forward_chunk(x, s0)
+    assert torch.allclose(y_seq, y_blk, atol=1e-5)
+    assert torch.allclose(M_seq, M_blk, atol=1e-5)
+
+
 def test_multihead_doc_boundaries_share_across_heads():
     """doc_boundaries is a single per-batch-position tensor — all heads
     must respect the same boundary positions."""
     torch.manual_seed(0)
     d, nh = 8, 2
-    m = MultiHeadDeltaProduct(
+    m = DeltaProductMemory(
         n_embd=d, n_heads=nh, order=1, finetune_mode=False,
     )
     x = torch.randn(1, 5, d)
     db = torch.tensor([[False, False, True, False, False]])
-
     s = m.init_state(B=1, device="cpu")
-    _, ns_full = m.forward_chunk(x, s, doc_boundaries=db)
-
-    # Compare to running only the post-boundary tokens from zero state.
+    _, (M_full,) = m.forward_chunk(x, s, doc_boundaries=db)
     s2 = m.init_state(B=1, device="cpu")
-    _, ns_post = m.forward_chunk(x[:, 2:, :], s2)
+    _, (M_post,) = m.forward_chunk(x[:, 2:, :], s2)
+    assert torch.allclose(M_full, M_post, atol=1e-6)
 
-    for i in range(nh):
-        assert torch.allclose(ns_full[i][0], ns_post[i][0], atol=1e-6)
+
+def test_multihead_heads_are_independent():
+    """Fused multi-head must produce per-head outputs equal to running
+    n_heads independent single-head DeltaProductMemory modules on each
+    head's slice of x (with the corresponding stacked-weight slice
+    copied to a single-head module). This pins the per-head architecture
+    invariant: heads share no parameters, see only their own input slice."""
+    torch.manual_seed(0)
+    H, hd, order = 3, 4, 2
+    d = H * hd
+    m_multi = DeltaProductMemory(
+        n_embd=d, n_heads=H, order=order, finetune_mode=False,
+    )
+
+    # Build n_heads independent single-head modules sharing the multi-
+    # head model's per-head slice.
+    x = torch.randn(2, 4, d)
+    s = m_multi.init_state(B=2, device="cpu")
+    y_multi, _ = m_multi.forward_chunk(x, s)
+
+    head_outs = []
+    for h in range(H):
+        m_single = DeltaProductMemory(
+            n_embd=hd, n_heads=1, order=order, finetune_mode=False,
+        )
+        with torch.no_grad():
+            m_single.q_proj_weight[0].copy_(m_multi.q_proj_weight[h])
+            m_single.out_scale[0].copy_(m_multi.out_scale[h])
+            for i in range(order):
+                m_single.k_proj_weights[i][0].copy_(m_multi.k_proj_weights[i][h])
+                m_single.v_proj_weights[i][0].copy_(m_multi.v_proj_weights[i][h])
+                m_single.beta_proj_weights[i][0].copy_(m_multi.beta_proj_weights[i][h])
+                m_single.beta_proj_biases[i][0].copy_(m_multi.beta_proj_biases[i][h])
+        x_h = x[..., h * hd : (h + 1) * hd]
+        s_h = m_single.init_state(B=2, device="cpu")
+        y_h, _ = m_single.forward_chunk(x_h, s_h)
+        head_outs.append(y_h)
+
+    y_ref = torch.cat(head_outs, dim=-1)
+    assert torch.allclose(y_multi, y_ref, atol=1e-5)
+
+
+# -- Legacy state-dict migration ------------------------------------------
+
+
+def test_load_legacy_multihead_per_head_submodule_format():
+    """Pre-fusion MultiHeadDeltaProduct stored n_heads independent
+    DeltaProductMemory submodules under `heads.{h}.`. The new
+    multi-head-native DeltaProductMemory must load those checkpoints
+    transparently via the registered pre-hook."""
+    torch.manual_seed(0)
+    H, hd, order = 3, 4, 2
+    n_embd = H * hd
+
+    m = DeltaProductMemory(
+        n_embd=n_embd, n_heads=H, order=order, finetune_mode=False,
+    )
+
+    # Fabricate an OLD-format state dict by hand.
+    legacy = {}
+    q_per_head = [torch.randn(hd, hd) for _ in range(H)]
+    out_scale_per_head = [torch.randn(hd) for _ in range(H)]
+    k_per_head = [[torch.randn(hd, hd) for _ in range(H)] for _ in range(order)]
+    v_per_head = [[torch.randn(hd, hd) for _ in range(H)] for _ in range(order)]
+    bw_per_head = [[torch.randn(1, hd) for _ in range(H)] for _ in range(order)]
+    bb_per_head = [[torch.randn(1) for _ in range(H)] for _ in range(order)]
+
+    for h in range(H):
+        legacy[f"heads.{h}.q_proj.weight"] = q_per_head[h]
+        legacy[f"heads.{h}.out_scale"] = out_scale_per_head[h]
+        for i in range(order):
+            legacy[f"heads.{h}.k_projs.{i}.weight"] = k_per_head[i][h]
+            legacy[f"heads.{h}.v_projs.{i}.weight"] = v_per_head[i][h]
+            legacy[f"heads.{h}.beta_heads.{i}.weight"] = bw_per_head[i][h]
+            legacy[f"heads.{h}.beta_heads.{i}.bias"] = bb_per_head[i][h]
+
+    # Load — pre-hook should rewrite the keys.
+    missing, unexpected = m.load_state_dict(legacy, strict=False)
+    assert missing == [], f"unexpected missing keys: {missing}"
+    assert unexpected == [], f"unexpected extra keys: {unexpected}"
+
+    # Verify stacked params received per-head weights.
+    for h in range(H):
+        assert torch.allclose(m.q_proj_weight[h], q_per_head[h])
+        assert torch.allclose(m.out_scale[h], out_scale_per_head[h])
+        for i in range(order):
+            assert torch.allclose(m.k_proj_weights[i][h], k_per_head[i][h])
+            assert torch.allclose(m.v_proj_weights[i][h], v_per_head[i][h])
+            # β weight: old [1, hd] -> new [hd, 1] via transpose.
+            assert torch.allclose(
+                m.beta_proj_weights[i][h], bw_per_head[i][h].t(),
+            )
+            assert torch.allclose(m.beta_proj_biases[i][h], bb_per_head[i][h])
+
+
+def test_load_legacy_singlehead_linear_module_format():
+    """Pre-fusion single-head DeltaProductMemory used Linear modules
+    (q_proj.weight, k_projs.{i}.weight, etc.). The new layout must
+    accept those checkpoints too — needed for any single-head training
+    run that predates the multi-head fusion refactor."""
+    torch.manual_seed(0)
+    n_embd, order = 8, 2
+    m = DeltaProductMemory(
+        n_embd=n_embd, n_heads=1, order=order, finetune_mode=False,
+    )
+
+    legacy = {
+        "q_proj.weight": torch.randn(n_embd, n_embd),
+        "out_scale": torch.randn(n_embd),
+    }
+    for i in range(order):
+        legacy[f"k_projs.{i}.weight"] = torch.randn(n_embd, n_embd)
+        legacy[f"v_projs.{i}.weight"] = torch.randn(n_embd, n_embd)
+        legacy[f"beta_heads.{i}.weight"] = torch.randn(1, n_embd)
+        legacy[f"beta_heads.{i}.bias"] = torch.randn(1)
+
+    missing, unexpected = m.load_state_dict(legacy, strict=False)
+    assert missing == []
+    assert unexpected == []
+
+    # Spot-check: stacked params should match wrapped legacy values.
+    assert torch.allclose(m.q_proj_weight[0], legacy["q_proj.weight"])
+    assert torch.allclose(m.out_scale[0], legacy["out_scale"])
