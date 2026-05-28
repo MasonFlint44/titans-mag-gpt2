@@ -34,10 +34,48 @@ between the two via `config.memory_type` without other changes:
     step_with_conv(x_t, state) -> (y_t, new_state)
 """
 
+import functools
 import math
 
 import torch
 import torch.nn as nn
+
+
+@functools.lru_cache(maxsize=128)
+def _chunkwise_aux_tensors(device, T: int, N: int, dtype):
+    """Static auxiliary tensors used by every WY solve.
+
+    Returns `(mask_lt, I_TN, real_mask)`:
+      - `mask_lt`: strict-lower-tri bool mask of shape [TN, TN] used to
+        keep only the j<s entries of G.
+      - `I_TN`: identity of shape [TN, TN] in `dtype` for the (I + G)
+        triangular system.
+      - `real_mask`: [T, TN] mask of `(s_idx < (t_idx + 1) * N)` in
+        `dtype`, used to scope each real token's read to its own
+        write-window.
+
+    Caching by `(device, T, N, dtype)` because:
+      - At training scale (T·N ≈ 2056) `mask_lt` alone is ~4 MB, so
+        re-allocating per layer per forward is ~150 MB/s of allocator
+        pressure for purely deterministic tensors.
+      - `(T, N, device, dtype)` is the full identifier of the tensor
+        values — there's no per-call variation.
+
+    `lru_cache(maxsize=128)` bounds cache memory if the caller exercises
+    many distinct chunk lengths (e.g., variable-length doc segments at
+    training time). In practice most calls share one (T, N) so the cache
+    is hot after the first few forwards.
+    """
+    TN = T * N
+    mask_lt = torch.tril(
+        torch.ones(TN, TN, device=device, dtype=torch.bool),
+        diagonal=-1,
+    )
+    I_TN = torch.eye(TN, device=device, dtype=dtype)
+    s_idx = torch.arange(TN, device=device).unsqueeze(0)
+    t_idx = torch.arange(T, device=device).unsqueeze(1)
+    real_mask = (s_idx < (t_idx + 1) * N).to(dtype)
+    return mask_lt, I_TN, real_mask
 
 
 class DeltaProductMemory(nn.Module):
@@ -420,11 +458,17 @@ class DeltaProductMemory(nn.Module):
         # Split positions: 0 (implicit start), T (implicit end), and any
         # position where any row has a doc boundary. Each segment gets
         # one WY solve; the head of each segment may reset M per-row.
+        #
+        # One CUDA sync per chunk (`.tolist()`) instead of one sync per
+        # boundary position (the previous `int(t.item())` loop) — `.tolist()`
+        # synchronously reads the whole 1-D tensor in a single round-trip.
         splits = {0, T}
-        if doc_boundaries is not None and doc_boundaries.any():
+        if doc_boundaries is not None:
             any_boundary = doc_boundaries.any(dim=0)  # [T]
-            for t in torch.nonzero(any_boundary, as_tuple=False).flatten():
-                splits.add(int(t.item()))
+            boundary_positions = (
+                torch.nonzero(any_boundary, as_tuple=False).flatten().tolist()
+            )
+            splits.update(boundary_positions)
         split_list = sorted(splits)
 
         # Reset M unconditionally at every segment head where a boundary
@@ -434,6 +478,13 @@ class DeltaProductMemory(nn.Module):
         # every per-rank stream start and whenever EOT aligns with a
         # chunk boundary, so position-0 resets fire more than they might
         # seem to.
+        #
+        # The per-segment `torch.where` runs unconditionally instead of
+        # being gated by `reset_mask.any()`. The kernel is a no-op when
+        # the mask is all-False (cheap), but the `.any()` reads a 0-d
+        # bool back to CPU — a sync per segment. For our use (few
+        # segments per chunk) the trade is a wash on bandwidth and a win
+        # on sync count.
         y_segments = []
         for seg_i in range(len(split_list) - 1):
             t_lo, t_hi = split_list[seg_i], split_list[seg_i + 1]
@@ -441,12 +492,11 @@ class DeltaProductMemory(nn.Module):
                 continue
             if doc_boundaries is not None:
                 reset_mask = doc_boundaries[:, t_lo]  # [B]
-                if reset_mask.any():
-                    M = torch.where(
-                        reset_mask.view(B, 1, 1, 1),
-                        torch.zeros_like(M),
-                        M,
-                    )
+                M = torch.where(
+                    reset_mask.view(B, 1, 1, 1),
+                    torch.zeros_like(M),
+                    M,
+                )
             q_seg = q_all[:, t_lo:t_hi]
             ks_seg = [k[:, t_lo:t_hi] for k in ks_all]
             vs_seg = [v[:, t_lo:t_hi] for v in vs_all]
@@ -515,20 +565,22 @@ class DeltaProductMemory(nn.Module):
         Q_v = Q_BH.reshape(B * H, T, hd)
         M_in_v = M_in.reshape(B * H, hd, hd)
 
+        # Static auxiliary tensors (mask_lt, I_TN, real_mask) depend only
+        # on (T, N, device, dtype) — fetch from the module-level cache
+        # instead of re-allocating every forward.
+        mask_lt, I_TN, real_mask = _chunkwise_aux_tensors(
+            K_v.device, T, N, M_dtype,
+        )
+
         # R[b, s] = β_s · (v_s − M_in · k_s)
         Mk_virt = torch.bmm(K_v, M_in_v.transpose(-1, -2))
         R = beta_v * (V_v - Mk_virt)
 
         # G[b, s, j] = β_s · (k_s · k_j) for j < s (strict lower tri)
         KKt = torch.bmm(K_v, K_v.transpose(-1, -2))
-        mask_lt = torch.tril(
-            torch.ones(TN, TN, device=K_v.device, dtype=torch.bool),
-            diagonal=-1,
-        )
         G = (beta_v * KKt) * mask_lt
 
         # (I + G) U = R  via unit-lower-triangular solve.
-        I_TN = torch.eye(TN, device=K_v.device, dtype=M_dtype)
         LhS = I_TN.unsqueeze(0) + G
         U = torch.linalg.solve_triangular(
             LhS, R, upper=False, unitriangular=True,
@@ -539,9 +591,6 @@ class DeltaProductMemory(nn.Module):
 
         # Reads
         QKt = torch.bmm(Q_v, K_v.transpose(-1, -2))  # [B*H, T, TN]
-        s_idx = torch.arange(TN, device=Q_v.device).unsqueeze(0)
-        t_idx = torch.arange(T, device=Q_v.device).unsqueeze(1)
-        real_mask = (s_idx < (t_idx + 1) * N).to(M_dtype)
         A_rv = QKt * real_mask
         y_init = torch.bmm(Q_v, M_in_v.transpose(-1, -2))
         y_acc = torch.bmm(A_rv, U)

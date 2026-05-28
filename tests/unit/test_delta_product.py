@@ -7,7 +7,7 @@ multi-head fusion, and legacy state-dict migration.
 import pytest
 import torch
 
-from model.delta_product import DeltaProductMemory
+from model.delta_product import DeltaProductMemory, _chunkwise_aux_tensors
 
 
 # -- Module construction --------------------------------------------------
@@ -616,6 +616,90 @@ def test_load_legacy_multihead_per_head_submodule_format():
                 m.beta_proj_weights[i][h], bw_per_head[i][h].t(),
             )
             assert torch.allclose(m.beta_proj_biases[i][h], bb_per_head[i][h])
+
+
+# -- Chunkwise auxiliary-tensor cache -------------------------------------
+
+
+def test_chunkwise_aux_cache_returns_identical_tensors_on_repeat_call():
+    """`_chunkwise_aux_tensors` is memoized by (device, T, N, dtype). A
+    second call with the same key should return the SAME tensor objects
+    (identity, not just equality) so we're truly avoiding re-allocation."""
+    _chunkwise_aux_tensors.cache_clear()
+    device = torch.device("cpu")
+    a = _chunkwise_aux_tensors(device, T=8, N=2, dtype=torch.float32)
+    b = _chunkwise_aux_tensors(device, T=8, N=2, dtype=torch.float32)
+    for t_a, t_b in zip(a, b):
+        assert t_a is t_b
+
+
+def test_chunkwise_aux_cache_separates_by_T_and_N():
+    """Different (T, N) must produce distinct tensors with the right shapes."""
+    _chunkwise_aux_tensors.cache_clear()
+    device = torch.device("cpu")
+    dtype = torch.float32
+
+    mask_a, I_a, real_a = _chunkwise_aux_tensors(device, T=4, N=2, dtype=dtype)
+    mask_b, I_b, real_b = _chunkwise_aux_tensors(device, T=4, N=3, dtype=dtype)
+    mask_c, I_c, real_c = _chunkwise_aux_tensors(device, T=8, N=2, dtype=dtype)
+
+    # T=4, N=2 -> TN=8
+    assert mask_a.shape == (8, 8)
+    assert I_a.shape == (8, 8)
+    assert real_a.shape == (4, 8)
+    # T=4, N=3 -> TN=12
+    assert mask_b.shape == (12, 12)
+    assert real_b.shape == (4, 12)
+    # T=8, N=2 -> TN=16
+    assert mask_c.shape == (16, 16)
+    assert real_c.shape == (8, 16)
+
+    # And not the same objects.
+    assert mask_a is not mask_b
+    assert mask_a is not mask_c
+    assert real_a is not real_b
+
+
+def test_chunkwise_aux_real_mask_semantics():
+    """`real_mask[t, s] = 1` iff virtual write `s` is in real token `t`'s
+    write-window — i.e. s < (t+1)·N. This is what scopes each read to
+    its own writes."""
+    _chunkwise_aux_tensors.cache_clear()
+    device = torch.device("cpu")
+    _, _, real_mask = _chunkwise_aux_tensors(
+        device, T=3, N=2, dtype=torch.float32,
+    )
+    # T=3, N=2 -> TN=6. For each real t, virtual positions allowed are 0..(t+1)*N-1.
+    expected = torch.tensor([
+        [1, 1, 0, 0, 0, 0],  # t=0: s < 2
+        [1, 1, 1, 1, 0, 0],  # t=1: s < 4
+        [1, 1, 1, 1, 1, 1],  # t=2: s < 6
+    ], dtype=torch.float32)
+    assert torch.allclose(real_mask, expected)
+
+
+def test_chunkwise_solve_uses_cache_without_breaking_correctness():
+    """End-to-end: warm the cache with one forward, then a second forward
+    of the same shape must hit the cache and produce identical results."""
+    _chunkwise_aux_tensors.cache_clear()
+    _, m_blk = _make_pair(d=4, order=2, block_size=8, seed=10)
+    s = m_blk.init_state(B=2, device="cpu")
+    x = torch.randn(2, 6, 4)
+
+    # First forward populates the cache.
+    y1, s1 = m_blk.forward_chunk(x, s)
+    cache_info_after_first = _chunkwise_aux_tensors.cache_info()
+    assert cache_info_after_first.currsize >= 1
+
+    # Second forward (same shape) hits the cache.
+    s2_in = m_blk.init_state(B=2, device="cpu")
+    y2, s2 = m_blk.forward_chunk(x, s2_in)
+    cache_info_after_second = _chunkwise_aux_tensors.cache_info()
+    assert cache_info_after_second.hits > cache_info_after_first.hits
+
+    # Identical outputs (same weights, same inputs, same cache).
+    assert torch.allclose(y1, y2)
+    assert torch.allclose(s1[0], s2[0])
 
 
 def test_load_legacy_singlehead_linear_module_format():
