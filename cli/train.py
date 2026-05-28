@@ -538,6 +538,12 @@ def _layer_norm_M(layer_state):
     if isinstance(layer_state, list):
         return sum(_layer_norm_M(s) for s in layer_state) / len(layer_state)
     M = layer_state[0]
+    # DeltaProductMemory state is a 1-tuple (M,) where M is a tensor
+    # [B, d, d] (not a dict). Treat the whole tensor as one block for
+    # the Frobenius norm.
+    if isinstance(M, torch.Tensor):
+        sq_sum = (M.float() ** 2).sum(dim=tuple(range(1, M.ndim)))
+        return sq_sum.sqrt().mean().detach().item()
     sq_sum = sum(
         (v.float() ** 2).sum(dim=tuple(range(1, v.ndim)))
         for k, v in M.items() if not k.endswith("_qs")

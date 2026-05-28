@@ -378,6 +378,47 @@ def test_blockwise_gradient_flow():
     assert x.grad.abs().max() > 0
 
 
+# -- Numerical stability at training-realistic scale ----------------------
+
+
+def test_blockwise_stable_at_training_scale_long_chunk():
+    """Regression for the NaN-loss bug in the first smoke run: at training
+    chunk length (T·N >> 1), the WY triangular solve diverges unless
+    keys are L2-normalized to bound K·Kᵀ. This test runs at training
+    chunk shape (chunk_size=1024 + persistent_prefix=4 = 1028, head_dim=64,
+    order=2 → T·N = 2056) and asserts finite outputs."""
+    torch.manual_seed(0)
+    d, order = 64, 2
+    T = 1028  # chunk_size 1024 + 4 persistent prefix positions
+    m = DeltaProductMemory(
+        n_embd=d, order=order, finetune_mode=False, block_size=64,
+    )
+    s = m.init_state(B=1, device="cpu")
+    x = torch.randn(1, T, d)
+    y, (M_out,) = m.forward_chunk(x, s)
+    assert torch.isfinite(y).all(), "y has non-finite entries"
+    assert torch.isfinite(M_out).all(), "M_out has non-finite entries"
+    # Also sanity-check magnitudes haven't blown up to absurd scales —
+    # if K is L2-normalized the per-element output should be O(1)–O(50).
+    assert y.abs().max() < 1e3, f"y magnitude {y.abs().max()} too large"
+
+
+def test_keys_are_l2_normalized():
+    """K must be L2-normalized along the last dim — required for the
+    chunkwise WY solve's numerical stability and matches the standard
+    DeltaNet / DeltaProduct formulation in Yang et al. and TPTT."""
+    torch.manual_seed(0)
+    d = 16
+    m = DeltaProductMemory(n_embd=d, order=2, finetune_mode=False)
+    x = torch.randn(2, 5, d)
+    _, ks, _, _ = m._project_kvb(x)
+    for k in ks:
+        norms = k.norm(dim=-1)  # [B, T]
+        assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5), (
+            f"K not L2-normalized: norms={norms}"
+        )
+
+
 # -- MultiHeadDeltaProduct ------------------------------------------------
 
 

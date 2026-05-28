@@ -190,11 +190,14 @@ def add_nmm_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=None,
         metavar="N",
-        help="Chunked-update aggregation size for the blockwise parallel "
-             "DeltaProduct path. 1 = sequential per-token recurrence "
-             "(reference correctness path). >1 = blockwise parallel "
-             "(training-time speed path). Only meaningful with "
-             "--memory-type delta_product.",
+        help="Selects the DeltaProduct forward path. 1 = sequential "
+             "per-token recurrence (reference correctness path; useful "
+             "as a baseline). >1 = chunkwise WY parallel path "
+             "(training-time speed path; one closed-form triangular "
+             "solve per document segment, bit-equivalent to sequential). "
+             "The numeric value above 1 is currently unused — reserved "
+             "for a future memory-bounded sub-chunking path. Only "
+             "meaningful with --memory-type delta_product.",
     )
 
 

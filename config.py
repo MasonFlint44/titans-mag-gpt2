@@ -424,12 +424,15 @@ class TitansConfig:
     #   Must divide n_embd. Only meaningful when memory_type="delta_product".
     delta_n_heads: int = 1
 
-    # delta_block_size: chunked-update aggregation size for the blockwise
-    #   parallel forward path. 1 = paper-strict per-token sequential
-    #   recurrence (reference correctness path). >1 = blockwise parallel
-    #   (training-time speed path, bit-equivalent to sequential at
-    #   block_size=1, approximately equivalent at larger sizes). Only
-    #   meaningful when memory_type="delta_product".
+    # delta_block_size: selects the forward path for DeltaProduct.
+    #   1 = paper-strict per-token sequential recurrence (reference
+    #   correctness path; slow but a useful baseline / decode path).
+    #   >1 = chunkwise WY parallel path: one closed-form triangular solve
+    #   per document segment, bit-equivalent to sequential. The numeric
+    #   value above 1 is currently unused (one WY solve per segment
+    #   regardless), but the field is reserved for a future memory-
+    #   bounded sub-chunking path if chunk lengths grow past ~4096.
+    #   Only meaningful when memory_type="delta_product".
     delta_block_size: int = 1
 
     def __post_init__(self):

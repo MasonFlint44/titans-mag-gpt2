@@ -112,16 +112,28 @@ class DeltaProductMemory(nn.Module):
 
         Returns:
             q [B, T, d]
-            ks: list[order] of [B, T, d]
+            ks: list[order] of [B, T, d] — L2-normalized along last dim
             vs: list[order] of [B, T, d]
             bs: list[order] of [B, T, 1] (after sigmoid)
+
+        Keys are L2-normalized so ||k_t|| = 1 and the Gram matrix K·Kᵀ
+        has entries bounded in [-1, 1]. This bounds the spectral norm of
+        β·K·Kᵀ inside the chunkwise WY solve and keeps `(I + G)` well-
+        conditioned regardless of chunk length. Without this the
+        triangular solve diverges at training scale (T·N >> 1) — the
+        canonical DeltaNet / DeltaProduct formulation requires it. The
+        sequential path also benefits: M's spectral norm stays bounded
+        across the chunk.
 
         Done outside the per-token loop so the loop body only does the
         recurrent state update — every projection is one batched matmul
         across the (B, T) dims.
         """
         q = self.q_proj(x_chunk)
-        ks = [self.k_projs[i](x_chunk) for i in range(self.order)]
+        ks = [
+            torch.nn.functional.normalize(self.k_projs[i](x_chunk), dim=-1)
+            for i in range(self.order)
+        ]
         vs = [self.v_projs[i](x_chunk) for i in range(self.order)]
         bs = [
             torch.sigmoid(self.beta_heads[i](x_chunk))
@@ -211,97 +223,63 @@ class DeltaProductMemory(nn.Module):
     ) -> tuple:
         """Chunkwise parallel forward — closed-form WY representation.
 
-        Bit-equivalent to the sequential per-token recurrence at any
-        chunk length when `doc_boundaries` is None or all-False. Replaces
-        the T-step Python loop with a single matrix solve plus a few
-        batched matmuls, which exposes tensor-core parallelism and
-        amortizes the per-token kernel-launch cost. The dominant cost is
-        O(T²·N² · d) for the Gram matrix and triangular solve, which
-        beats O(T·N · d²) sequential when d > T·N — i.e., for typical
-        block_size on the order of 64-256, the chunkwise form is the
-        training-time speed path.
+        Bit-equivalent to the sequential per-token recurrence: the WY
+        solve produces exactly the sequential outputs for the whole
+        chunk (L2-normalized K bounds the Gram matrix and keeps the
+        triangular solve well-conditioned at any T·N).
 
-        With document boundaries inside the chunk (e.g., multi-document
-        training corpora), the closed-form solve is split at each boundary
-        and the per-segment results are concatenated. This preserves the
-        sequential semantics (M reset at boundary positions BEFORE that
-        token's update) while keeping the inside-segment math closed-form.
+        One WY solve per contiguous document segment. With no doc
+        boundaries, the whole chunk is solved in a single WY system —
+        one large, tensor-core-friendly triangular solve per layer per
+        head per forward. With doc boundaries, the chunk is split at
+        boundary positions and one WY solve runs per segment, threading
+        M between segments with per-row reset where needed.
 
-        Math (single segment, no boundaries):
-          R[b, s] = β_s · (v_s − M_in · k_s)               [B, T*N, d]
-          G[b, s, j] = β_s · (k_s · k_j)  for j < s        [B, T*N, T*N]
-          (I + G) · U = R   (lower-tri solve)
-          M_out = M_in + U^T · K_virt
-          y[t]  = M_in · q_t + Σ_{s < (t+1)N} (q_t · k_s) · u_s
+        Why one solve instead of fixed-size sub-chunks: sub-chunking
+        adds Python-loop overhead and replaces one large solve with many
+        small ones, with ~6× wall-clock penalty at chunk_size=1024 (the
+        smoke-test observed regression). The WY solve's O(T²·N²) cost
+        is dominated by the single triangular solve kernel, which
+        parallelizes natively on tensor cores; sub-chunking trades that
+        for kernel-launch overhead with no compensating throughput win.
+
+        Memory bound (peak): the (I + G) matrix is [B, T·N, T·N] fp32.
+        At chunk_size=1024, T·N=2048 → ~16 MB per head per layer per
+        batch element — well within budget. Watch this if you raise
+        chunk_size past ~4096; we may then need a memory-bounded
+        chunked path.
         """
-        (M_in,) = state_in
+        (M,) = state_in
         B, T, d = x_chunk.shape
-
-        # Doc-boundary handling: split into segments and dispatch each
-        # to the no-boundary chunkwise solver. Boundary at position t
-        # means M resets BEFORE t's writes. So segment ranges are:
-        #   [0, t_1), [t_1, t_2), ..., [t_k, T)
-        # where {t_1, ..., t_k} are the boundary positions (in order).
-        # Each segment after the first starts from a zero M (per-batch
-        # row that crossed a boundary; rows without a boundary at that
-        # position keep the prior M).
-        if doc_boundaries is not None and doc_boundaries.any():
-            return self._forward_chunk_blockwise_with_boundaries(
-                x_chunk, state_in, doc_boundaries,
-            )
 
         # Project once for the whole chunk.
-        q, ks, vs, bs = self._project_kvb(x_chunk)
-        return self._chunkwise_solve(M_in, q, ks, vs, bs)
-
-    def _forward_chunk_blockwise_with_boundaries(
-        self,
-        x_chunk: torch.Tensor,
-        state_in: tuple,
-        doc_boundaries: torch.Tensor,
-    ) -> tuple:
-        """Boundary-aware chunkwise dispatcher.
-
-        Doc boundaries may be heterogeneous across the batch — a position
-        is a boundary for some rows but not others. To stay closed-form,
-        find the UNION of boundary positions across the batch and split
-        the chunk there; for each segment, apply per-row M-reset at the
-        boundary head using `torch.where`, then run the chunkwise solve.
-
-        This produces sequential-equivalent output as long as boundaries
-        within a segment-interior never fire for any row (guaranteed by
-        construction: a row that has a boundary inside a segment would
-        have triggered an earlier split).
-        """
-        (M_in,) = state_in
-        B, T, d = x_chunk.shape
-
-        # Union of boundary positions across all batch rows.
-        # any_boundary[t] = True if ANY row has a boundary at t.
-        any_boundary = doc_boundaries.any(dim=0)  # [T] bool
-        # Split positions: indices where any_boundary is True. Always
-        # add 0 (implicit start) and T (implicit end) to form segments.
-        split_idx = [0] + (
-            [int(t.item()) for t in torch.nonzero(any_boundary).squeeze(-1)]
-            + [T]
-        )
-        # Deduplicate / monotonic.
-        split_idx = sorted(set(split_idx))
-        if split_idx[-1] != T:
-            split_idx.append(T)
-
         q_all, ks_all, vs_all, bs_all = self._project_kvb(x_chunk)
 
-        M = M_in
+        # Split set: just doc-boundary positions (no fixed-size sub-chunks).
+        # 0 and T frame the segments implicitly.
+        splits = {0, T}
+        if doc_boundaries is not None and doc_boundaries.any():
+            any_boundary = doc_boundaries.any(dim=0)  # [T]
+            for t in torch.nonzero(any_boundary, as_tuple=False).flatten():
+                splits.add(int(t.item()))
+        split_list = sorted(splits)
+
+        # Fast path: no doc boundaries → one solve over the whole chunk.
+        if len(split_list) == 2:
+            y_raw, M_out = self._chunkwise_solve_raw(
+                M, q_all, ks_all, vs_all, bs_all,
+            )
+            y = y_raw.to(x_chunk.dtype) * self.out_scale.to(x_chunk.dtype)
+            return y, (M_out,)
+
+        # Slow path: per-document-segment WY solves with M reset at
+        # boundary positions for any row that crossed one.
         y_segments = []
-        for seg_i in range(len(split_idx) - 1):
-            t_lo, t_hi = split_idx[seg_i], split_idx[seg_i + 1]
+        for seg_i in range(len(split_list) - 1):
+            t_lo, t_hi = split_list[seg_i], split_list[seg_i + 1]
             if t_hi == t_lo:
                 continue
-            # Per-row reset at this segment's head (skip the very first
-            # segment — its head's reset, if any, is the caller's
-            # responsibility / already-zero state).
-            if seg_i > 0:
+            if t_lo > 0 and doc_boundaries is not None:
                 reset_mask = doc_boundaries[:, t_lo]  # [B] bool
                 if reset_mask.any():
                     M = torch.where(
@@ -309,7 +287,6 @@ class DeltaProductMemory(nn.Module):
                         torch.zeros_like(M),
                         M,
                     )
-            # Segment projections.
             q_seg = q_all[:, t_lo:t_hi, :]
             ks_seg = [k[:, t_lo:t_hi, :] for k in ks_all]
             vs_seg = [v[:, t_lo:t_hi, :] for v in vs_all]
@@ -319,28 +296,9 @@ class DeltaProductMemory(nn.Module):
             )
             y_segments.append(y_seg_raw)
 
-        y_raw = torch.cat(y_segments, dim=1)  # [B, T, d]
-        # out_scale + dtype cast (the chunkwise solver returns the raw
-        # pre-scale read; mirror what `_chunkwise_solve` does at exit).
+        y_raw = torch.cat(y_segments, dim=1)
         y = y_raw.to(x_chunk.dtype) * self.out_scale.to(x_chunk.dtype)
         return y, (M,)
-
-    def _chunkwise_solve(
-        self,
-        M_in: torch.Tensor,
-        q: torch.Tensor,
-        ks: list,
-        vs: list,
-        bs: list,
-    ) -> tuple:
-        """Public wrapper: chunkwise solve + out_scale gate + dtype cast.
-
-        Matches the post-loop convention of `_forward_chunk_sequential`:
-        cast y to x_chunk's dtype, multiply by out_scale.
-        """
-        y_raw, M_out = self._chunkwise_solve_raw(M_in, q, ks, vs, bs)
-        y = y_raw.to(q.dtype) * self.out_scale.to(q.dtype)
-        return y, (M_out,)
 
     def _chunkwise_solve_raw(
         self,
