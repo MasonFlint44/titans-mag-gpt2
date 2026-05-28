@@ -144,18 +144,19 @@ def _reset_M_S(M: dict, S, mask: torch.Tensor, init_M: dict):
 
 
 def reset_state(state: tuple, mask: torch.Tensor, init_M: dict) -> tuple:
-    """Reset masked batch entries of a full per-layer state.
+    """Reset masked batch entries of a full per-layer NMM state triple.
 
-    Handles both shapes:
-      - 2-tuple `(M, S)` — returns `(M_new, S_new)`. Used by callers that
-        only track M/S (e.g. the per-token inner loop).
-      - 3-tuple `(M, S, conv_buf)` — returns `(M_new, S_new, conv_buf_new)`.
-        Used by the chunk-level reset.
-
+    `state`: `(M, S, conv_buf)` triple.
     `mask`: [B] bool. True → init values for that batch row; False → keep.
+    Returns `(M_new, S_new, conv_buf_new)`.
 
-    Inner-loop callers that operate on (M, S) directly should call
-    `_reset_M_S` to avoid an unused conv_buf round-trip.
+    Internal callers that only need to reset `(M, S)` (the per-token
+    inner loop, the blockwise sub-chunk reset) should call `_reset_M_S`
+    directly — they thread `conv_buf` independently and don't need it
+    routed through the polymorphic surface.
+
+    The 2-tuple `(M, S)` form is still accepted for back-compat with
+    external callers that haven't migrated; returns a 2-tuple in that case.
     """
     if len(state) == 2:
         M, S = state
@@ -932,10 +933,10 @@ class NeuralMemoryModule(nn.Module):
         self.low_rank = low_rank
         # The analytical inner-gradient kernel (model/nmm_fused.py) is the
         # only path on the sequential `block_size=1` recurrence — the
-        # earlier `fused_kernel` toggle is gone (always-on now). Decode
-        # paths (`step`, `step_with_conv`) still use the vmap-based
-        # `per_sample_grad_fn` reference because they fire once per token
-        # at inference time and aren't on any training hot path.
+        # earlier `fused_kernel` toggle is gone (always-on now). The
+        # decode path (`step_with_conv`) still uses the vmap-based
+        # `per_sample_grad_fn` reference because it fires once per token
+        # at inference time and isn't on any training hot path.
         # Soft norm-clamp threshold applied to surprise gradients BEFORE NS5.
         # None = disabled (paper-strict). See `softclamp_grad_norm` docstring.
         self.softclamp_max = softclamp_max
@@ -1023,7 +1024,8 @@ class NeuralMemoryModule(nn.Module):
             _steps = self.ns5_steps
             self._ns5_fn = lambda g, _f=_ns5_base, _s=_steps: _f(g, steps=_s)
         # Paper Eq. 15: y_t = M(q_t) where M is M_{t-1} (read-then-write).
-        # Default False = lucidrains "write-then-read" (retrieve from M_t).
+        # Default True (paper-strict). Set False for lucidrains-style
+        # write-then-read (retrieve from the freshly-updated M_t).
         self.retrieval_from_M_prev = retrieval_from_M_prev
 
         allowed_state_dtypes = set(_STATE_DTYPE_MAP) | {"int8"}
@@ -1470,7 +1472,10 @@ class NeuralMemoryModule(nn.Module):
             if db_seg is not None and bool(db_seg[:, t].any()):
                 # `init_M` is guaranteed non-None at this branch by the caller —
                 # if any boundary in the WHOLE chunk fires, the caller builds it.
-                M, S = reset_state((M, S), db_seg[:, t], init_M)
+                # `_reset_M_S` directly (not the polymorphic `reset_state`) —
+                # conv_buf was already reset at chunk start; the per-token
+                # loop only touches M and S.
+                M, S = _reset_M_S(M, S, db_seg[:, t], init_M)
 
             k_hat_t = k_hat_seg[:, t, :]
             q_hat_t = q_hat_seg[:, t, :]
@@ -1812,11 +1817,13 @@ class NeuralMemoryModule(nn.Module):
             # Reset at sub-chunk start. `sub_idx == 0` is the chunk's
             # leading sub-chunk (starts at position 0); no prior state to
             # reset against, so we never reset here. For sub_idx > 0 the
-            # sub-chunk starts at a boundary position; reset_state masks
+            # sub-chunk starts at a boundary position; `_reset_M_S` masks
             # by `doc_boundaries[:, sub_s]` so only the batches that have
-            # the boundary at exactly this position get reset.
+            # the boundary at exactly this position get reset. conv_buf is
+            # not touched here — it was already reset (at chunk pos 0
+            # only) via `_reset_conv_buf_at_chunk_start` at chunk entry.
             if sub_idx > 0:
-                M, S = reset_state((M, S), doc_boundaries[:, sub_s], init_M)
+                M, S = _reset_M_S(M, S, doc_boundaries[:, sub_s], init_M)
 
             # Inner loop: block_size-aligned partition of [sub_s, sub_e).
             # No boundary checks inside — the sub-chunk has none by
@@ -2109,7 +2116,8 @@ class MultiHeadNMM(nn.Module):
     # --- Same-API methods as NeuralMemoryModule ----------------------------
 
     def init_state(self, B: int, device) -> list:
-        """Per-head init states. Returns a list[n_heads] of `(M, S)` tuples."""
+        """Per-head init states. Returns a list[n_heads] of
+        `(M, S, conv_buf)` triples (item 6 — conv_buf is in state now)."""
         return [h.init_state(B, device) for h in self.heads]
 
     def _split_heads(self, x: torch.Tensor) -> torch.Tensor:

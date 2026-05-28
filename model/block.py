@@ -8,6 +8,50 @@ from torch import cat
 from model.nmm import MultiHeadNMM, NeuralMemoryModule
 
 
+def _build_aug_mask(
+    N_p: int,
+    T_real: int,
+    use_swa: bool,
+    swa_window: int,
+    device,
+    dtype,
+) -> torch.Tensor:
+    """Block-structured additive attention mask `[N_p+T_real, N_p+T_real]`.
+
+    Used by both `TitansMAGBlock` (always) and `PlainGPT2Block` (only in
+    `persistent_prefix_mode="model_wide"` — see `PlainGPT2Block.forward`).
+
+    Block layout:
+      - persistent ↔ persistent : 0 (bidirectional among themselves)
+      - persistent → real       : −∞ (persistent can't see real)
+      - real → persistent       : 0 (real always sees persistent — Fig 3b)
+      - real → real             : upper-triangular causal, optionally
+                                  banded `swa_window` positions back if
+                                  `use_swa` is on. Persistent prefix stays
+                                  fully visible under SWA per paper Fig 3b.
+
+    `dtype` matches the input's dtype to avoid an implicit cast inside
+    SDPA under autocast.
+    """
+    N = N_p + T_real
+    mask = torch.full((N, N), float("-inf"), device=device, dtype=dtype)
+    if N_p > 0:
+        mask[:N_p, :N_p] = 0
+        mask[N_p:, :N_p] = 0
+    causal = torch.triu(
+        torch.full((T_real, T_real), float("-inf"), device=device, dtype=dtype),
+        diagonal=1,
+    )
+    if use_swa:
+        far_past = torch.tril(
+            torch.full((T_real, T_real), float("-inf"), device=device, dtype=dtype),
+            diagonal=-swa_window,
+        )
+        causal = causal + far_past
+    mask[N_p:, N_p:] = causal
+    return mask
+
+
 # G279 — int8 KV cache (decode-time only).
 #
 # Each cached K or V tensor at a transformer block has shape
@@ -314,26 +358,12 @@ class PlainGPT2Block(nn.Module):
         return mask
 
     def _aug_mask(self, T_real: int, device, dtype):
-        """Block-structured `[N_p+T_real, N_p+T_real]` mask matching
-        `TitansMAGBlock._aug_mask`. Used in `model_wide` mode where the
-        block input arrives with the persistent prefix prepended at the
-        model level."""
-        N = self.N_p + T_real
-        mask = torch.full((N, N), float("-inf"), device=device, dtype=dtype)
-        mask[: self.N_p, : self.N_p] = 0          # persistent ↔ persistent
-        mask[self.N_p :, : self.N_p] = 0          # real → persistent
-        causal = torch.triu(
-            torch.full((T_real, T_real), float("-inf"), device=device, dtype=dtype),
-            diagonal=1,
+        """Block-structured mask for the `model_wide` path — delegates to
+        the module-level `_build_aug_mask`. See that function's docstring
+        for the block layout."""
+        return _build_aug_mask(
+            self.N_p, T_real, self.use_swa, self.swa_window, device, dtype,
         )
-        if self.use_swa:
-            far_past = torch.tril(
-                torch.full((T_real, T_real), float("-inf"), device=device, dtype=dtype),
-                diagonal=-self.swa_window,
-            )
-            causal = causal + far_past
-        mask[self.N_p :, self.N_p :] = causal     # real → real (banded if SWA)
-        return mask
 
     def forward(self, x: torch.Tensor, nmm_state=None, doc_boundaries=None):
         # nmm_state and doc_boundaries are accepted for signature uniformity
@@ -494,33 +524,23 @@ class TitansMAGBlock(nn.Module):
         self.mlp = GPT2MLP(config.n_embd, config.dropout)
 
     def _aug_mask(self, T: int, dtype: torch.dtype = None) -> torch.Tensor:
-        """Build the [N_p+T, N_p+T] additive attention mask (0 attend, -inf block).
+        """Build the `[N_p+T, N_p+T]` additive attention mask — delegates
+        to the module-level `_build_aug_mask`. See that function's
+        docstring for the block layout.
 
-        dtype matches x.dtype to avoid an implicit cast inside
-        scaled_dot_product_attention under autocast.
+        `T` here is the real-token count; the persistent rows/cols are
+        added internally based on `self.N_p`. `dtype` matches x.dtype to
+        avoid an implicit cast inside SDPA under autocast.
+
+        Device is picked off `ln_1.weight` because `persistent_mem` is
+        only present on this block in `per_block` mode (in `model_wide`
+        mode the prefix lives on the model). `ln_1.weight` is always
+        present and always lives on the block's device.
         """
-        # `persistent_mem` only exists in per_block mode (in model_wide
-        # mode the prefix lives on `TitansMAGGPT2`). Use a Parameter that's
-        # always present on the block — `ln_1.weight` works for both modes.
-        device = self.ln_1.weight.device
-        N = self.N_p + T
-        mask = torch.full((N, N), float("-inf"), device=device, dtype=dtype)
-        mask[: self.N_p, : self.N_p] = 0
-        mask[self.N_p :, : self.N_p] = 0
-        causal = torch.triu(
-            torch.full((T, T), float("-inf"), device=device, dtype=dtype),
-            diagonal=1,
+        return _build_aug_mask(
+            self.N_p, T, self.use_swa, self.swa_window,
+            self.ln_1.weight.device, dtype,
         )
-        if self.use_swa:
-            # Sliding Window Attention: mask positions >= swa_window steps in the past.
-            # Persistent prefix stays fully visible per paper Fig. 3b.
-            far_past = torch.tril(
-                torch.full((T, T), float("-inf"), device=device, dtype=dtype),
-                diagonal=-self.swa_window,
-            )
-            causal = causal + far_past
-        mask[self.N_p :, self.N_p :] = causal
-        return mask
 
     def forward(self, x: torch.Tensor, nmm_state, doc_boundaries=None):
         B, T_in, _ = x.shape

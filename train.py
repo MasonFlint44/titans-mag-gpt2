@@ -89,7 +89,8 @@ NO_DECAY_SUBSTRINGS = ("bias", "ln", "norm", "out_scale", "gamma", "persistent")
 
 # Substring set for NMM routing. Paper-strict: only the NMM module's own
 # parameters get the 3× learning rate. `gamma_mem` / `gamma_attn` and
-# `persistent_mem` are block-level params not specified by the paper as
+# `persistent_mem` (block-level under `persistent_prefix_mode="per_block"`,
+# model-level under `"model_wide"`) are not specified by the paper as
 # fast-LR; they route to the backbone (1×) group. `ln_nmm` is the NMM
 # pre-norm and still routes via the leading "nmm" hit on its full path.
 NMM_SUBSTRINGS = ("nmm",)
