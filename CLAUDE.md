@@ -59,7 +59,7 @@ Pytest markers: `slow`, `gpu`, `slow_gpu`, `ddp`, `compile`, `perf`. See
 
 ## The consumer-GPU finetune recipe
 
-`finetune.py` and `train.py` share defaults that fit a 16 GiB card:
+`cli/finetune.py` and `cli/train.py` share defaults that fit a 16 GiB card:
 `--chunk-size 1024 --batch-size 1 --grad-accum 16 --max-steps 5000
 --warmup-steps 500`. The full canonical command also passes a few `--nmm-*`
 backend toggles and `--compile-model --optim8bit`:
@@ -85,21 +85,25 @@ override.
   shapes) are **ignored** on `--resume-from` with a rank-0 warning. The
   checkpoint's saved config is authoritative; changing shape would silently
   break `optimizer.load_state_dict`.
-- Backend-only flags listed in `train.RESUME_OVERRIDABLE_BACKEND_FLAGS`
+- Backend-only flags listed in `cli.train.RESUME_OVERRIDABLE_BACKEND_FLAGS`
   *can* be overridden on resume — currently `nmm_use_gram_ns5`, `nmm_use_cans`,
   `nmm_ns5_steps`. These swap the NS5 implementation without touching any
   saved weight. Add new backend-only NMM toggles to that frozenset; both
-  `train.py` and `cli/finetune.py` import from it.
+  `cli/train.py` and `cli/finetune.py` import from it.
 - Scaffolding flags (`--max-steps`, `--save-dir`, `--grad-accum`,
   `--batch-size`, warmup, save-every) are **not** overridden — the user
   controls them. They're persisted in the checkpoint under `training_args`
-  (see `SAVED_TRAINING_ARGS` in `train.py`), and on resume the loader warns
-  if the CLI value disagrees with what was saved. Defaults match the
+  (see `SAVED_TRAINING_ARGS` in `cli/train.py`), and on resume the loader
+  warns if the CLI value disagrees with what was saved. Defaults match the
   documented recipe so a bare `--resume-from` is a no-warning resume.
-- `train.py` and `cli/finetune.py` share the resume helpers
+- `cli/train.py` and `cli/finetune.py` share the resume helpers
   (`apply_resume_overrides_and_warn`, `warn_training_arg_drift`,
   `config_size_label`, `training_args_from_namespace`) so the two entry
   points are behaviorally identical on resume. Don't fork them.
+- `TitansConfig.from_dict` (used by the resume loader) silently drops keys
+  listed in `config._REMOVED_CONFIG_KEYS` so checkpoints from older schemas
+  still load. When you delete a config field, append the name to that
+  frozenset rather than breaking old checkpoints.
 
 ## NS5 variants
 
@@ -119,6 +123,10 @@ external `gram_ns5` package back as a dependency.
 
 ## Conventions
 
+- **Validation uses `raise ValueError`, never `assert`.** `python -O` strips
+  asserts, which would let invalid configs ship silently. Same for any
+  precondition that has to fire in production. The pattern is everywhere
+  in `config.py::__post_init__`; mirror it.
 - `_unwrap(state_dict)` in `model/__init__.py` strips both `_orig_mod.`
   (torch.compile) and `module.` (DDP) prefixes. Always use it when loading
   checkpoints across compiled / DDP / plain runs.
@@ -126,19 +134,80 @@ external `gram_ns5` package back as a dependency.
   Letting bf16 autocast leak into NS5 silently produces NaN loss after a few
   steps (`docs/RUNBOOK.md §NaN loss`).
 - `finetune_mode=True` (default for `cli/finetune.py`) uses an additive
-  gate with `out_scale=0` so initial logits match HF GPT-2 exactly. `train.py`
-  hard-codes `finetune_mode=False` for from-scratch with the paper's
-  multiplicative gate.
-- Checkpoints persist via `save_checkpoint` in `train.py`; the file format
-  includes `config`, `state_dict`, `optimizer`, `step`. The saved `step` is
-  the value *before* the post-step increment — `start_step = step + 1` on
-  resume.
+  gate with `out_scale=0` so initial logits match HF GPT-2 exactly.
+  `cli/train.py` hard-codes `finetune_mode=False` for from-scratch with
+  the paper's multiplicative gate.
+- Checkpoints persist via `save_checkpoint` in `cli/train.py`; the file
+  format includes `config`, `state_dict`, `optimizer`, `step`. The saved
+  `step` is the value *before* the post-step increment — `start_step =
+  step + 1` on resume.
+- Run logs go to `logs/`. The directory is gitignored except for
+  `.gitkeep`; don't write `.log` files anywhere else.
+
+## Per-layer NMM state shape
+
+A per-layer entry in `nmm_states` can be any of these — every code path
+that walks state must handle all four:
+
+- `None` — plain (non-NMM) block, when the index is not in `nmm_layer_indices`.
+- `(M, S, conv_buf)` — single-head, `nmm_momentum_order=1`. `M` and `S` are
+  dicts keyed by parameter name (`W1`, `W_gate`, `W2` for full-rank; six
+  factors for `nmm_low_rank`).
+- `(M, S_tuple, conv_buf)` — single-head, `nmm_momentum_order>1`. `S_tuple`
+  is a tuple of N dicts.
+- `[(M_h, S_h, conv_buf_h), ...]` — multi-head (`nmm_n_heads>1`). One entry
+  per head.
+
+`detach_states`, `compute_nmm_norm` (in `cli/train.py`), and the
+decode-cache plumbing in `model/titans_gpt2.py` recurse over these
+shapes. Mirror the same recursion in any new helper.
+
+## Paper-strict vs lucidrains defaults
+
+The defaults prefer the paper for the two documented divergences:
+
+- `retrieval_from_M_prev=True` — paper Eq. 15 (read-then-write). False
+  recovers the lucidrains-flavored write-then-read.
+- `feed_persistent_to_nmm=True` — paper Eq. 28 (`M(x̃)`). False feeds
+  only real tokens to the NMM.
+- `nmm_n_heads=1` — paper is single-head. `>1` opts into the
+  lucidrains-style `MultiHeadNMM` wrapper.
+
+`persistent_prefix_mode="model_wide"` (default) prepends a single learned
+prefix at the model level; every block — including plain non-NMM blocks
+— sees it and applies a block-structured attention mask. `"per_block"`
+gives each NMM block its own prefix with no shared model-wide prepend.
+
+## Where new flags go
+
+- **Config field** → `config.py::TitansConfig` dataclass + validation in
+  `__post_init__`.
+- **NMM backend toggle** (CLI knob, no shape change) → register in
+  `cli/nmm_cli.py::add_nmm_args`. If it's resume-overridable, add to
+  `RESUME_OVERRIDABLE_BACKEND_FLAGS` in `cli/train.py`.
+- **Training-scaffolding flag** (persisted across resume) → add to
+  `SAVED_TRAINING_ARGS` in `cli/train.py`.
+
+## Tests
+
+- `tests/conftest.py` seeds `torch.manual_seed(0)` per-test (autouse
+  fixture) and sets `set_float32_matmul_precision("high")` globally.
+  Don't override either unless the test specifically needs it.
+- Tier picking: `unit/` for module invariants, `integration/` for
+  cross-component flow, `parity/` for HF GPT-2 numerical match,
+  `behavior/` for emergent properties (memorization, convergence),
+  `ddp/` for multi-GPU, `performance/` for timing/leak gates,
+  `failure_modes/` for error paths.
 
 ## Things that are not bugs
 
 - `out_scale=0` at finetune init is deliberate. Don't "fix" the zero.
-- The NMM keeps updating during `generate.py` even under `torch.no_grad()` —
-  `torch.func.grad` is independent of the no-grad context. This is the whole
-  TITANS premise.
-- `pyproject.toml` has no `[gram_ns5]` extra anymore — the external library
-  was removed in favor of the local reimplementation. Don't re-add it.
+- The NMM keeps updating during `cli/generate.py` even under
+  `torch.no_grad()` — `torch.func.grad` is independent of the no-grad
+  context. This is the whole TITANS premise.
+- `pyproject.toml` has no `[gram_ns5]` extra anymore — the external
+  library was removed in favor of the local reimplementation. Don't
+  re-add it.
+- `docs/archive/` references `Gxxx` audit IDs throughout. Those tags
+  have been scrubbed from the live code and docs; the archive is the
+  only place they still live. Don't reintroduce the convention.
