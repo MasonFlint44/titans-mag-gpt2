@@ -361,3 +361,63 @@ def test_forward_step_rejects_train_mode():
     next_tok = torch.tensor([[0]], dtype=torch.long)
     with pytest.raises(RuntimeError, match="forward_step requires model.eval"):
         model.forward_step(next_tok, cache)
+
+
+# ---------------------------------------------------------------------------
+# Plain-block awareness of `persistent_prefix_mode="model_wide"` (audit #1)
+# ---------------------------------------------------------------------------
+
+def test_model_wide_with_plain_blocks_and_swa_decode_parity():
+    """Audit item 1: when `persistent_prefix_mode="model_wide"` AND
+    `nmm_layer_indices` excludes some blocks (i.e., some blocks are
+    `PlainGPT2Block`), the plain blocks must honor the persistent-prefix
+    structure: bidirectional within persistent positions, real → persistent
+    always-visible, persistent always-visible under SWA.
+
+    Without the fix, plain blocks would apply a vanilla causal mask over
+    the augmented `[N_p+T, N_p+T]` sequence — causal-among-persistent and
+    SWA-masking-persistent are both wrong — silently producing different
+    decode logits than the warm-up reference.
+
+    This test triggers all three: model_wide, mixed plain/NMM blocks, SWA.
+    Decode-vs-full-forward parity catches the bug.
+    """
+    torch.manual_seed(0)
+    cfg = TitansConfig(
+        n_layer=3, n_head=2, n_embd=16, vocab_size=64,
+        block_size=64, chunk_size=16, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=2,
+        finetune_mode=False,
+        persistent_prefix_mode="model_wide",
+        nmm_layer_indices=[1],   # blocks 0 and 2 are plain; block 1 has NMM
+        use_swa=True, swa_window=3,
+    )
+    model = TitansMAGGPT2(cfg).eval()
+    # Confirm we're actually exercising plain blocks.
+    from model.block import PlainGPT2Block, TitansMAGBlock
+    block_types = [type(b).__name__ for b in model.blocks]
+    assert block_types == ["PlainGPT2Block", "TitansMAGBlock", "PlainGPT2Block"], (
+        f"unexpected block layout: {block_types}"
+    )
+
+    P = 12  # > swa_window so SWA actually masks something
+    prompt = torch.randint(0, cfg.vocab_size, (1, P))
+    next_tok = torch.tensor([[7]], dtype=torch.long)
+
+    with torch.no_grad():
+        full = torch.cat([prompt, next_tok], dim=1)
+        ref_logits, _ = model(full, nmm_states=None)
+        ref_step = ref_logits[:, -1:, :]
+
+        cache = model.prepare_decode(prompt)
+        step_logits, _ = model.forward_step(next_tok, cache)
+
+    # Same scaled tolerance as the SWA test above (G234).
+    ref_max = ref_step.abs().max().item()
+    tol = max(1e-4, 1e-2 * ref_max)
+    diff = (step_logits - ref_step).abs().max().item()
+    assert diff < tol, (
+        f"model_wide + plain-block + SWA decode parity broke: max diff = "
+        f"{diff:.3e}, tolerance = {tol:.3e} (ref_max = {ref_max:.3f}). "
+        f"Likely cause: PlainGPT2Block ignoring persistent_prefix_mode."
+    )

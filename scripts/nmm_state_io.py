@@ -1,15 +1,18 @@
 """Persistent NMM state I/O for `generate.py`.
 
-A `nmm_states` list (per-layer `(M, S)` tuples, possibly with `None` entries
-for layers without NMM and possibly list-of-tuples for multi-head) is the
-"session memory" that lets the model carry context across separate generation
-calls. This module saves/loads that state atomically with a config fingerprint
-so a state file built for one model can't silently load into a mismatched one.
+A `nmm_states` list (per-layer `(M, S, conv_buf)` triples, possibly with
+`None` entries for layers without NMM and possibly list-of-triples for
+multi-head) is the "session memory" that lets the model carry context
+across separate generation calls. This module saves/loads that state
+atomically with a config fingerprint so a state file built for one model
+can't silently load into a mismatched one.
 
-The conv buffer is INTENTIONALLY not persisted — it's rebuilt from the first
-k-1 tokens of the next prompt by `init_decode_cache`, which is the right
-behavior for "this state is from a previous session, the conv window for the
-new prompt starts fresh."
+The full triple — including the rolling conv buffer — is persisted: the
+buffer carries the last (k-1) Q/K/V Linear projections of the previous
+prompt and feeds directly into the next session's first conv. Saving it
+lets the conv see uninterrupted context across the session boundary
+exactly the same way it sees it within a session. The fingerprint
+includes `nmm_conv_kernel` so a k mismatch fails fast at load.
 """
 
 import os
@@ -47,6 +50,10 @@ def _fingerprint(config) -> dict:
             else sorted(config.nmm_layer_indices)
         ),
         "nmm_state_dtype": config.nmm_state_dtype,
+        # conv_buf is part of state now (item 6); kernel size determines
+        # its shape [B, k-1, d]. Without this, a state file saved at k=4
+        # would load against k=2 and shape-error at the next conv.
+        "nmm_conv_kernel": config.nmm_conv_kernel,
     }
 
 

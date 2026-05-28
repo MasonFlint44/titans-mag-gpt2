@@ -67,11 +67,11 @@ Per paper §3.2 ("functions of tokens"). All three are scalars `[B, T]` (not per
 
 **TBPTT (Truncated BackPropagation Through Time).** Standard technique for training recurrent models: process a long sequence in chunks, backprop within each chunk, **detach** the state between chunks to bound the graph. Without detach, every chunk extends the autograd graph and memory blows up linearly.
 
-**`detach_states`.** Method that calls `.detach()` on every leaf of the nested `(M, S)` state. Called between TBPTT chunks. Must handle `state=None` (G149).
+**`detach_states`.** Method that calls `.detach()` on every leaf of the nested `(M, S, conv_buf)` state. Called between TBPTT chunks. Must handle `state=None` (G149).
 
 **`chunk_size`.** Length of one TBPTT chunk. Bounded by `block_size` (GPT-2 position embedding table covers 0..1023). Positions reset to 0 at each chunk boundary; cross-chunk context lives in the NMM state, not in the attention.
 
-**Doc boundary.** Boolean `[B, T]` tensor marking document starts within the chunk. The NMM resets `(M, S)` to init values at boundaries via `torch.where` (NOT in-place — autograd tensors). Prevents cross-document memory leakage.
+**Doc boundary.** Boolean `[B, T]` tensor marking document starts within the chunk. The NMM resets `(M, S)` to init values at boundaries via `torch.where` (NOT in-place — autograd tensors). `conv_buf` is also zeroed per-batch when the boundary fires at `t = 0` (chunk start); see SPEC §2.8a for the mid-chunk-boundary semantics trade-off. Prevents cross-document memory leakage.
 
 **`ParallelStreamLoader`.** Our TBPTT-aware data loader. Maintains B independent sub-streams; position `i` of every batch in a row continues the same document stream across calls. A naive `DataLoader(shuffle=False)` does NOT give this property — see `diagrams/data_pipeline.mmd`.
 
@@ -95,11 +95,11 @@ Per paper §3.2 ("functions of tokens"). All three are scalars `[B, T]` (not per
 
 ## Inference
 
-**Conv buffer.** Per-block rolling buffer of the last `kernel_size - 1` projected Q/K/V tokens. NOT part of `(M, S)` — it's a separate first-class cache used by `NMM.step_with_conv` at decode time so the depthwise conv sees a full `kernel_size`-token window (matching training-time chunk forward) instead of the 1-token zero-padded window the legacy `NMM.step` saw. Seeded by `NMM.init_conv_buffer_from_prompt` during `prepare_decode`'s warm-up and rolled forward by `step_with_conv` (drop oldest, append new linear projection).
+**Conv buffer.** Per-block rolling buffer of the last `kernel_size - 1` Q/K/V Linear projections. **Part of the NMM state**, as the third element of the `(M, S, conv_buf)` per-layer state tuple. Used to give the depthwise conv a full `kernel_size`-token window across chunk and decode-step boundaries (without it the conv's left-pad would zero-pad at each new chunk and lose paper-§4.4 context). Rolled forward at every step in both `_forward_chunk_*` and `step_with_conv` (drop oldest, append latest linear projection). Zeroed per-batch at chunk start when `doc_boundaries[:, 0]` fires. Dtype = `state_dtype`.
 
 **KV cache.** Standard attention key/value cache for autoregressive generation. Captured by `CausalSelfAttention.project_kv` during warm-up (length `N_p + T_prompt`, includes persistent prefix); extended one token at a time by `forward_with_kv_cache`. Separate from NMM state.
 
-**Cached decode (Option B).** The Phase 7 generation pipeline: `model.prepare_decode(prompt)` warms up + captures `(k_cache, v_cache, nmm_conv_buffer)` per block; `model.forward_step(token, cache)` per decoded token gets exactly one NMM update via `step_with_conv` and one attention pass via KV cache. Replaces the v1 sliding-window pattern that re-fed the entire `block_size` window through the NMM at every decoded token (compounding state updates ~`block_size`× per token). See `eval.py:needle_in_haystack`, `generate.py`.
+**Cached decode.** The production generation pipeline: `model.prepare_decode(prompt)` warms up + captures `(k_cache, v_cache)` per block; the NMM conv buffer threads through `cache["nmm_states"]` automatically (item 6, no longer a separate cache field). `model.forward_step(token, cache)` per decoded token gets exactly one NMM update via `step_with_conv` and one attention pass via KV cache. Replaces the v1 sliding-window pattern that re-fed the entire `block_size` window through the NMM at every decoded token. See `eval.py:needle_in_haystack`, `generate.py`.
 
 **Sliding window context strategy.** For generation past `block_size`, slide the attention window but keep the NMM state continuous. The NMM provides the long-range memory; attention covers local context. In v2 with Option B, `generate.py`'s long-prompt path chunks the prefix through `forward()` (NMM state threads) and calls `prepare_decode(tail, initial_nmm_states=...)` on the last `block_size` tokens.
 

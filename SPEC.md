@@ -60,11 +60,11 @@ The NMM is implemented in `model/nmm.py` as `NeuralMemoryModule(nn.Module)`.
 
 | Component | Type / shape | Purpose |
 |---|---|---|
-| `q_proj`, `k_proj`, `v_proj` | `NMMProjection` = `Linear(d, d, bias=False)` then `CausalDepthwiseConv1d(d, kernel=k)` | Per-token query/key/value with local context |
+| `q_proj`, `k_proj`, `v_proj` | `NMMProjection` = `Linear(d, d, bias=False)` → `CausalDepthwiseConv1d(d, kernel=k)` → `Linear(d, d, bias=False)` (pointwise) | Per-token query/key/value with local context; depthwise-separable conv per paper §4.4 |
 | `W_theta`, `W_eta`, `W_alpha` | `Linear(d, 1, bias=False)` | Per-token data-dependent learning-rate / momentum-decay / forgetting-rate |
 | `memory_mlp` | `MemoryMLP(d, expansion=E)` | The recurrent MLP; its weights ARE the meta-learned initial M |
 | `out_scale` | `Parameter[d]` | Per-channel output scale (zeros if `finetune_mode=True`, else ones) |
-| `per_sample_grad_fn` | `vmap(grad(inner_loss))` cached at `__init__` | Per-sample inner gradient |
+| `per_sample_grad_fn` | `vmap(grad(inner_loss))` cached at `__init__` | Per-sample inner gradient (used by the inference-time `step_with_conv` path only) |
 | `_batched_retrieve` | `vmap(functional_call(memory_mlp, ...))` | Per-sample retrieval `f_M(q)` |
 
 `MemoryMLP` is a SiLU-GLU gated two-layer MLP (paper depth `L_M = 2`) with a
@@ -80,10 +80,13 @@ uniform**. Only these three matrices appear in the recurrent state — the
 LayerNorm parameters are not recurrent (Newton-Schulz needs 2D matrices and
 LN params would break the per-key uniform-shape invariant).
 
-`NMMProjection` separates the linear and the causal depthwise conv so the
-two can be reused independently at decode time (see §6). SiLU and L2-norm
-are applied **at the call site**, not inside `NMMProjection.forward` —
-putting them inside would yield `silu(silu(x))` at the call site.
+`NMMProjection` separates `linear`, `conv`, and `pointwise` as named
+submodules so the chunk-forward path can drive them independently — it
+prepends the cross-chunk conv buffer between `linear` and `conv`
+(bypassing `CausalDepthwiseConv1d`'s built-in left-pad) and applies
+`pointwise` after the conv. SiLU and L2-norm are applied **at the call
+site**, not inside `NMMProjection.forward` — putting them inside would
+yield `silu(silu(x))` at the call site.
 
 `CausalDepthwiseConv1d`: depthwise `nn.Conv1d(d, d, kernel_size, groups=d,
 padding=0)` with left-only `F.pad(x, (k-1, 0))`. Built-in conv padding would
@@ -91,19 +94,32 @@ be symmetric → leaks future tokens; we pad left manually.
 
 ### 2.2 State
 
-The per-layer state is a tuple `(M, S)` where each is a dict keyed by
-`"W1.weight"`, `"W_gate.weight"`, `"W2.weight"` with shapes
-`[B, expansion·d, d]` (W1, W_gate) and `[B, d, expansion·d]` (W2). `S` is
-the momentum buffer; same shapes as `M`.
+The per-layer state is a 3-tuple `(M, S, conv_buf)`:
+
+- `M`: dict keyed by `"W1.weight"`, `"W_gate.weight"`, `"W2.weight"` with
+  shapes `[B, expansion·d, d]` (W1, W_gate) and `[B, d, expansion·d]` (W2)
+  for full-rank. Low-rank produces six factored keys (see §5.6).
+- `S`: same key/shape layout as `M`; at `momentum_order > 1`, S becomes
+  a tuple of N such dicts (§5.7).
+- `conv_buf`: dict `{"q","k","v"}` of `[B, k-1, d]` Linear projections
+  from the previous chunk's tail. Used to give the depthwise conv a
+  full `k`-token context window at chunk start (otherwise the conv
+  loses paper-§4.4 context across chunk boundaries). At fresh init the
+  buffer is zeros — equivalent to the legacy left-pad-with-zeros
+  behavior. Dtype invariant: `state_dtype` (rolled-buffer cast
+  enforced by `_project_qkv_with_buf` and `step_with_conv`).
 
 `init_state(B, device)` builds `M` by replicating `memory_mlp.W*.weight`
-across the batch (`.expand(B, -1, -1).to(device).clone()` — `.expand` is a
-stride-0 view; `.clone()` materializes normal strides so vmap with
-`in_dims=0` is well-defined). `S` is zeros.
+across the batch (`.expand(B, -1, -1).to(device).clone()` — `.expand` is
+a stride-0 view; `.clone()` materializes normal strides so vmap with
+`in_dims=0` is well-defined). `S` is zeros. `conv_buf` is zeros.
 
-`(M, S)` is **never saved in checkpoints**. It is per-sequence state, not
-model state; resume re-initializes from `memory_mlp.W*.weight`. The
-checkpoint contract is in §8.5.
+`(M, S, conv_buf)` is **never saved in model checkpoints**. It is
+per-sequence state, not model state; resume re-initializes from
+`memory_mlp.W*.weight`. Session-level state I/O via
+`scripts/nmm_state_io.py` DOES persist the full triple
+(`fingerprint` includes `nmm_conv_kernel` so a shape mismatch errors at
+load). The checkpoint contract is in §8.5.
 
 ### 2.3 Per-token update rule
 
@@ -186,73 +202,100 @@ gives per-sample gradients `{key: [B, ...]}` in one fused kernel call.
 The function is **built once at `__init__`** and cached. Recreating
 `vmap(grad(...))` per forward is measurably slower at T=512.
 
-### 2.6 Single-token step (`step`)
+### 2.6 Decode-time single-token step (`step_with_conv`)
 
-Inference-time path. Pre-projects `[B, 1, d]` through Q/K/V (so the conv
-sees a 1-token window with `k−1` zero-pad), then performs the per-token
-update of §2.3.
+The single-token path. There is no separate `step()` — the conv buffer
+is part of state (see §2.2), so a one-shot zero-padded variant would
+just be the same code with a zero conv buffer. The chunk-forward path
+and the per-token decode path share the same depthwise conv contract:
+the conv sees a full `k`-token window via the rolling buffer.
 
-**Do NOT call in a training loop.** With kernel_size=4, the conv only sees
-a 1-token window per call (3 of 4 kernel weights masked by left-pad). The
-training path is `_forward_chunk_sequential` which pre-projects the **full
-chunk** so the conv sees up to k tokens of context for every output.
-
-### 2.7 Decode-time step with conv buffer (`step_with_conv`)
-
-Maintains an **explicit conv buffer** of the last `k−1` Linear projections
-per Q/K/V so the depthwise conv at decode time sees a full k-token window
-matching training-time behavior.
-
-`init_conv_buffer_from_prompt(x_chunk)` seeds the buffer by re-projecting
-the last `k−1` tokens of the warm-up input through `q_proj.linear /
-k_proj.linear / v_proj.linear` (no conv, no activation). Returns
-`{"q": [B, k-1, d], "k": [B, k-1, d], "v": [B, k-1, d]}`. Left-pads with
-zeros if `T < k−1`.
-
-`step_with_conv(x_t, state, conv_buffer)`:
+`step_with_conv(x_t, state)`:
 
 ```
-q_lin, k_lin, v_lin = q_proj.linear(x), k_proj.linear(x), v_proj.linear(x)  # [B, 1, d] each
-q_full = cat([buffer.q, q_lin], dim=1)                                       # [B, k, d]
-q_conv = q_proj.conv(q_full)[:, -1, :]                                       # [B, d]
+M_prev, S_prev, conv_buf = state
+q_lin, k_lin, v_lin = q_proj.linear(x_t.unsqueeze(1)), …                # [B, 1, d] each
+q_full = cat([conv_buf["q"], q_lin], dim=1)                              # [B, k, d]
+q_conv = q_proj.conv(q_full)[:, -1, :]                                   # [B, d]
+q_pw   = q_proj.pointwise(q_conv)                                        # [B, d]
 # same for k, v
-... [SiLU + L2 + update rule as §2.3]
-new_buffer = {q: cat([buffer.q[:, 1:], q_lin]), ...}
-return y_t, (M_t, S_t), new_buffer
+… [SiLU + L2 + per-token update rule of §2.3]
+new_conv_buf = {q: cat([conv_buf["q"][:, 1:], q_lin]).to(state_dtype), …}
+return y_t, (M_t, S_t, new_conv_buf)
 ```
 
-The conv buffer is **not** part of `(M, S)`. NS operates on 2D matrices; a
-`[k−1, d]` buffer would break the per-key uniform-shape invariant. The
-buffer is a separate per-block decode cache (§6).
+The new conv buffer is cast back to `state_dtype` so the buffer's
+storage dtype is invariant across steps (matches M/S semantics).
+
+`int8` state is rejected: `step_with_conv` raises `NotImplementedError`
+when `state_dtype == "int8"` because per-token quant/dequant of the
+recurrent state would both be slow and amplify noise (use the blockwise
+forward for int8).
 
 ### 2.8 Chunked forward — sequential path
 
 `_forward_chunk_sequential(x_chunk, state_in, doc_boundaries)`:
 
-1. Full-chunk pre-projection: `k_proj(x)`, `q_proj(x)`, `v_proj(x)` over
-   the whole `[B, T, d]` chunk so the conv sees up to k tokens for every
-   output position. Compute SiLU + L2 (q, k) and SiLU (v).
-2. Compute `θ_chunk`, `η_chunk`, `α_chunk` for the whole chunk in one shot.
-3. **Dtype reconciliation.** When `state_dtype != x_chunk.dtype` (i.e.,
-   bf16 state with fp32 input, or vice versa), cast all chunk-level
-   buffers (k_hat, q_hat, v, θ, η, α) to `state_dtype`. Required so
-   `per_sample_grad_fn`'s `functional_call` doesn't fail at the inner
-   `F.linear` with "expected Float but found BFloat16" when state is
-   bf16 (G256).
-4. Build the per-position "any boundary?" mask once on CPU (avoids T
-   GPU↔CPU syncs). If any boundary fires anywhere in the chunk, build
-   `init_M` eagerly so the inner loop sees a stable tensor.
-5. Run `_run_inner_loop(...)` once over the full chunk. For each `t`:
-   - If `doc_boundaries[:, t].any()`: reset state via
-     `reset_state((M, S), doc_boundaries[:, t], init_M)`.
+1. Unpack `state_in = (M, S, conv_buf)`. Reset per-batch entries of
+   `conv_buf` to zero where `doc_boundaries[:, 0]` fires (post-boundary
+   chunks should not pick up pre-boundary conv context — see §2.8a).
+2. Buffer-aware Q/K/V pre-projection via `_project_qkv_with_buf`:
+   `linear(x_chunk)` → `cat([conv_buf, lin], dim=1)` → raw
+   `nn.Conv1d` (no internal left-pad — the buffer provides the k-1
+   context) → `pointwise`. Produces post-pointwise outputs for the full
+   chunk plus a `new_conv_buf` = last `k-1` linear projections of THIS
+   chunk, detached and cast to `state_dtype`. Caller then applies SiLU +
+   L2-norm (q, k) and SiLU (v).
+3. Compute `θ_chunk`, `η_chunk`, `α_chunk` for the whole chunk in one shot.
+4. **Dtype reconciliation.** When `state_dtype != x_chunk.dtype` (e.g.
+   bf16 state with fp32 input under no autocast, or vice versa), cast
+   the chunk-level buffers (k_hat, q_hat, v, θ, η, α) to `state_dtype`.
+   Required so `per_sample_grad_fn`'s `functional_call` (used by the
+   reference path) doesn't fail at the inner `F.linear` with "expected
+   Float but found BFloat16" when state is bf16 (G256). The analytical
+   inner-grad path is dtype-agnostic.
+5. If any boundary fires anywhere in the chunk, build `init_M` eagerly
+   so the inner loop sees a stable tensor.
+6. Run `_run_inner_loop(...)` once over the full chunk. For each `t`:
+   - If `doc_boundaries[:, t].any()`: reset `(M, S)` via `_reset_M_S`
+     (the per-token loop doesn't touch `conv_buf` — it was already
+     handled at chunk start).
    - Capture `M_prev = M` (needed if `retrieval_from_M_prev`).
-   - Compute `g_t`, NS5, update `S` and `M` per §2.3.
+   - Compute `g_t` via `analytical_inner_grad`, NS5, update `S` and `M`
+     per §2.3.
    - Retrieve from `M_prev` or `M` per `retrieval_from_M_prev`.
-6. Return `(y_chunk, (M, S))`.
+7. Return `(y_chunk, (M, S, new_conv_buf))`.
 
 `reset_state(state, mask, init_M)` uses `torch.where` (NOT in-place
 assignment): in-place index assignment on tensors in the autograd graph
 raises `RuntimeError`. `where` is non-mutating and differentiable.
+`reset_state` accepts both 2-tuple `(M, S)` (used by the per-token
+inner loop via `_reset_M_S`) and 3-tuple `(M, S, conv_buf)` shapes; on
+the 3-tuple form the masked rows of `conv_buf` are also zeroed.
+
+#### 2.8a Doc-boundary semantics inside `conv_buf`
+
+`conv_buf` is consumed **exactly once per chunk** — at the linear+conv
+step at chunk start. Mid-chunk boundaries cannot retroactively change
+what the conv at position 0 saw, so:
+
+- `_reset_conv_buf_at_chunk_start` checks only `doc_boundaries[:, 0]`
+  and zeros per-batch buffer entries for batches whose chunk starts at
+  a doc boundary.
+- Mid-chunk boundaries DO reset `(M, S)` (precise per-token, via the
+  inner-loop branch or the blockwise pre-split — §2.9a), but they do
+  NOT split the linear+conv. The conv kernel still mixes `k-1`
+  pre-boundary tokens into the first few post-boundary outputs within
+  the same chunk.
+
+This is a deliberate trade-off: splitting the linear+conv per sub-chunk
+would give up most of the TC engagement on the chunk pre-projection,
+and the conv-context bleed at sub-chunk seams is the same kind of
+local-context mixing the conv already does within a document anyway.
+For workloads where this matters, align doc boundaries with chunk
+starts via the dataloader (this is what `data/dataloader.py` does by
+construction: `doc_boundaries[:, 0]` is always True at the start of
+each rank's stream).
 
 **Memory characterization** (sequential path, gpt2_small, bf16 autocast):
 the sequential path retains the full per-token autograd graph for the
@@ -271,17 +314,28 @@ a 16 GiB consumer card.
    with TC-engaged batched matmuls.
 2. **Sequential** otherwise — paper-strict per-token recurrence.
 
+#### 2.9a Blockwise doc-boundary pre-split
+
+The blockwise path pre-splits the chunk at boundary positions (union
+across batch) into sub-chunks, each of which has no internal boundary
+by construction. `reset_state` fires once at sub-chunk start (per-batch
+via the boundary mask at that exact position). Tokens BEFORE a boundary
+keep their pre-boundary M; tokens AT-OR-AFTER the boundary run against
+init_M for batches that hit the boundary at that position. Restores
+per-token-correct reset semantics without per-token loop overhead.
+Trade-off: boundary-containing chunks produce smaller block matmuls at
+the sub-chunk seams, which costs some TC engagement near the seam.
+
 ### 2.10 Multi-head NMM
 
 `MultiHeadNMM(n_embd, n_heads, ...)` instantiates `n_heads` parallel
-`NeuralMemoryModule` instances on `head_dim = n_embd // n_heads`. Same API
-surface as `NeuralMemoryModule`: `init_state`, `forward_chunk`,
-`init_conv_buffer_from_prompt`, `step_with_conv`, `step`. State per layer
-is a `list[n_heads]` of `(M_h, S_h)` tuples instead of a single tuple.
+`NeuralMemoryModule` instances on `head_dim = n_embd // n_heads`. Same
+API surface as `NeuralMemoryModule`: `init_state`, `forward_chunk`,
+`step_with_conv`. State per layer is a `list[n_heads]` of
+`(M_h, S_h, conv_buf_h)` triples instead of a single triple.
 
 `memory_mlp` property returns `heads[0].memory_mlp` for shape / dtype
-consumers (`init_conv_buffer_from_prompt` dtype inference,
-`_apply_gpt2_init`'s NMM-skip-by-id).
+consumers (`_apply_gpt2_init`'s NMM-skip-by-id).
 
 The block constructs `MultiHeadNMM` only when `nmm_n_heads > 1`. Default 1
 uses `NeuralMemoryModule` directly with no wrapper.
@@ -346,27 +400,58 @@ autocast.
 
 ### 4.2 Forward
 
+The forward branches on `persistent_prefix_mode` (§5.4). Both modes
+produce an `o = MAG-gate(y_attn_aug, y_mem_aug)` over the augmented
+shape, then in `per_block` mode slice the persistent positions off `o`
+before the residual on real-token `x` (so the residual stream that
+crosses block boundaries only carries real-token state). In
+`model_wide` mode the persistent positions stay in the residual through
+this block — they accumulate information from real tokens at every
+layer until the model slices them off before `ln_f` (§6).
+
 ```python
 def forward(x, nmm_state, doc_boundaries=None):
-    B, T, _ = x.shape
-    x_aug = cat([persistent_mem.expand(B, -1, -1), x], dim=1)             # [B, N_p+T, d]
-    y_attn = attn(ln_1(x_aug), mask=_aug_mask(T, x.dtype))[:, N_p:, :]    # [B, T, d]
+    B, T_in, _ = x.shape
 
-    if feed_persistent_to_nmm:                                            # paper Eq. 28 (default)
-        db_aug = cat([zeros(B, N_p, bool), doc_boundaries], dim=1) if doc_boundaries is not None else None
-        y_mem_full, nmm_state = nmm.forward_chunk(ln_nmm(x_aug), nmm_state, db_aug)
-        y_mem = y_mem_full[:, N_p:, :]
-    else:                                                                 # lucidrains-flavored
-        y_mem, nmm_state = nmm.forward_chunk(ln_nmm(x), nmm_state, doc_boundaries)
+    if persistent_prefix_mode == "per_block":
+        x_aug = cat([persistent_mem.expand(B, -1, -1), x], dim=1)         # [B, N_p+T, d]
+        T_real = T_in
+    else:  # model_wide
+        x_aug = x                                                          # already [B, N_p+T_real, d]
+        T_real = T_in - N_p
 
-    if finetune_mode:
-        o = y_attn + silu(gamma_mem * y_mem) * y_attn       # = y_attn * (1 + silu(γ_m · y_mem))
-    else:
-        o = silu(gamma_attn * y_attn) * silu(gamma_mem * y_mem)
+    y_attn_aug = attn(ln_1(x_aug), mask=_aug_mask(T_real, x.dtype))        # [B, N_p+T_real, d]
 
-    x = x + o
-    x = x + mlp(ln_2(x))
-    return x, nmm_state
+    if feed_persistent_to_nmm:                                             # paper Eq. 28 (default)
+        # doc_boundaries augmented at the model level in model_wide; here
+        # in per_block.
+        db_for_nmm = (
+            doc_boundaries if persistent_prefix_mode == "model_wide"
+            else (cat([zeros(B, N_p, bool), doc_boundaries], dim=1)
+                  if doc_boundaries is not None else None)
+        )
+        y_mem_aug, nmm_state = nmm.forward_chunk(ln_nmm(x_aug), nmm_state, db_for_nmm)
+    else:                                                                  # lucidrains-flavored
+        x_real = x if persistent_prefix_mode == "per_block" else x_aug[:, N_p:, :]
+        db_real = (
+            doc_boundaries if persistent_prefix_mode == "per_block"
+            else (doc_boundaries[:, N_p:] if doc_boundaries is not None else None)
+        )
+        y_mem_real, nmm_state = nmm.forward_chunk(ln_nmm(x_real), nmm_state, db_real)
+        y_mem_aug = cat([zeros(B, N_p, d), y_mem_real], dim=1) if N_p > 0 else y_mem_real
+
+    o_aug = (
+        y_attn_aug + silu(gamma_mem * y_mem_aug) * y_attn_aug if finetune_mode
+        else silu(gamma_attn * y_attn_aug) * silu(gamma_mem * y_mem_aug)
+    )
+
+    if persistent_prefix_mode == "per_block":
+        o = o_aug[:, N_p:, :]
+        x_out = x + o
+    else:  # model_wide: full augmented residual
+        x_out = x_aug + o_aug
+    x_out = x_out + mlp(ln_2(x_out))
+    return x_out, nmm_state
 ```
 
 Two MAG gate variants:
@@ -383,27 +468,37 @@ Two MAG gate variants:
 
 ### 4.3 Block decode methods
 
-`init_decode_cache(x_prompt, nmm_state)`: called once per block AFTER
-`forward` has run on the prompt. Captures
-`(k_cache, v_cache, nmm_conv_buffer)`:
+`init_decode_cache(x_prompt, nmm_state)`: called once per block BEFORE
+`forward` runs on the prompt (caller's loop captures KV cache from the
+input, then runs the block which mutates `nmm_state`). Returns
+`(k_cache, v_cache)`:
 
 - `k_cache, v_cache` come from `attn.project_kv(ln_1(x_aug_prompt))`;
   length `N_p + T_prompt`, includes the persistent prefix.
-- `nmm_conv_buffer` is `nmm.init_conv_buffer_from_prompt(ln_nmm(x_for_nmm))`
-  where `x_for_nmm` is `x_aug` if `feed_persistent_to_nmm` else `x_prompt`.
-  This matches whatever the warm-up's conv actually saw, so decode-time conv
-  sees the same `k`-token window across the persistent→real boundary.
+- In `per_block` mode the block prepends `persistent_mem` locally to
+  build `x_aug`. In `model_wide` mode `x_prompt` is already augmented at
+  the model level (§6.1), so the block uses it as-is.
+- The NMM conv buffer is **NOT** captured here — it lives inside
+  `nmm_state` (§2.2) and gets rolled forward naturally by
+  `block.forward(x, nmm_state, None)` during the prompt warm-up.
 
-`forward_step(x_new, nmm_state, k_cache, v_cache, nmm_conv_buffer)`:
+`forward_step(x_new, nmm_state, k_cache, v_cache)`:
 
 - `x_new`: `[B, 1, d]` — already embedded (wte + wpe at the new position).
 - Attention via `attn.forward_with_kv_cache(ln_1(x_new), k_cache, v_cache,
   swa_window=swa_window if use_swa else None, n_persistent=N_p)`. No
   `x_aug` concat — the persistent prefix is already in the cache.
-- NMM via `nmm.step_with_conv(ln_nmm(x_new).squeeze(1), nmm_state,
-  nmm_conv_buffer)`: one update per token, full k-token conv context.
+- NMM via `nmm.step_with_conv(ln_nmm(x_new).squeeze(1), nmm_state)`:
+  one update per token, conv buffer pulled from `nmm_state[2]`.
 - Same MAG gate variants as §4.2.
-- Returns `(x_out, new_nmm_state, new_k_cache, new_v_cache, new_conv_buf)`.
+- Returns `(x_out, new_nmm_state, new_k_cache, new_v_cache)`.
+
+`PlainGPT2Block` (non-NMM blocks under `nmm_layer_indices`) mirrors
+this contract and honors `persistent_prefix_mode`: in `model_wide` mode
+it applies a block-structured `_aug_mask` over `[N_p+T_real, N_p+T_real]`
+in `forward` and passes `n_persistent=N_p` in `forward_step` so SWA
+keeps persistent positions always-visible. In `per_block` mode it sees
+only real tokens and uses a plain causal mask.
 
 ---
 
@@ -423,6 +518,7 @@ asserts, which would let invalid configs ship silently in production.
 |---|---|
 | `chunk_size > block_size` | `ValueError` |
 | `nmm_n_persistent < 0` | `ValueError` |
+| `persistent_prefix_mode not in {"model_wide","per_block"}` | `ValueError` |
 | `nmm_expansion < 1` | `ValueError` |
 | `n_embd % n_head != 0` | `ValueError` |
 | `use_swa and swa_window < 1` | `ValueError` (empty window → softmax NaN) |
@@ -473,14 +569,18 @@ All factories accept `**overrides` and merge via `**{**defaults,
 These flags expose deliberate paper/lucidrains divergences as runtime
 config. **Defaults prefer the paper** (G255 default flip).
 
-| Field | Default | Paper-strict (default) | Flip-to-`False` (lucidrains-flavored) |
+| Field | Default | Paper-strict (default) | Flip / alternative |
 |---|---|---|---|
-| `retrieval_from_M_prev` | `True` | Paper Eq. 15: `y_t = M(q_t)` where `M = M_{t-1}` (read-then-write). Applies in `step`, `step_with_conv`, `_forward_chunk_sequential`, and `_forward_chunk_blockwise`. | Write-then-read: retrieve from freshly-updated `M_t`. |
-| `feed_persistent_to_nmm` | `True` | Paper Eq. 28: `M(x̃)` where `x̃ = concat(persistent, x)`. Block feeds `ln_nmm(x_aug)` to NMM, augments `doc_boundaries` with a False prefix of length `N_p` (persistent positions never trigger resets), and slices `N_p` positions off `y_mem` before the residual. | NMM sees `ln_nmm(x)` only (real tokens); `doc_boundaries` is passed verbatim. Slightly lower memory; updates only on real tokens. |
+| `retrieval_from_M_prev` | `True` | Paper Eq. 15: `y_t = M(q_t)` where `M = M_{t-1}` (read-then-write). Applies in `step_with_conv`, `_forward_chunk_sequential`, and `_forward_chunk_blockwise`. | `False` — write-then-read: retrieve from freshly-updated `M_t`. |
+| `feed_persistent_to_nmm` | `True` | Paper Eq. 28: `M(x̃)` where `x̃ = concat(persistent, x)`. Block feeds `ln_nmm(x_aug)` to NMM, augments `doc_boundaries` with a False prefix of length `N_p` (persistent positions never trigger resets), and slices `N_p` positions off `y_mem` before the residual. | `False` — NMM sees `ln_nmm(x)` only (real tokens); `doc_boundaries` is passed verbatim. Slightly lower memory; updates only on real tokens. |
+| `persistent_prefix_mode` | `"model_wide"` | Paper Eq. 19: one model-level `persistent_mem: [N_p, d]` prepended ONCE after wte+wpe; persistent positions propagate through every block via the residual stream and accumulate information from real tokens. Sliced off before `ln_f`. | `"per_block"` — each `TitansMAGBlock` owns its own `persistent_mem: [N_p, d]` (legacy layout). Total persistent params: `N_p × d × n_layer` (vs `N_p × d` model_wide). |
 | `nmm_n_heads` | `1` | Paper single-head (implicit). | `>1` instantiates `MultiHeadNMM` (lucidrains enhancement). Must divide `n_embd`. |
 
 At `finetune_mode=True` with `out_scale=0`, the NMM contributes 0 at init
-regardless of these flags, so HF parity at init is unaffected.
+regardless of these flags, so HF parity at init is unaffected. With
+`nmm_n_persistent=0`, both `persistent_prefix_mode` values reduce to a
+no-op prepend (empty `[0, d]` parameter), so parity also holds across
+modes when `N_p=0`.
 
 ### 5.5 Memory-saving flags (G256 / G257 / G258 / G259)
 
@@ -502,7 +602,7 @@ drops from ~13 GiB (OOM) to **3.8 GiB** at B=1 T=1024 with
 | Field | Default | What it does | Cost |
 |---|---|---|---|
 | `nmm_expansion` | `4` | Hidden-dim multiplier in `MemoryMLP`. Setting `=1` makes weights square `[d, d]` and quarters per-step NMM state. Already-existing knob; documented here for completeness alongside the new ones. | Lower expansion = less NMM capacity. Paper ablation: `L_M=2` (depth) ≫ `L_M=1`; analogous ablation for expansion hasn't been measured but it's a paper departure. |
-| `nmm_layer_indices` | `None` | If a list, only listed transformer blocks have NMM; others are `PlainGPT2Block` (attn + MLP, no NMM, no persistent prefix, no MAG gate). Linear reduction of NMM cost. The per-block NMM `(M, S)` state slot is `None` at plain-block positions; `detach_states`, `compute_nmm_norm`, and the decode path all tolerate. Decode-time: plain blocks contribute only a KV cache; their slot in `nmm_conv_buffers` is `None`. | Fewer NMM blocks = less mid-stack memory branch. Paper applies NMM at every block; subset is a deliberate departure. Best paired with `nmm_low_rank` so the remaining NMM blocks are themselves cheap. |
+| `nmm_layer_indices` | `None` | If a list, only listed transformer blocks have NMM; others are `PlainGPT2Block` (attn + MLP, no NMM, no MAG gate; in `persistent_prefix_mode="model_wide"` they still see the model-level persistent prefix and apply a block-structured mask — §4.3). Linear reduction of NMM cost. The per-block NMM state slot is `None` at plain-block positions; `detach_states`, `compute_nmm_norm`, and the decode path all tolerate. Decode-time: plain blocks contribute only a KV cache. | Fewer NMM blocks = less mid-stack memory branch. Paper applies NMM at every block; subset is a deliberate departure. Best paired with `nmm_low_rank` so the remaining NMM blocks are themselves cheap. |
 | `nmm_low_rank` | `None` | If an int `r`, factor each `MemoryMLP` weight as `[r, in] @ [out, r]`. Per-step state goes from `3 × 4d²` to `3 × r × 5d` (≈ `5r/(4d)` of full-rank). At `d=768, r=64`: ~10× smaller — the single biggest unlock for long-T training. The `MemoryMLP`'s recurrent state goes from 3 keys (W1, W_gate, W2) to 6 keys (W1_a, W1_b, …); the checkpoint plumbing handles this via `state_keys` discovery at NMM `__init__`. NS5 converges on the factored rectangles (no special-casing needed). | Lower expressiveness than full-rank — limits the rank of representations the meta-learned `M` can encode. r=64 at d=768 is well above typical informational rank for memory_mlp-style maps so the loss is usually modest, but measure loss curves vs full-rank baseline before committing. Validation: `r >= n_embd` rejected (factored form would be larger than full-rank). |
 
 ### 5.7 Inner-loop speed knobs (G264, G264a)
@@ -638,8 +738,9 @@ training recipes are unaffected.
 - **`nmm_per_head_learned_params` (G271)** — multi-head NMM only. When False, all heads share the same `MemoryMLP` instance; per-head state (M, S) remains independent. Param count drops ~`n_heads×`. Rejected at `n_heads = 1`.
 
 State-structure invariants for callers reading internal state:
-- At `momentum_order == 1`: `state = (M, S)` where both are dicts. Backward compat — every existing test that unpacks state this way still works.
-- At `momentum_order  > 1`: `state = (M, S)` where M is a dict and S is a `tuple` of N dicts. Use `isinstance(S, tuple)` to detect. `init_state`, `reset_state`, `detach_states`, `compute_nmm_norm` all handle both shapes.
+- Single-head, `momentum_order == 1`: `state = (M, S, conv_buf)` triple of dicts (§2.2).
+- Single-head, `momentum_order  > 1`: `state = (M, S_tuple, conv_buf)` where `S_tuple` is a `tuple` of N dicts. Use `isinstance(S, tuple)` to detect. `init_state`, `reset_state`, `detach_states`, `compute_nmm_norm` all handle both S shapes.
+- Multi-head (`nmm_n_heads > 1`): `state = [(M_h, S_h, conv_buf_h), ...]` — a list of per-head triples.
 
 #### Composition matrix
 
@@ -684,13 +785,16 @@ Cache structure:
 
 ```python
 {
-    "last_logits":      Tensor[B, 1, V],         # logits at last prompt token
-    "nmm_states":       list[n_layer] of state,  # post-warmup NMM state per layer
-    "kv_caches":        list[n_layer] of (K, V), # each [B, n_head, N_p+P, head_dim]
-    "nmm_conv_buffers": list[n_layer] of buf,    # each {"q","k","v"}: [B, k-1, d]
-    "position":         int,                     # = prompt length P (next decode pos)
+    "last_logits":  Tensor[B, 1, V],         # logits at last prompt token
+    "nmm_states":   list[n_layer] of state,  # post-warmup NMM state (M, S, conv_buf) per layer;
+                                             # None at plain-block positions under nmm_layer_indices
+    "kv_caches":    list[n_layer] of (K, V), # each [B, n_head, N_p+P, head_dim]
+    "position":     int,                     # = prompt length P (next decode pos)
 }
 ```
+
+The conv buffer is part of `nmm_states[i][2]` (item 6 — no separate
+`nmm_conv_buffers` field).
 
 ### 6.1 `prepare_decode`
 
@@ -700,12 +804,18 @@ Cache structure:
    both. The two paths' attention outputs would diverge silently and break
    the decode-vs-full-forward parity invariant.
 2. Reject `prompt_idx.size(1) > block_size` (would OOB the wpe table).
-3. Embed `wte(prompt_idx) + wpe(0..P-1)`; build `nmm_states` from
+3. Embed `wte(prompt_idx) + wpe(0..P-1)`. When
+   `persistent_prefix_mode == "model_wide"` and `N_p > 0`, prepend
+   `self.persistent_mem` once at the input (so every block's KV cache
+   captures the persistent prefix). Build `nmm_states` from
    `initial_nmm_states` or `init_state(B, device)` per block.
-4. For each block, in order: capture `(k_cache, v_cache, conv_buf)` via
+4. For each block, in order: capture `(k_cache, v_cache)` via
    `block.init_decode_cache(x, nmm_state)` **BEFORE** the block mutates
-   `x`, then run `x, nmm_state = block(x, nmm_state, None)`.
-5. Compute `last_logits = ln_f(x)[..., -1:, :] @ wte.weight.T`.
+   `x`, then run `x, nmm_state = block(x, nmm_state, None)`. The block's
+   forward rolls the conv buffer inside `nmm_state` automatically; no
+   separate buffer capture is needed.
+5. In `model_wide` mode slice off the `N_p` persistent positions before
+   `ln_f`. Compute `last_logits = ln_f(x)[..., -1:, :] @ wte.weight.T`.
 6. Return the cache dict with `position = P`.
 
 `initial_nmm_states` (when not None) is validated up front for
@@ -732,9 +842,12 @@ Same eval-mode contract as `prepare_decode`.
 
 1. Eval-mode contract (G243).
 2. Reject `cache["position"] >= block_size` (wpe OOB).
-3. Embed `wte(token_id) + wpe([position])` → `[B, 1, d]`.
+3. Embed `wte(token_id) + wpe([position])` → `[B, 1, d]`. No persistent
+   prepend at decode-step time — the prefix is already in each block's
+   KV cache (captured during warm-up).
 4. For each block, in order: `block.forward_step(x, nmm_state, k_cache,
-   v_cache, conv_buf)` advances all four caches by one token.
+   v_cache)` advances the KV cache and the in-state conv buffer by one
+   token (the conv buffer lives inside `nmm_state`).
 5. Compute `logits = ln_f(x) @ wte.weight.T` → `[B, 1, V]`.
 6. Return `(logits, new_cache)` with `new_cache["position"] = pos + 1`.
 
@@ -904,9 +1017,11 @@ torch.save({
 - `config` is **required** (not optional). `finetune_mode` controls block
   topology (`gamma_attn` presence, `out_scale` init); resume needs it to
   rebuild the same structure.
-- **NMM `(M, S)` states are intentionally NOT saved.** They are
-  per-sequence accumulators; resume re-initializes from
-  `memory_mlp.W*.weight`.
+- **NMM `(M, S, conv_buf)` states are intentionally NOT saved in model
+  checkpoints.** They are per-sequence accumulators; resume re-initializes
+  via `nmm.init_state(B, device)`. Session-level state persistence (for
+  multi-turn generation) goes through `scripts/nmm_state_io.py` instead
+  (§6 / module docstring).
 
 `load_checkpoint(path, device)`: `torch.load(path,
 weights_only=False)` (G168 — PyTorch 2.6+ flipped the default; our nested

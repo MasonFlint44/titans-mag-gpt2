@@ -115,6 +115,9 @@ def test_fingerprint_captures_shape_affecting_fields():
         "n_layer", "n_embd", "nmm_n_persistent", "nmm_expansion",
         "nmm_low_rank", "nmm_n_heads", "nmm_momentum_order",
         "nmm_layer_indices", "nmm_state_dtype",
+        # conv_buf is part of state now (item 6); the conv kernel size
+        # determines its shape, so a k mismatch must error loudly at load.
+        "nmm_conv_kernel",
     }
     assert set(_fingerprint(cfg).keys()) == expected
 

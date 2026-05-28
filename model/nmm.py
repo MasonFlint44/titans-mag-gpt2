@@ -1201,9 +1201,10 @@ class NeuralMemoryModule(nn.Module):
 
         def _one(projection: NMMProjection, buf_x: torch.Tensor):
             lin = projection.linear(x_chunk)  # [B, T, d]
-            # Buffer may be stored in `state_dtype` (e.g. fp32) while the
-            # current chunk's Linear output is bf16 under autocast. Cast
-            # so `torch.cat` doesn't error.
+            # Buffer is always stored in `state_dtype` (see new_buf cast
+            # below); the current chunk's Linear output may be bf16 under
+            # autocast even when state_dtype is fp32. Promote the buffer
+            # to the compute dtype so `torch.cat` doesn't error.
             if buf_x.dtype != lin.dtype:
                 buf_x = buf_x.to(lin.dtype)
             if k_sz <= 1:
@@ -1219,13 +1220,19 @@ class NeuralMemoryModule(nn.Module):
                 combined_t = combined.transpose(1, 2)  # [B, d, T+k-1]
                 conv_out = projection.conv.conv(combined_t).transpose(1, 2)
                 # New buf: last (k-1) of THIS chunk's linear projections.
-                # Detached so the autograd graph doesn't span chunks.
+                # Detached so the autograd graph doesn't span chunks, and
+                # cast back to `state_dtype` so the buffer's storage dtype
+                # is invariant across chunks (matches M and S semantics —
+                # without this cast, an autocast-bf16 chunk's tail would
+                # silently downgrade an otherwise-fp32 buffer for all
+                # subsequent chunks).
                 if lin.shape[1] >= k_sz - 1:
                     new_buf = lin[:, -(k_sz - 1):, :].detach()
                 else:
                     # Edge case: chunk shorter than k-1 (rare). Take from
                     # the combined buffer's tail.
                     new_buf = combined[:, -(k_sz - 1):, :].detach()
+                new_buf = new_buf.to(self.state_dtype)
             pw_out = projection.pointwise(conv_out)
             return pw_out, new_buf
 
@@ -1258,7 +1265,15 @@ class NeuralMemoryModule(nn.Module):
         }
 
     def _init_conv_buf(self, B: int, device) -> dict:
-        """Zero-init conv buffer, shape `{q, k, v: [B, k-1, n_embd]}`."""
+        """Zero-init conv buffer, shape `{q, k, v: [B, k-1, n_embd]}`.
+
+        The buffer's dtype is `state_dtype` (fp32 default, bf16 when set).
+        Both `_project_qkv_with_buf` and `step_with_conv` cast the rolled
+        buffer back to `state_dtype` before storing, so this invariant
+        holds across chunks even when the per-step compute runs in
+        autocast bf16. `int8` state mode uses fp32 for the buffer
+        (quantizing per-step would amplify rolling-context noise — same
+        rationale as the int8-blockwise-only rule for M and S)."""
         k_sz = self.k_proj.conv.kernel_size
         dt = self.state_dtype if not self.int8_state else torch.float32
         if k_sz <= 1:
@@ -1377,12 +1392,13 @@ class NeuralMemoryModule(nn.Module):
         y_t = self.out_scale * self._batched_retrieve(M_for_retrieval, q_hat)
 
         # Roll conv buffer: drop oldest, append the new linear projection.
-        # Use the casted `cb_*` tensors so the buffer dtype matches what
-        # we actually fed to the conv this step.
+        # Cast back to `state_dtype` so the buffer's storage dtype stays
+        # invariant across steps (matches M/S semantics; without this an
+        # autocast-bf16 step would downgrade an otherwise-fp32 buffer).
         new_conv_buf = {
-            "q": torch.cat([cb_q[:, 1:, :], q_lin], dim=1),
-            "k": torch.cat([cb_k[:, 1:, :], k_lin], dim=1),
-            "v": torch.cat([cb_v[:, 1:, :], v_lin], dim=1),
+            "q": torch.cat([cb_q[:, 1:, :], q_lin], dim=1).to(self.state_dtype),
+            "k": torch.cat([cb_k[:, 1:, :], k_lin], dim=1).to(self.state_dtype),
+            "v": torch.cat([cb_v[:, 1:, :], v_lin], dim=1).to(self.state_dtype),
         }
         return y_t, (M_t, S_t, new_conv_buf)
 
@@ -2085,9 +2101,9 @@ class MultiHeadNMM(nn.Module):
     @property
     def memory_mlp(self):
         """For backward-compat with code paths that read `nmm.memory_mlp.W*`
-        for shape / dtype probes (e.g., `init_conv_buffer_from_prompt` dtype
-        inference, `_apply_gpt2_init`'s NMM-skip-by-id). Returns the FIRST
-        head's MemoryMLP — sufficient for shape/dtype-only consumers."""
+        for shape / dtype probes (e.g., `_apply_gpt2_init`'s
+        NMM-skip-by-id). Returns the FIRST head's MemoryMLP — sufficient
+        for shape/dtype-only consumers."""
         return self.heads[0].memory_mlp
 
     # --- Same-API methods as NeuralMemoryModule ----------------------------

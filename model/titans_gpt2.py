@@ -167,9 +167,15 @@ class TitansMAGGPT2(nn.Module):
 
         Runs forward() over the prompt (NMM gets exactly one update per
         prompt token via forward_chunk), then captures per-block
-        (k_cache, v_cache, nmm_conv_buffer) by re-projecting the prompt's
-        ln_1/ln_nmm outputs. The KV cache for each block includes the
-        persistent prefix at positions 0..N_p-1.
+        (k_cache, v_cache) by re-projecting the prompt's ln_1 outputs.
+        The KV cache for each block includes the persistent prefix at
+        positions 0..N_p-1 (in `model_wide` mode the prefix arrives via
+        the model-level prepend; in `per_block` mode each block prepends
+        its own).
+
+        The NMM conv buffer is NOT captured separately — it lives inside
+        `cache["nmm_states"][i][2]` and rolls forward automatically as
+        `block(x, nmm_state, None)` runs during the warm-up loop.
 
         prompt_idx: [B, P] token ids. P must be <= block_size.
         initial_nmm_states: optional list[n_layer] of (M, S, conv_buf) —

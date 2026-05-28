@@ -276,6 +276,20 @@ class PlainGPT2Block(nn.Module):
         super().__init__()
         self.use_swa = config.use_swa
         self.swa_window = config.swa_window
+        # Plain blocks must honor `persistent_prefix_mode` because in
+        # `model_wide` mode the persistent prefix is prepended at the model
+        # input and arrives at EVERY block — including this one. Without
+        # block-structured masking, plain blocks would apply standard
+        # upper-triangular causal mask over the augmented sequence, which:
+        #   - makes persistent-to-persistent attention causal instead of
+        #     bidirectional (paper Fig 3b wants bidirectional);
+        #   - under SWA, can mask out persistent positions when they fall
+        #     outside the sliding window (paper Fig 3b: persistent always
+        #     visible).
+        # In `per_block` mode the plain block sees only real tokens (the
+        # NMM blocks prepend/slice locally) and standard causal works.
+        self.persistent_prefix_mode = config.persistent_prefix_mode
+        self.N_p = config.nmm_n_persistent
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(
             config.n_embd, config.n_head, config.dropout
@@ -285,7 +299,8 @@ class PlainGPT2Block(nn.Module):
 
     def _causal_mask(self, T: int, device, dtype):
         """Standard causal mask (with optional banded SWA), no persistent
-        prefix. Mirrors `TitansMAGBlock._aug_mask` minus the N_p rows."""
+        prefix. Used in `per_block` mode where plain blocks see only real
+        tokens."""
         mask = torch.triu(
             torch.full((T, T), float("-inf"), device=device, dtype=dtype),
             diagonal=1,
@@ -298,11 +313,41 @@ class PlainGPT2Block(nn.Module):
             mask = mask + far_past
         return mask
 
+    def _aug_mask(self, T_real: int, device, dtype):
+        """Block-structured `[N_p+T_real, N_p+T_real]` mask matching
+        `TitansMAGBlock._aug_mask`. Used in `model_wide` mode where the
+        block input arrives with the persistent prefix prepended at the
+        model level."""
+        N = self.N_p + T_real
+        mask = torch.full((N, N), float("-inf"), device=device, dtype=dtype)
+        mask[: self.N_p, : self.N_p] = 0          # persistent ↔ persistent
+        mask[self.N_p :, : self.N_p] = 0          # real → persistent
+        causal = torch.triu(
+            torch.full((T_real, T_real), float("-inf"), device=device, dtype=dtype),
+            diagonal=1,
+        )
+        if self.use_swa:
+            far_past = torch.tril(
+                torch.full((T_real, T_real), float("-inf"), device=device, dtype=dtype),
+                diagonal=-self.swa_window,
+            )
+            causal = causal + far_past
+        mask[self.N_p :, self.N_p :] = causal     # real → real (banded if SWA)
+        return mask
+
     def forward(self, x: torch.Tensor, nmm_state=None, doc_boundaries=None):
         # nmm_state and doc_boundaries are accepted for signature uniformity
         # with TitansMAGBlock; both are ignored. State passes through.
-        T = x.size(1)
-        mask = self._causal_mask(T, x.device, x.dtype)
+        T_in = x.size(1)
+        if self.persistent_prefix_mode == "model_wide" and self.N_p > 0:
+            # In `model_wide` mode the model has already prepended the
+            # persistent prefix; `T_in == N_p + T_real`. Build the block-
+            # structured mask so persistent positions stay bidirectional
+            # and always-visible to real positions.
+            T_real = T_in - self.N_p
+            mask = self._aug_mask(T_real, x.device, x.dtype)
+        else:
+            mask = self._causal_mask(T_in, x.device, x.dtype)
         x = x + self.attn(self.ln_1(x), mask=mask)
         x = x + self.mlp(self.ln_2(x))
         return x, nmm_state  # state pass-through (typically None)
@@ -331,10 +376,18 @@ class PlainGPT2Block(nn.Module):
     ) -> tuple:
         """Single-token decode through a plain block."""
         x_norm = self.ln_1(x_new)
+        # In `model_wide` mode the KV cache already contains the persistent
+        # prefix at positions [0, N_p) (captured during warmup against the
+        # model-augmented input). Pass `n_persistent=self.N_p` so the SWA
+        # mask keeps those positions always-visible. In `per_block` mode
+        # the cache contains real tokens only — `n_persistent=0`.
+        n_persistent = (
+            self.N_p if self.persistent_prefix_mode == "model_wide" else 0
+        )
         y_attn, new_k_cache, new_v_cache = self.attn.forward_with_kv_cache(
             x_norm, k_cache, v_cache,
             swa_window=self.swa_window if self.use_swa else None,
-            n_persistent=0,  # plain block has no persistent prefix
+            n_persistent=n_persistent,
         )
         x = x_new + y_attn
         x = x + self.mlp(self.ln_2(x))
