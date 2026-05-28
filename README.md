@@ -89,6 +89,7 @@ uv run python -m cli.finetune \
     --freeze-embeddings \
     --nmm-gate-ramp-steps 100 \
     --nmm-gate-ramp-target 0.1 \
+    --nmm-aux-loss-weight 0.5 \
     --compile-model \
     --optim8bit \
     --max-steps 5000
@@ -98,19 +99,32 @@ This loads pretrained `openai-community/gpt2`, splices in the NMM with
 `out_scale=0` (so initial logits exactly match HF), freezes the input/
 output embeddings (`wte`, `wpe`, `ln_f`) so the gradient concentrates on
 the parts that need to adapt to the new memory pathway, ramps the memory
-gate open over the first 100 steps, and then trains. Transformer blocks
-(attention, MLP) stay trainable so they can learn to attend to NMM-
-modulated tokens. At step 0 perplexity should equal vanilla GPT-2; from
-there it decreases as the memory contribution ramps up.
+gate open over the first 100 steps, adds an auxiliary loss that directly
+trains the NMM's `y_mem` output to predict next tokens, and then trains.
+Transformer blocks (attention, MLP) stay trainable so they can learn to
+attend to NMM-modulated tokens. At step 0 perplexity should equal
+vanilla GPT-2; from there it decreases as the memory contribution ramps
+up.
 
-The `--freeze-embeddings` and `--nmm-gate-ramp-*` flags follow a TPTT-
-style ([fabienfrfr/tptt](https://github.com/fabienfrfr/tptt)) recipe
-for injecting a new memory mechanism into a pretrained Transformer:
-preserve the input/output representation space, force the memory gate
-open on a schedule instead of waiting for LM loss alone to slowly open
-it. (There's also a `--freeze-backbone` flag for the more aggressive
-freeze, but empirically it's too aggressive — attention can't adapt
-and short-distance accuracy collapses. Prefer `--freeze-embeddings`.)
+The training-regime flags address three things diagnosed during
+needle-in-haystack experiments:
+- `--freeze-embeddings`: TPTT-style
+  ([fabienfrfr/tptt](https://github.com/fabienfrfr/tptt)) gradient
+  concentration — keeps the limited fine-tune data from distorting the
+  pretrained input/output representations. (There's also a
+  `--freeze-backbone` flag for a more aggressive freeze, but
+  empirically it's too aggressive — attention can't adapt and short-
+  distance accuracy collapses. Prefer `--freeze-embeddings`.)
+- `--nmm-gate-ramp-*`: forces the memory gate open on a schedule
+  instead of waiting for LM loss alone to slowly discover the NMM is
+  worth using.
+- `--nmm-aux-loss-weight`: direct supervision on the NMM's `y_mem`
+  output — added after diagnostics showed the surprise-driven NMM
+  doesn't naturally produce retrievable structure from LM loss alone
+  at our scale (its `y_mem` at the answer position was uncorrelated
+  with the correct-answer token). Forces `k_proj` and `q_proj` to
+  align by pressuring `y_mem` to predict next tokens directly.
+
 Drop the flags entirely for the original full-fine-tune-with-passive-
 gate behavior.
 

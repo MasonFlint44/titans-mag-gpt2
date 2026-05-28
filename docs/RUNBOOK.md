@@ -298,19 +298,32 @@ python -m cli.finetune --data corpus.txt \
     --freeze-embeddings \
     --nmm-gate-ramp-steps 100 \
     --nmm-gate-ramp-target 0.1 \
+    --nmm-aux-loss-weight 0.5 \
     --compile-model \
     --optim8bit
 ```
 
-`--freeze-embeddings` + `--nmm-gate-ramp-*` follow a TPTT-style recipe
-for memory injection: preserve the input/output representations (wte,
-wpe, ln_f) so the limited fine-tune data doesn't distort them, force
-the memory gate open on a schedule, and let the transformer blocks
-(attention + MLP) train so they can adapt to attend to NMM-modulated
-tokens. There's also `--freeze-backbone` for a more aggressive freeze,
-but empirically it's too aggressive (short-distance accuracy collapses
-because attention can't compensate for the injected NMM signal). Drop
-the flags entirely for the original full-fine-tune behavior.
+The three training-regime flags at the bottom address things found in
+needle-in-haystack diagnostics:
+
+- `--freeze-embeddings`: TPTT-style freeze of `wte`, `wpe`, `ln_f` so
+  the limited fine-tune data doesn't distort the input/output
+  representations. Transformer blocks (attention + MLP) stay trainable
+  so they can adapt to attend to NMM-modulated tokens. (There's also
+  `--freeze-backbone` for a more aggressive freeze, but empirically it
+  collapses short-distance accuracy because attention can't compensate
+  for the injected NMM signal.)
+- `--nmm-gate-ramp-*`: forces the memory gate open on a schedule
+  instead of waiting for LM loss alone to slowly open it.
+- `--nmm-aux-loss-weight`: explicitly trains the NMM's `y_mem` output
+  to predict next tokens (CE against the same labels as `lm_loss`).
+  Added after diagnostics showed the surprise-driven NMM otherwise
+  produces input-dependent noise rather than retrievable structure at
+  our scale — `y_mem` at the answer position had cosine alignment ≈ 0
+  with the correct-answer embedding. The aux loss pressures
+  `k_proj`/`q_proj` to align.
+
+Drop the flags entirely for the original full-fine-tune behavior.
 
 Measured on RTX 5070 Ti without `--nmm-use-gram-ns5`: ~1.11 s/step,
 8.5 GiB peak. The `--nmm-use-gram-ns5` flag swaps NS5 for the

@@ -32,6 +32,19 @@ def build_finetune_config(size: str, **overrides):
     return _FACTORY[size](finetune_mode=True, **overrides)
 
 
+def _install_aux_capture_if_enabled(model, args):
+    """If --nmm-aux-loss-weight > 0, install the y_mem capture hook BEFORE
+    torch.compile wraps the model. Returns the capture dict (or None).
+    Must be called BEFORE `torch.compile(...)` so the patched method is
+    part of the traced graph — installing after compile would leave
+    dynamo with the unpatched version and the hook never fires."""
+    if args.nmm_aux_loss_weight <= 0.0:
+        return None
+    from cli.train import install_y_mem_capture
+    capture, _uninstall = install_y_mem_capture(model)
+    return capture
+
+
 def _apply_freeze_flag(model, args) -> None:
     """Dispatch on the mutually-exclusive --freeze-backbone /
     --freeze-embeddings flags. No-op if neither is set (full fine-tune).
@@ -162,6 +175,22 @@ def build_parser() -> argparse.ArgumentParser:
              "close to the empirical std observed when the optimizer alone "
              "controls out_scale.",
     )
+    parser.add_argument(
+        "--nmm-aux-loss-weight",
+        type=float,
+        default=0.0,
+        help="If > 0, add an auxiliary retrieval loss to training. The last "
+             "NMM-bearing block's pre-gate `y_mem` is projected through "
+             "ln_f + tied LM head and CE'd against the same next-token "
+             "labels as the standard LM loss; the sum (with this weight on "
+             "the aux term) is what backprops. Diagnostic motivation: at "
+             "our scale, the surprise-driven NMM doesn't naturally produce "
+             "retrievable structure from LM loss alone — y_mem at the "
+             "answer position is uncorrelated with the right answer token. "
+             "This loss provides explicit supervision on the NMM read "
+             "pathway, pressuring k_proj/q_proj alignment and the update "
+             "rule. Default 0.0 (disabled).",
+    )
     from cli.nmm_cli import add_nmm_args
     add_nmm_args(parser)
     return parser
@@ -213,6 +242,7 @@ def main():
         # `_orig_mod.` prefix is in place before we load (or alternatively,
         # use _unwrap on the saved dict). We do the latter — matches how
         # other consumers (eval_qa_recall, generate.py) handle this.
+        aux_capture = _install_aux_capture_if_enabled(model, args)
         if args.compile_model:
             model = torch.compile(model, mode="default", dynamic=False)
         state = ckpt.get("state_dict", ckpt.get("model"))
@@ -279,6 +309,7 @@ def main():
         # unwrapped model's named_parameters() — _unwrap strips both
         # `_orig_mod.` compile prefixes and any DDP `module.` prefixes at
         # save/load time).
+        aux_capture = _install_aux_capture_if_enabled(model, args)
         if args.compile_model:
             model = torch.compile(model, mode="default", dynamic=False)
 
@@ -325,6 +356,8 @@ def main():
         batch_size=args.batch_size,
         gate_ramp_steps=args.nmm_gate_ramp_steps,
         gate_ramp_target=args.nmm_gate_ramp_target,
+        aux_loss_weight=args.nmm_aux_loss_weight,
+        aux_capture=aux_capture,
     )
 
 

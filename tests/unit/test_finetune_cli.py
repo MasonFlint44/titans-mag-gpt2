@@ -252,3 +252,37 @@ def test_freeze_embeddings_composes_with_gate_ramp():
     assert args.freeze_embeddings is True
     assert args.freeze_backbone is False
     assert args.nmm_gate_ramp_steps == 100
+
+
+def test_nmm_aux_loss_weight_flag_exists_and_defaults_to_zero():
+    """Default 0.0 means the aux loss is disabled — preserves
+    backward-compatible training behavior for recipes that don't pass
+    the flag. Opt-in only."""
+    args = _parse()
+    assert args.nmm_aux_loss_weight == 0.0
+
+
+def test_nmm_aux_loss_weight_round_trip():
+    args = _parse("--nmm-aux-loss-weight", "0.25")
+    assert args.nmm_aux_loss_weight == pytest.approx(0.25)
+
+
+def test_nmm_aux_loss_weight_composes_with_freeze_and_ramp():
+    """The full recommended recipe: --freeze-embeddings +
+    --nmm-gate-ramp-* + --nmm-aux-loss-weight. Verify they all parse
+    together without conflict."""
+    args = _parse(
+        "--freeze-embeddings",
+        "--nmm-gate-ramp-steps", "100",
+        "--nmm-gate-ramp-target", "0.1",
+        "--nmm-aux-loss-weight", "0.5",
+        "--nmm-use-gram-ns5",
+        "--compile-model",
+        "--optim8bit",
+    )
+    assert args.freeze_embeddings is True
+    assert args.nmm_gate_ramp_steps == 100
+    assert args.nmm_aux_loss_weight == pytest.approx(0.5)
+    assert args.nmm_use_gram_ns5 is True
+    assert args.compile_model is True
+    assert args.optim8bit is True

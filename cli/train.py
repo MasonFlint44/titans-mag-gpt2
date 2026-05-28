@@ -197,6 +197,92 @@ def collect_out_scale_params(model: nn.Module) -> list:
     return out
 
 
+def install_y_mem_capture(
+    model: nn.Module, target_layer: int = -1,
+) -> tuple[dict, callable]:
+    """Monkey-patch the target NMM block's `forward_chunk` to capture its
+    raw (pre-gate) `y_mem` output on each call. Returns
+    `(capture_dict, uninstall_fn)`.
+
+    The captured tensor IS in the autograd graph — gradients flow back
+    through it when it's used in an auxiliary loss. Use `.detach()`
+    yourself if you only want diagnostics.
+
+    `target_layer=-1` walks backward to find the last NMM-bearing block,
+    which is the natural target for an auxiliary retrieval loss
+    (closest to the LM head, most directly contributes to logits).
+
+    Diagnostic motivation for this hook: needle-in-haystack probes
+    showed the NMM's `y_mem` at the answer position is uncorrelated
+    with the right answer token at long distance. Adding an auxiliary
+    loss that directly trains `y_mem` to predict the next token
+    (projected through ln_f + tied wte LM head) provides explicit
+    supervision on the NMM's retrieval pathway — pressuring k_proj /
+    q_proj alignment and the update rule that writes into M.
+
+    Install BEFORE `torch.compile` wrapping so the patched method is
+    part of the traced graph; otherwise dynamo may capture the
+    unpatched version and the hook never fires.
+    """
+    from model import _unwrap
+    real_model = _unwrap(model)
+    blocks = list(real_model.blocks)
+    idx = target_layer if target_layer >= 0 else len(blocks) + target_layer
+    while idx >= 0 and (
+        not hasattr(blocks[idx], "nmm") or blocks[idx].nmm is None
+    ):
+        idx -= 1
+    if idx < 0:
+        raise ValueError(
+            "install_y_mem_capture: no NMM-bearing block in model.blocks; "
+            "auxiliary retrieval loss requires at least one block with "
+            "an NMM."
+        )
+    nmm = blocks[idx].nmm
+    orig = nmm.forward_chunk
+    capture: dict = {"target_layer": idx}
+
+    def wrapped(x_chunk, state_in, doc_boundaries):
+        result = orig(x_chunk, state_in, doc_boundaries)
+        y_mem = result[0] if isinstance(result, tuple) else result
+        # NOTE: do NOT detach — auxiliary loss needs gradients here.
+        capture["y_mem"] = y_mem
+        return result
+
+    nmm.forward_chunk = wrapped
+
+    def uninstall():
+        nmm.forward_chunk = orig
+
+    return capture, uninstall
+
+
+def compute_aux_retrieval_loss(
+    y_mem_aug: torch.Tensor, input_ids: torch.Tensor, model: nn.Module,
+) -> torch.Tensor:
+    """Project captured y_mem through ln_f + tied-wte LM head, compute
+    cross-entropy against the SAME next-token labels as `lm_loss`. Strips
+    the persistent_mem prefix from y_mem so positions align with
+    input_ids.
+
+    Mirrors the standard lm_loss shape exactly:
+      logits-equivalent = ln_f(y_mem_real) @ wte.weight.T
+      target            = input_ids[:, 1:]
+    """
+    from model import _unwrap
+    real = _unwrap(model)
+    N_p = real.config.nmm_n_persistent
+    if N_p > 0:
+        y_mem = y_mem_aug[:, N_p:, :]
+    else:
+        y_mem = y_mem_aug
+    aux_logits = real.ln_f(y_mem) @ real.wte.weight.T
+    return F.cross_entropy(
+        aux_logits[:, :-1].reshape(-1, aux_logits.size(-1)),
+        input_ids[:, 1:].reshape(-1),
+    )
+
+
 def gate_ramp_value(step: int, ramp_steps: int, target: float) -> float:
     """Linear ramp schedule value at training `step`. The schedule reaches
     `target` exactly at `step == ramp_steps - 1` (the LAST in-ramp step),
@@ -782,6 +868,8 @@ def run_training(
     batch_size: int | None = None,
     gate_ramp_steps: int = 0,
     gate_ramp_target: float = 0.0,
+    aux_loss_weight: float = 0.0,
+    aux_capture: dict | None = None,
 ) -> None:
     """Top-level training loop covering both Phase 4.4 (fine-tune) and 4.5
     (from-scratch). One optimizer.step per accumulation cycle of `accum_steps`
@@ -913,6 +1001,26 @@ def run_training(
         for p in out_scale_params:
             p.requires_grad = False
 
+    # Auxiliary retrieval-loss setup. If the caller passed an aux_capture
+    # dict (created via `install_y_mem_capture` BEFORE compile), and
+    # aux_loss_weight > 0, each forward pass projects the captured
+    # y_mem through ln_f + tied wte LM head and adds the resulting
+    # cross-entropy (against the same next-token labels) into the total
+    # loss. See `compute_aux_retrieval_loss` docstring for motivation.
+    aux_enabled = (
+        aux_loss_weight > 0.0
+        and aux_capture is not None
+    )
+    if aux_enabled and rank == 0:
+        print(
+            f"[run_training] auxiliary retrieval loss enabled "
+            f"(weight={aux_loss_weight}, target_layer="
+            f"{aux_capture.get('target_layer', '?')}): y_mem is projected "
+            f"through ln_f + tied LM head and CE'd against next-token "
+            f"labels alongside the standard LM loss.",
+            file=sys.stderr,
+        )
+
     try:
         while step < max_steps:
             # Gate-ramp: hold out_scale to the schedule during the ramp.
@@ -994,18 +1102,34 @@ def run_training(
                             logits, nmm_states = model(
                                 input_ids, nmm_states, doc_boundaries
                             )
-                            loss = F.cross_entropy(
+                            lm_loss = F.cross_entropy(
                                 logits[:, :-1].reshape(-1, logits.size(-1)),
                                 input_ids[:, 1:].reshape(-1),
-                            ) / accum_steps
+                            )
+                            if aux_enabled and "y_mem" in aux_capture:
+                                aux_loss = compute_aux_retrieval_loss(
+                                    aux_capture["y_mem"], input_ids, model,
+                                )
+                                total_loss = lm_loss + aux_loss_weight * aux_loss
+                            else:
+                                total_loss = lm_loss
+                            loss = total_loss / accum_steps
                     else:
                         logits, nmm_states = model(
                             input_ids, nmm_states, doc_boundaries
                         )
-                        loss = F.cross_entropy(
+                        lm_loss = F.cross_entropy(
                             logits[:, :-1].reshape(-1, logits.size(-1)),
                             input_ids[:, 1:].reshape(-1),
-                        ) / accum_steps
+                        )
+                        if aux_enabled and "y_mem" in aux_capture:
+                            aux_loss = compute_aux_retrieval_loss(
+                                aux_capture["y_mem"], input_ids, model,
+                            )
+                            total_loss = lm_loss + aux_loss_weight * aux_loss
+                        else:
+                            total_loss = lm_loss
+                        loss = total_loss / accum_steps
                     loss.backward()
                 cycle_ran_any_microbatch = True
 

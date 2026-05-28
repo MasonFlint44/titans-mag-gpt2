@@ -73,15 +73,21 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python -m cli.finetune \
     --freeze-embeddings \
     --nmm-gate-ramp-steps 100 \
     --nmm-gate-ramp-target 0.1 \
+    --nmm-aux-loss-weight 0.5 \
     --compile-model --optim8bit
 ```
 
-The training-regime flags at the bottom — `--freeze-embeddings` and
-`--nmm-gate-ramp-*` — were added after a needle-in-haystack diagnostic
-showed that vanilla fine-tuning produces a too-weak NMM signal
-(~0.45 logits of needle-dependence past block_size, ~100× too small
-to flip top-1 predictions). They're inspired by TPTT
-([fabienfrfr/tptt](https://github.com/fabienfrfr/tptt)).
+The training-regime flags at the bottom — `--freeze-embeddings`,
+`--nmm-gate-ramp-*`, and `--nmm-aux-loss-weight` — were added after
+needle-in-haystack diagnostics showed two things: (1) vanilla fine-
+tuning produces a too-weak NMM signal (~0.45 logits of needle-dependence
+past block_size, ~100× too small to flip top-1 predictions), and (2)
+the NMM's `y_mem` at the answer position is *uncorrelated* with the
+correct answer token even at long distance — meaning the surprise-
+driven update rule isn't shaping M into a retrievable structure when
+trained on LM loss alone. The first two flags are inspired by TPTT
+([fabienfrfr/tptt](https://github.com/fabienfrfr/tptt)); the aux loss
+is our diagnostic-directed addition.
 
 ### `--freeze-embeddings`
 
@@ -105,14 +111,42 @@ the schedule. At step N, the optimizer takes over. Forces the memory
 gate open on a fixed schedule instead of relying on LM loss alone to
 slowly discover that the NMM is worth using.
 
+### `--nmm-aux-loss-weight α`
+
+When `α > 0`, install a hook on the **last NMM block's `forward_chunk`**
+that captures its raw (pre-gate) `y_mem` each step. After the main
+forward, project that y_mem through `ln_f` + tied wte LM head and
+cross-entropy it against the same next-token labels as the main LM
+loss; add `α * aux_loss` to the total before backprop.
+
+Implementation helpers in `cli.train`:
+- `install_y_mem_capture(model, target_layer=-1) -> (capture, uninstall)`
+- `compute_aux_retrieval_loss(y_mem, input_ids, model)`
+
+The capture **must be installed before `torch.compile`** so the patched
+method is part of the traced graph; `cli/finetune.py`'s
+`_install_aux_capture_if_enabled` does this at the right point in both
+the resume and fresh paths. Default `α = 0.0` (disabled — main LM loss
+only).
+
+Motivation: needle-in-haystack diagnostics showed `y_mem` at the
+answer position has cosine alignment ≈ 0 with the correct-answer
+embedding at long distance. The NMM's `k_proj` and `q_proj` aren't
+aligned and M ends up holding input-dependent noise rather than
+retrievable structure. Direct supervision on `y_mem` (CE against the
+next token) is the most surgical intervention the diagnostic supports:
+it pressures the NMM read pathway to produce outputs that correctly
+predict tokens, forcing k/q alignment and shaping the update rule that
+writes into M.
+
 ### Defaults
 
-The argparse defaults leave both freeze flags OFF and
-`--nmm-gate-ramp-steps=0` so legacy scripts that didn't pass them get
-full-fine-tune-with-passive-gate behavior unchanged. The canonical
-recipe above is the new recommendation; the previous full-fine-tune
-recipe is still supported but doesn't appear to learn cross-chunk
-recall well.
+The argparse defaults leave both freeze flags OFF,
+`--nmm-gate-ramp-steps=0`, and `--nmm-aux-loss-weight=0.0`, so legacy
+scripts that didn't pass them get full-fine-tune-with-passive-gate
+behavior unchanged. The canonical recipe above is the new recommendation;
+the previous full-fine-tune recipe is still supported but doesn't appear
+to learn cross-chunk recall well.
 
 For multi-GPU from-scratch runs on a bigger box you'll want to bump
 `--batch-size`, drop `--grad-accum`, raise `--max-steps`, and probably

@@ -24,9 +24,11 @@ from cli.train import (
     EMBEDDING_SUBSTRINGS,
     FREEZE_BACKBONE_KEEP_TRAINABLE_SUBSTRINGS,
     collect_out_scale_params,
+    compute_aux_retrieval_loss,
     freeze_backbone,
     freeze_embeddings_only,
     gate_ramp_value,
+    install_y_mem_capture,
 )
 
 
@@ -354,3 +356,226 @@ def test_ramp_overwrite_pattern_does_not_break_optimizer_construction():
         f"out_scale params should be excluded from optimizer groups "
         f"during the ramp; found {out_scale_in_optim} in groups"
     )
+
+
+# ---------------------------------------------------------------------------
+# install_y_mem_capture / compute_aux_retrieval_loss
+# ---------------------------------------------------------------------------
+
+def _micro_model(**cfg_overrides) -> TitansMAGGPT2:
+    """Much smaller than _tiny_model — used for tests that need a real
+    forward pass. _tiny_model uses gpt2_small dimensions; running the
+    full NMM forward at that scale is too slow / heavy on CPU for unit
+    tests. This gives us a model that exercises every code path at
+    minimal cost."""
+    cfg = TitansConfig(
+        n_layer=2, n_head=2, n_embd=8, vocab_size=16,
+        block_size=32, chunk_size=32, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=2, finetune_mode=True,
+    )
+    return TitansMAGGPT2(cfg)
+
+
+def test_install_y_mem_capture_returns_dict_and_uninstall():
+    """Two-element return: capture dict and uninstall callable. Both must
+    be usable: dict for capture state, callable to restore the patched
+    method."""
+    model = _micro_model()
+    capture, uninstall = install_y_mem_capture(model)
+    assert isinstance(capture, dict)
+    assert callable(uninstall)
+    # Pre-forward, capture has only the target-layer metadata.
+    assert "target_layer" in capture
+    assert "y_mem" not in capture
+
+
+def test_install_y_mem_capture_targets_last_nmm_block_by_default():
+    """target_layer=-1 should find the LAST block with an NMM. In the
+    micro fixture all blocks have NMMs, so the answer is n_layer - 1."""
+    model = _micro_model()
+    capture, uninstall = install_y_mem_capture(model)
+    assert capture["target_layer"] == model.config.n_layer - 1
+    uninstall()
+
+
+def test_install_y_mem_capture_raises_when_no_nmm_block():
+    """Defensive: if a caller hands us a model with zero NMM-bearing
+    blocks (e.g., a fully vanilla GPT-2 built via nmm_layer_indices=[]),
+    we must fail loud rather than silently capturing nothing."""
+    cfg = TitansConfig(
+        n_layer=2, n_head=2, n_embd=8, vocab_size=16,
+        block_size=32, chunk_size=32, dropout=0.0,
+        nmm_expansion=2, nmm_n_persistent=2, finetune_mode=True,
+        nmm_layer_indices=[],  # vanilla — no NMM blocks at all
+    )
+    model = TitansMAGGPT2(cfg)
+    with pytest.raises(ValueError, match="no NMM-bearing block"):
+        install_y_mem_capture(model)
+
+
+def test_y_mem_capture_fires_on_forward():
+    """After a forward pass, capture['y_mem'] must contain a tensor.
+    This pins the basic mechanism: the monkey-patched forward_chunk
+    writes into the capture dict."""
+    model = _micro_model().eval()
+    capture, uninstall = install_y_mem_capture(model)
+    ids = torch.randint(0, model.config.vocab_size, (1, 16))
+    with torch.no_grad():
+        _ = model(ids, None, None)
+    assert "y_mem" in capture, "forward_chunk hook did not fire"
+    assert isinstance(capture["y_mem"], torch.Tensor)
+    uninstall()
+
+
+def test_captured_y_mem_keeps_grad_for_aux_loss():
+    """The capture must NOT detach — aux loss needs gradients to flow
+    back through y_mem to the NMM's projections. A bug here would
+    silently make the aux loss a no-op (loss computed but no gradient
+    contribution)."""
+    model = _micro_model().train()
+    capture, uninstall = install_y_mem_capture(model)
+    ids = torch.randint(0, model.config.vocab_size, (1, 16))
+    _ = model(ids, None, None)
+    y_mem = capture["y_mem"]
+    assert y_mem.requires_grad, (
+        f"y_mem.requires_grad is False — aux loss gradients can't flow"
+    )
+    assert y_mem.grad_fn is not None, (
+        f"y_mem has no grad_fn — capture detached the tensor from autograd"
+    )
+    uninstall()
+
+
+def test_y_mem_capture_shape_includes_persistent_prefix():
+    """Captured y_mem is the RAW NMM output, which includes the
+    persistent_mem positions at the front. compute_aux_retrieval_loss
+    strips them before projection. This test pins the pre-strip shape
+    so that test_aux_loss_strips_persistent below has a stable
+    expectation to verify."""
+    model = _micro_model().eval()
+    cfg = model.config
+    capture, uninstall = install_y_mem_capture(model)
+    T = 16
+    ids = torch.randint(0, cfg.vocab_size, (1, T))
+    with torch.no_grad():
+        _ = model(ids, None, None)
+    y = capture["y_mem"]
+    # Shape is [B, T_aug, D] where T_aug = T + N_p
+    assert y.shape == (1, T + cfg.nmm_n_persistent, cfg.n_embd)
+    uninstall()
+
+
+def test_uninstall_restores_original_forward_chunk():
+    """After uninstall, subsequent forwards must NOT write into the
+    capture dict — confirms the monkey-patch is reversible. Otherwise
+    training that toggles aux loss on/off would leak hook state."""
+    model = _micro_model().eval()
+    capture, uninstall = install_y_mem_capture(model)
+    ids = torch.randint(0, model.config.vocab_size, (1, 16))
+    with torch.no_grad():
+        _ = model(ids, None, None)
+    assert "y_mem" in capture
+    uninstall()
+    capture.clear()
+    capture["target_layer"] = -1  # restore the metadata-only state
+    with torch.no_grad():
+        _ = model(ids, None, None)
+    assert "y_mem" not in capture, (
+        "uninstall didn't restore the original method; capture still "
+        "receives y_mem from new forwards"
+    )
+
+
+# ---------------------------------------------------------------------------
+# compute_aux_retrieval_loss
+# ---------------------------------------------------------------------------
+
+def test_aux_loss_returns_scalar_with_grad():
+    """The aux loss must be a 0-D scalar tensor with grad enabled, so
+    it can be added to the main loss and backprop normally."""
+    model = _micro_model().train()
+    capture, uninstall = install_y_mem_capture(model)
+    ids = torch.randint(0, model.config.vocab_size, (1, 16))
+    _ = model(ids, None, None)
+    aux = compute_aux_retrieval_loss(capture["y_mem"], ids, model)
+    assert aux.ndim == 0
+    assert aux.requires_grad
+    uninstall()
+
+
+def test_aux_loss_strips_persistent_prefix():
+    """The pre-strip y_mem has shape [B, T+N_p, D]; the post-strip
+    projection must align with input_ids of shape [B, T]. If the
+    persistent prefix weren't stripped, the cross-entropy would compare
+    y_mem at persistent positions to real-token labels, which is
+    nonsense."""
+    model = _micro_model().train()
+    capture, uninstall = install_y_mem_capture(model)
+    T = 16
+    ids = torch.randint(0, model.config.vocab_size, (1, T))
+    _ = model(ids, None, None)
+    # Sanity: y_mem has T + N_p positions before stripping.
+    assert capture["y_mem"].shape[1] == T + model.config.nmm_n_persistent
+    # If aux loss didn't strip, it would either crash on shape mismatch
+    # or produce a different value. As a smoke check, just verify it
+    # computes without error.
+    aux = compute_aux_retrieval_loss(capture["y_mem"], ids, model)
+    assert torch.isfinite(aux)
+    uninstall()
+
+
+def test_aux_loss_backward_writes_grad_to_memory_params():
+    """End-to-end: after aux_loss.backward(), the NMM module's params
+    must have non-zero gradients. This pins the contract that the aux
+    loss actually trains the memory pathway — the whole point."""
+    model = _micro_model().train()
+    capture, uninstall = install_y_mem_capture(model)
+    ids = torch.randint(0, model.config.vocab_size, (1, 16))
+    _ = model(ids, None, None)
+    aux = compute_aux_retrieval_loss(capture["y_mem"], ids, model)
+    # Zero existing grads to be sure we measure aux's contribution alone.
+    model.zero_grad(set_to_none=True)
+    aux.backward()
+    # The target block's NMM should have grads on at least one of its
+    # learnable params. Walk the NMM submodule.
+    target_layer = capture["target_layer"]
+    nmm = model.blocks[target_layer].nmm
+    has_grad = False
+    for name, p in nmm.named_parameters():
+        if p.grad is not None and p.grad.abs().sum().item() > 0:
+            has_grad = True
+            break
+    assert has_grad, (
+        f"aux_loss.backward() left every NMM param with zero/None grad "
+        f"— gradients are not flowing into the memory pathway"
+    )
+    uninstall()
+
+
+def test_aux_loss_matches_lm_loss_shape_target():
+    """The aux loss CE-targets the SAME labels as lm_loss: shifted
+    input_ids. If a regression made aux loss target the wrong positions,
+    training would silently optimize a different objective."""
+    import torch.nn.functional as F
+    from model import _unwrap
+    model = _micro_model().train()
+    capture, uninstall = install_y_mem_capture(model)
+    T = 16
+    ids = torch.randint(0, model.config.vocab_size, (1, T))
+    _ = model(ids, None, None)
+    aux = compute_aux_retrieval_loss(capture["y_mem"], ids, model)
+    # Recompute aux loss manually to pin the contract:
+    real = _unwrap(model)
+    N_p = real.config.nmm_n_persistent
+    y_mem = capture["y_mem"][:, N_p:, :] if N_p > 0 else capture["y_mem"]
+    aux_logits = real.ln_f(y_mem) @ real.wte.weight.T
+    expected = F.cross_entropy(
+        aux_logits[:, :-1].reshape(-1, aux_logits.size(-1)),
+        ids[:, 1:].reshape(-1),
+    )
+    # Allow small numerical difference (autocast / determinism).
+    assert torch.allclose(aux, expected, atol=1e-5), (
+        f"aux loss differs from expected formula: got {aux.item():.6f}, "
+        f"expected {expected.item():.6f}"
+    )
+    uninstall()
