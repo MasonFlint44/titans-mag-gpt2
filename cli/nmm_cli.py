@@ -146,6 +146,57 @@ def add_nmm_args(parser: argparse.ArgumentParser) -> None:
              "--nmm-ns5-steps. Mutually exclusive with --nmm-use-gram-ns5.",
     )
 
+    # ---- DeltaProduct memory (alternative to NMM) -----------------------
+    dp_group = parser.add_argument_group(
+        "DeltaProduct memory selection",
+        "Swap the surprise-driven NMM for the closed-form delta-rule "
+        "update of Siems et al. (ICLR 2025 / arxiv 2502.10297). At "
+        "order=1 reduces to DeltaNet (Yang et al., NeurIPS 2024); at "
+        "order>=2 matches Titans expressivity per the TPTT paper "
+        "(arxiv 2506.17671). Production pretrained-adaptation path.",
+    )
+    dp_group.add_argument(
+        "--memory-type",
+        choices=["nmm", "delta_product"],
+        default=None,
+        help="Fast-weight memory mechanism. Default 'nmm' = paper-strict "
+             "surprise-driven inner-loop gradient update. 'delta_product' "
+             "= closed-form delta-rule update; ignores all --nmm-* knobs.",
+    )
+    dp_group.add_argument(
+        "--delta-order",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Number of sequential delta sub-steps per token. 1 = DeltaNet "
+             "(single rank-1 update). 2 = DeltaProduct order-2, matching "
+             "Titans expressivity per TPTT. Cost scales linearly in N. "
+             "Only meaningful with --memory-type delta_product.",
+    )
+    dp_group.add_argument(
+        "--delta-n-heads",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Number of parallel DeltaProductMemory heads per MAG block. "
+             "Default 1 = single head with M ∈ R^(n_embd × n_embd). For "
+             "production training prefer N = n_head (matches attention) "
+             "so M per head is head_dim × head_dim — drastically smaller "
+             "state. Must divide n_embd. Only meaningful with "
+             "--memory-type delta_product.",
+    )
+    dp_group.add_argument(
+        "--delta-block-size",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Chunked-update aggregation size for the blockwise parallel "
+             "DeltaProduct path. 1 = sequential per-token recurrence "
+             "(reference correctness path). >1 = blockwise parallel "
+             "(training-time speed path). Only meaningful with "
+             "--memory-type delta_product.",
+    )
+
 
 def nmm_kwargs_from_args(args: argparse.Namespace) -> dict:
     """Convert parsed args to a TitansConfig kwargs dict. Only includes
@@ -187,4 +238,40 @@ def nmm_kwargs_from_args(args: argparse.Namespace) -> dict:
         kwargs["nmm_use_gram_ns5"] = True
     if args.nmm_use_cans:
         kwargs["nmm_use_cans"] = True
+    # DeltaProduct selection — only propagate when the user set the flag.
+    # Cross-flag sanity: --delta-* only meaningful with --memory-type
+    # delta_product; surfacing as a hard error catches typo-quality bugs
+    # like "I set order=2 but forgot to switch memory_type".
+    if getattr(args, "memory_type", None) is not None:
+        kwargs["memory_type"] = args.memory_type
+    if getattr(args, "delta_order", None) is not None:
+        kwargs["delta_order"] = args.delta_order
+    if getattr(args, "delta_n_heads", None) is not None:
+        kwargs["delta_n_heads"] = args.delta_n_heads
+    if getattr(args, "delta_block_size", None) is not None:
+        kwargs["delta_block_size"] = args.delta_block_size
+    _validate_delta_flags(args)
     return kwargs
+
+
+def _validate_delta_flags(args: argparse.Namespace) -> None:
+    """Cross-flag validation for DeltaProduct selection.
+
+    Surfaces typo-grade bugs at CLI-parse time rather than letting them
+    silently no-op deep in the config.
+    """
+    delta_only_flags = {
+        "--delta-order": getattr(args, "delta_order", None),
+        "--delta-n-heads": getattr(args, "delta_n_heads", None),
+        "--delta-block-size": getattr(args, "delta_block_size", None),
+    }
+    memory_type = getattr(args, "memory_type", None)
+    if memory_type != "delta_product":
+        set_flags = [
+            name for name, val in delta_only_flags.items() if val is not None
+        ]
+        if set_flags:
+            raise argparse.ArgumentTypeError(
+                f"{', '.join(set_flags)} only meaningful with "
+                f"--memory-type delta_product (got memory_type={memory_type!r})."
+            )

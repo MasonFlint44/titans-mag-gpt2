@@ -200,6 +200,85 @@ gradient-dilution concern less acute).
   still load. When you delete a config field, append the name to that
   frozenset rather than breaking old checkpoints.
 
+## DeltaProduct memory (alternative to NMM)
+
+`config.memory_type` selects the fast-weight mechanism that slots into
+each MAG block. Default `"nmm"` keeps the paper-strict surprise-driven
+inner-loop gradient update from Behrouz et al. (Titans). Setting
+`"delta_product"` swaps it for the closed-form delta-rule update of
+Siems et al. (DeltaProduct, ICLR 2025 / arxiv 2502.10297), which
+generalizes Yang et al.'s DeltaNet (NeurIPS 2024) via a configurable
+`order` parameter.
+
+| Order | Mechanism | Notes |
+|---|---|---|
+| 1 | DeltaNet | One rank-1 delta update per token. |
+| 2 | DeltaProduct order-2 | Matches Titans expressivity per TPTT (arxiv 2506.17671). Default. |
+| N≥2 | DeltaProduct order-N | More state-tracking capacity; cost scales linearly in N. |
+
+**Why this exists alongside the NMM:** the gradient-based NMM appears not
+to adapt well from a pretrained backbone at our scale — needle
+diagnostics showed M is input-dependent but `y_mem` at the answer
+position is uncorrelated with the right answer token at long distance,
+suggesting the surprise-driven update doesn't naturally produce
+retrievable key-value structure unless the backbone is co-evolved with
+it (paper-style from-scratch training). DeltaProduct's update rule
+forms key-value associations by construction (`M ← M + β·(v − M·k)·kᵀ`),
+which sidesteps that adaptation problem. The TPTT library / paper
+formalizes exactly this pattern as the production pretrained-adaptation
+recipe — same MAG-style integration, persistent prefix, and gating as
+the NMM, with the inner mechanism swapped.
+
+### Flags
+
+```
+--memory-type {nmm,delta_product}   # selector; default "nmm"
+--delta-order N                      # 1 = DeltaNet, 2 = DeltaProduct (default 2)
+--delta-n-heads N                    # heads per block; default 1, prefer n_head for prod
+--delta-block-size N                 # 1 = sequential reference, >1 = chunkwise parallel
+```
+
+The `--delta-*` flags only meaningful with `--memory-type delta_product`;
+the CLI raises `argparse.ArgumentTypeError` if you set them without
+selecting delta_product (saves you from a typo silently no-op'ing).
+
+### Sequential vs blockwise (chunkwise WY)
+
+`model/delta_product.py` provides two equivalent forward paths:
+
+- **Sequential** (`delta_block_size=1`): paper-strict per-token recurrence.
+  Reference correctness path. The tests pin chunkwise == sequential at
+  any order, with non-zero initial state, and with document boundaries.
+- **Blockwise** (`delta_block_size>1`): closed-form chunkwise WY-form
+  solve. Bit-equivalent to sequential, but replaces the T-step Python
+  loop with one triangular solve + a few batched matmuls. Training-time
+  speed path. Doc-boundary aware: splits the chunk at boundary positions
+  and runs one WY solve per segment.
+
+State is a 1-tuple `(M,)` with `M ∈ R^(B, d_head, d_head)` per head —
+no momentum stack, no conv buffer. State serialization (`model/state_io.py`)
+recognizes `memory_type` in the fingerprint so a checkpoint from one
+mechanism can't silently load into the other.
+
+### Multi-head (`delta_n_heads > 1`)
+
+`MultiHeadDeltaProduct` wraps N parallel single-head `DeltaProductMemory`
+instances on `head_dim = n_embd / n_heads`. For training, prefer
+`delta_n_heads = n_head` (matches attention) so M per head is
+`head_dim × head_dim` — dramatically smaller state vs single-head
+`n_embd × n_embd`. Default 1 = simplest case, but the production recipe
+should match attention's head count.
+
+### Compatibility with existing training-regime flags
+
+The freeze, gate-ramp, and aux-loss helpers in `cli/train.py` are
+mechanism-agnostic — they key off the `nmm` attribute name on the block
+(which is the polymorphic handle for either NMM or DeltaProductMemory),
+`out_scale`, `gamma`, and `persistent`, all of which exist on both
+modules. So `--freeze-embeddings`, `--nmm-gate-ramp-*`, and even
+`--nmm-aux-loss-weight` compose with `--memory-type delta_product`
+unchanged.
+
 ## NS5 variants
 
 Three implementations of the Newton-Schulz spectral normalization of the inner

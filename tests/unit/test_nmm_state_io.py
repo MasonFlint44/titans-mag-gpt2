@@ -118,6 +118,10 @@ def test_fingerprint_captures_shape_affecting_fields():
         # conv_buf is part of state now (item 6); the conv kernel size
         # determines its shape, so a k mismatch must error loudly at load.
         "nmm_conv_kernel",
+        # memory_type fully changes the state schema (NMM triple vs
+        # DeltaProduct 1-tuple); delta_order and delta_n_heads change
+        # M's shape under delta_product. All three must round-trip.
+        "memory_type", "delta_order", "delta_n_heads",
     }
     assert set(_fingerprint(cfg).keys()) == expected
 

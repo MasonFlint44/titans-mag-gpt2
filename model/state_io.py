@@ -54,6 +54,14 @@ def _fingerprint(config) -> dict:
         # its shape [B, k-1, d]. Without this, a state file saved at k=4
         # would load against k=2 and shape-error at the next conv.
         "nmm_conv_kernel": config.nmm_conv_kernel,
+        # memory_type fully changes the state schema: NMM stores
+        # (M_dict, S_dict_or_tuple, conv_buf_dict); DeltaProduct stores
+        # (M_tensor,) only. Loading the wrong family would either silently
+        # broadcast-corrupt or surface a confusing deep shape error in the
+        # per-block loop. Fail fast at load with a clear diff.
+        "memory_type": config.memory_type,
+        "delta_order": config.delta_order,
+        "delta_n_heads": config.delta_n_heads,
     }
 
 

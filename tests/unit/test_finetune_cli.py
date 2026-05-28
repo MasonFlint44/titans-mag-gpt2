@@ -286,3 +286,109 @@ def test_nmm_aux_loss_weight_composes_with_freeze_and_ramp():
     assert args.nmm_use_gram_ns5 is True
     assert args.compile_model is True
     assert args.optim8bit is True
+
+
+# ---------------------------------------------------------------------------
+# DeltaProduct memory selection flags
+# ---------------------------------------------------------------------------
+
+
+def test_memory_type_default_is_none_unset():
+    """`--memory-type` default is None so that omitting the flag preserves
+    the TitansConfig default ('nmm') — i.e. existing recipes unchanged."""
+    args = _parse()
+    assert args.memory_type is None
+
+
+def test_delta_flags_default_is_none_unset():
+    args = _parse()
+    assert args.delta_order is None
+    assert args.delta_n_heads is None
+    assert args.delta_block_size is None
+
+
+def test_memory_type_round_trip_delta_product():
+    args = _parse(
+        "--memory-type", "delta_product",
+        "--delta-order", "2",
+        "--delta-n-heads", "4",
+        "--delta-block-size", "32",
+    )
+    assert args.memory_type == "delta_product"
+    assert args.delta_order == 2
+    assert args.delta_n_heads == 4
+    assert args.delta_block_size == 32
+
+
+def test_memory_type_round_trip_nmm():
+    args = _parse("--memory-type", "nmm")
+    assert args.memory_type == "nmm"
+
+
+def test_memory_type_rejects_unknown_value():
+    """Choices restrict to {nmm, delta_product}; argparse rejects others."""
+    with pytest.raises(SystemExit):
+        _parse("--memory-type", "elephant")
+
+
+def test_delta_order_without_memory_type_raises_via_kwargs():
+    """--delta-* flags are only meaningful with --memory-type delta_product.
+    The cross-flag validator runs at kwargs-extraction time so config-build
+    fails fast rather than silently no-op'ing the flag."""
+    import argparse as _ap
+    from cli.nmm_cli import nmm_kwargs_from_args
+    args = _parse("--delta-order", "2")
+    with pytest.raises(_ap.ArgumentTypeError, match="delta_product"):
+        nmm_kwargs_from_args(args)
+
+
+def test_delta_n_heads_without_memory_type_raises_via_kwargs():
+    import argparse as _ap
+    from cli.nmm_cli import nmm_kwargs_from_args
+    args = _parse("--delta-n-heads", "4")
+    with pytest.raises(_ap.ArgumentTypeError, match="delta_product"):
+        nmm_kwargs_from_args(args)
+
+
+def test_delta_block_size_without_memory_type_raises_via_kwargs():
+    import argparse as _ap
+    from cli.nmm_cli import nmm_kwargs_from_args
+    args = _parse("--delta-block-size", "32")
+    with pytest.raises(_ap.ArgumentTypeError, match="delta_product"):
+        nmm_kwargs_from_args(args)
+
+
+def test_delta_kwargs_extraction_includes_only_set_fields():
+    """nmm_kwargs_from_args only emits keys for flags the user explicitly
+    set — keeps the TitansConfig defaults authoritative for everything else."""
+    from cli.nmm_cli import nmm_kwargs_from_args
+    args = _parse("--memory-type", "delta_product", "--delta-order", "2")
+    kwargs = nmm_kwargs_from_args(args)
+    assert kwargs["memory_type"] == "delta_product"
+    assert kwargs["delta_order"] == 2
+    # delta_n_heads and delta_block_size NOT set on CLI -> not in kwargs.
+    assert "delta_n_heads" not in kwargs
+    assert "delta_block_size" not in kwargs
+
+
+def test_delta_product_composes_with_freeze_and_compile():
+    """The DeltaProduct training recipe should compose cleanly with the
+    existing freeze/ramp/compile flags."""
+    args = _parse(
+        "--memory-type", "delta_product",
+        "--delta-order", "2",
+        "--delta-n-heads", "12",
+        "--delta-block-size", "64",
+        "--freeze-embeddings",
+        "--nmm-gate-ramp-steps", "100",
+        "--nmm-gate-ramp-target", "0.1",
+        "--compile-model",
+        "--optim8bit",
+    )
+    assert args.memory_type == "delta_product"
+    assert args.delta_order == 2
+    assert args.delta_n_heads == 12
+    assert args.delta_block_size == 64
+    assert args.freeze_embeddings is True
+    assert args.compile_model is True
+    assert args.optim8bit is True

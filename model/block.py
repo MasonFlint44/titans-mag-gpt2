@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import cat
 
+from model.delta_product import DeltaProductMemory, MultiHeadDeltaProduct
 from model.nmm import MultiHeadNMM, NeuralMemoryModule
 
 
@@ -481,37 +482,60 @@ class TitansMAGBlock(nn.Module):
             config.n_embd, config.n_head, config.dropout
         )
 
-        # Separate from ln_1; NMM has its own pre-norm.
+        # Separate from ln_1; memory pathway has its own pre-norm.
         self.ln_nmm = nn.LayerNorm(config.n_embd)
-        # Build NMM — single-head (default) or multi-head wrapper.
-        nmm_kwargs = dict(
-            n_embd=config.n_embd,
-            expansion=config.nmm_expansion,
-            kernel_size=config.nmm_conv_kernel,
-            spectral_norm=config.nmm_spectral_norm,
-            finetune_mode=config.finetune_mode,
-            retrieval_from_M_prev=config.retrieval_from_M_prev,
-            state_dtype=config.nmm_state_dtype,
-            low_rank=config.nmm_low_rank,
-            softclamp_max=config.nmm_softclamp_max,
-            block_size=config.nmm_block_size,
-            per_token_ns5=config.nmm_per_token_ns5,
-            detach_state_between_blocks=config.nmm_detach_state_between_blocks,
-            lookahead_value=config.nmm_lookahead_value,
-            per_param_lr_modulation=config.nmm_per_param_lr_modulation,
-            momentum_order=config.nmm_momentum_order,
-            ns5_steps=config.nmm_ns5_steps,
-            use_gram_ns5=config.nmm_use_gram_ns5,
-            use_cans=config.nmm_use_cans,
-        )
-        if config.nmm_n_heads > 1:
-            self.nmm = MultiHeadNMM(
-                n_heads=config.nmm_n_heads,
-                per_head_learned_params=config.nmm_per_head_learned_params,
-                **nmm_kwargs,
+
+        # Build the fast-weight memory module. `self.nmm` is the polymorphic
+        # handle — the call sites (forward, init_decode_cache, forward_step)
+        # don't branch on memory_type. Both NMM and DeltaProductMemory
+        # satisfy the {init_state, forward_chunk, step_with_conv} contract.
+        self.memory_type = config.memory_type
+        if config.memory_type == "delta_product":
+            dp_kwargs = dict(
+                order=config.delta_order,
+                finetune_mode=config.finetune_mode,
+                block_size=config.delta_block_size,
             )
+            if config.delta_n_heads > 1:
+                self.nmm = MultiHeadDeltaProduct(
+                    n_embd=config.n_embd,
+                    n_heads=config.delta_n_heads,
+                    **dp_kwargs,
+                )
+            else:
+                self.nmm = DeltaProductMemory(
+                    n_embd=config.n_embd, **dp_kwargs,
+                )
         else:
-            self.nmm = NeuralMemoryModule(**nmm_kwargs)
+            # Default: paper-strict NMM (memory_type="nmm").
+            nmm_kwargs = dict(
+                n_embd=config.n_embd,
+                expansion=config.nmm_expansion,
+                kernel_size=config.nmm_conv_kernel,
+                spectral_norm=config.nmm_spectral_norm,
+                finetune_mode=config.finetune_mode,
+                retrieval_from_M_prev=config.retrieval_from_M_prev,
+                state_dtype=config.nmm_state_dtype,
+                low_rank=config.nmm_low_rank,
+                softclamp_max=config.nmm_softclamp_max,
+                block_size=config.nmm_block_size,
+                per_token_ns5=config.nmm_per_token_ns5,
+                detach_state_between_blocks=config.nmm_detach_state_between_blocks,
+                lookahead_value=config.nmm_lookahead_value,
+                per_param_lr_modulation=config.nmm_per_param_lr_modulation,
+                momentum_order=config.nmm_momentum_order,
+                ns5_steps=config.nmm_ns5_steps,
+                use_gram_ns5=config.nmm_use_gram_ns5,
+                use_cans=config.nmm_use_cans,
+            )
+            if config.nmm_n_heads > 1:
+                self.nmm = MultiHeadNMM(
+                    n_heads=config.nmm_n_heads,
+                    per_head_learned_params=config.nmm_per_head_learned_params,
+                    **nmm_kwargs,
+                )
+            else:
+                self.nmm = NeuralMemoryModule(**nmm_kwargs)
 
         # MAG gates: gamma_mem always; gamma_attn only when training from scratch.
         # Creating gamma_attn unconditionally would leak unused params into the

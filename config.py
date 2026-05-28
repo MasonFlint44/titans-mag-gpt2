@@ -387,6 +387,51 @@ class TitansConfig:
     # (default, paper-faithful).
     nmm_low_rank: Optional[int] = None
 
+    # ---- Fast-weight memory selection -----------------------------------
+    #
+    # memory_type: which fast-weight mechanism slots into the MAG block at
+    #   each NMM layer. "nmm" (default) is the paper-strict surprise-driven
+    #   inner-loop gradient update from Behrouz et al. (Titans). "delta_product"
+    #   is the closed-form delta-rule update of Siems et al. (DeltaProduct,
+    #   ICLR 2025), which generalizes Yang et al.'s DeltaNet via an `order`
+    #   parameter. At order=1, delta_product reduces to DeltaNet. The TPTT
+    #   paper (arxiv 2506.17671) uses this family as the production "Memory
+    #   as Gate" mechanism when retrofitting pretrained transformers — the
+    #   gradient-based NMM appears not to adapt well from a pretrained
+    #   backbone at small scale (mechanical evidence in our needle
+    #   diagnostics; the delta-rule's explicit key→value update doesn't
+    #   require gradient descent to discover lookup structure).
+    #
+    # All NMM-specific knobs (nmm_block_size, nmm_state_dtype, nmm_use_gram_ns5,
+    # …) are ignored when memory_type="delta_product"; DeltaProduct has its
+    # own knobs below.
+    memory_type: str = "nmm"
+
+    # delta_order: number of sequential delta sub-steps per token. 1 =
+    #   DeltaNet (single rank-1 update per token). >=2 = DeltaProduct
+    #   (state transition as a product of N Householder reflections, more
+    #   expressive at state-tracking — TPTT shows order=2 matches Titans
+    #   expressivity). Only meaningful when memory_type="delta_product";
+    #   ignored otherwise. Cost scales linearly in order.
+    delta_order: int = 2
+
+    # delta_n_heads: number of parallel single-head DeltaProductMemory
+    #   instances inside each MAG block. Default 1 = single head with
+    #   M ∈ R^(n_embd × n_embd), simplest case and matches the user-
+    #   facing "one memory per block" mental model. For production
+    #   training, prefer delta_n_heads = n_head (matches attention) so
+    #   M per head is head_dim × head_dim — drastically smaller state.
+    #   Must divide n_embd. Only meaningful when memory_type="delta_product".
+    delta_n_heads: int = 1
+
+    # delta_block_size: chunked-update aggregation size for the blockwise
+    #   parallel forward path. 1 = paper-strict per-token sequential
+    #   recurrence (reference correctness path). >1 = blockwise parallel
+    #   (training-time speed path, bit-equivalent to sequential at
+    #   block_size=1, approximately equivalent at larger sizes). Only
+    #   meaningful when memory_type="delta_product".
+    delta_block_size: int = 1
+
     def __post_init__(self):
         # raise ValueError (never assert): `python -O` strips asserts, which
         # would let invalid configs ship silently in production.
@@ -462,6 +507,41 @@ class TitansConfig:
                 f"({self.nmm_n_heads}); head_dim would be {head_dim} but "
                 f"{self.nmm_n_heads} * {head_dim} = "
                 f"{self.nmm_n_heads * head_dim}, not {self.n_embd}."
+            )
+
+        # Fast-weight memory selection validation.
+        if self.memory_type not in ("nmm", "delta_product"):
+            raise ValueError(
+                f"memory_type must be 'nmm' or 'delta_product' (got "
+                f"{self.memory_type!r}). Default 'nmm' = paper-strict "
+                f"surprise-driven inner-loop update. 'delta_product' = "
+                f"closed-form delta-rule update (DeltaNet at order=1, "
+                f"DeltaProduct at order>=2; matches Titans expressivity "
+                f"at order=2 per TPTT)."
+            )
+        if self.delta_order < 1:
+            raise ValueError(
+                f"delta_order must be >= 1 (got {self.delta_order}); use 1 "
+                f"for DeltaNet, 2+ for DeltaProduct."
+            )
+        if self.delta_n_heads < 1:
+            raise ValueError(
+                f"delta_n_heads must be >= 1 (got {self.delta_n_heads}); "
+                f"use 1 for single-head DeltaProduct."
+            )
+        if self.n_embd % self.delta_n_heads != 0:
+            head_dim = self.n_embd // self.delta_n_heads
+            raise ValueError(
+                f"n_embd ({self.n_embd}) must be divisible by delta_n_heads "
+                f"({self.delta_n_heads}); head_dim would be {head_dim} but "
+                f"{self.delta_n_heads} * {head_dim} = "
+                f"{self.delta_n_heads * head_dim}, not {self.n_embd}."
+            )
+        if self.delta_block_size < 1:
+            raise ValueError(
+                f"delta_block_size must be >= 1 (got {self.delta_block_size}); "
+                f"use 1 for the sequential reference path, >1 for the "
+                f"blockwise parallel path."
             )
 
         # Memory-saving knob validation.
