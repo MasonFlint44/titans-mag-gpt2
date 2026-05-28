@@ -18,7 +18,7 @@ _STATE_DTYPE_MAP = {
     "bf16": torch.bfloat16,
 }
 
-# G275 — int8 state quantization.
+# int8 state quantization.
 #
 # Halves the bytes-per-element of the recurrent (M, S) state vs bf16
 # (and quarters vs fp32). Within the blockwise path the math runs in
@@ -171,12 +171,12 @@ def reset_state(state: tuple, mask: torch.Tensor, init_M: dict) -> tuple:
 
 def _detach_per_layer(layer_state):
     """Detach a single per-layer NMM state. Handles all shapes:
-      - None: pass through (plain non-NMM block, G261).
+      - None: pass through (plain non-NMM block).
       - single-head, momentum_order=1: `(M, S_dict, conv_buf)` triple.
       - single-head, momentum_order>1: `(M, S_tuple, conv_buf)` where S_tuple
-        is a tuple/list of N dicts (G272).
-      - multi-head: `[(M_h, S_h, conv_buf_h), ...]` (G254).
-      - int8 state (G275): dicts may carry `_qs` scale companion entries
+        is a tuple/list of N dicts.
+      - multi-head: `[(M_h, S_h, conv_buf_h), ...]`.
+      - int8 state: dicts may carry `_qs` scale companion entries
         alongside value entries. `dict.items()` returns both;
         `.detach()` is dtype-agnostic so detaching both is safe.
 
@@ -203,9 +203,9 @@ def detach_states(states):
 
     Pass-through on None — at the very first training step nmm_states is
     None and the model's forward initializes it; this helper must not
-    explode on that case (G149).
+    explode on that case.
 
-    Now recursive (G254): per-layer state can be either a `(M, S)` tuple
+    Now recursive: per-layer state can be either a `(M, S)` tuple
     (single-head NMM) or a list-of-tuples (multi-head NMM via `MultiHeadNMM`).
     The recursion in `_detach_per_layer` handles both transparently.
     """
@@ -216,7 +216,7 @@ def detach_states(states):
 
 
 def _apply_lookahead_v(v_chunk: torch.Tensor, theta_chunk: torch.Tensor) -> tuple:
-    """G269 lookahead-value transform: shift v left by 1, zero θ at last pos.
+    """lookahead-value transform: shift v left by 1, zero θ at last pos.
 
     Inner loss becomes `||M(k_t) - v_{t+1}||²` for t < T-1; for t = T-1
     there's no v_T+1 within this chunk, so its surprise gradient is zeroed
@@ -253,7 +253,7 @@ def _scale_per_key(scalars, tensor_dict: dict) -> dict:
       - a per-key dict of scalars `{key: [B, ...]}` — applied independently
         per key.
 
-    G270: enables per-parameter LR modulation where each state key (W1,
+    enables per-parameter LR modulation where each state key (W1,
     W_gate, W2 for full-rank; six factors for low-rank) gets its own
     data-dependent learning rate θ[key].
     """
@@ -273,7 +273,7 @@ def _step_momentum(S_prev, g_tilde: dict, theta_t, eta_t, order: int):
     Order 1 (paper default):
         S_t = η_1 · S_{t-1} - θ · g_t                          (single dict)
 
-    Order N > 1 (G272):
+    Order N > 1:
         S_1_t = η_1 · S_1_{t-1} - θ · g_t
         S_k_t = η_k · S_k_{t-1} + S_{k-1}_t        for k=2..N
         S_t = tuple(S_1, S_2, ..., S_N)                         (tuple-of-dicts)
@@ -345,7 +345,7 @@ def _dict_sub(a: dict, b: dict) -> dict:
 def softclamp_grad_norm(
     t: torch.Tensor, max_value: float, eps: float = 1e-6
 ) -> torch.Tensor:
-    """Tanh-based soft norm clamping (G265 — lucidrains/titans-pytorch).
+    """Tanh-based soft norm clamping (lucidrains/titans-pytorch).
 
     Caps the Frobenius norm of `t` (over the last two dims) at roughly
     `max_value`, but smoothly via tanh — unlike hard clipping
@@ -646,7 +646,7 @@ def gram_newton_schulz(G: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
       1. **fp32 for the F-norm step.** The Frobenius norm of a small-valued
          gradient can underflow in fp16 — keep it in fp32 for stability.
       2. **fp16 for the Gram iteration.** Unlike stock NS5 (Muon coefficients,
-         G226 fp32 invariant), POLAR_EXPRESS coefficients with reset at
+ fp32 invariant), POLAR_EXPRESS coefficients with reset at
          iter 2 tolerate fp16 just fine — measured |orth error| difference
          vs fp32 is < 1e-2 at NMM shapes. fp16 buys ~2.3× speed on consumer
          Blackwell tensor cores (matches what the upstream library does).
@@ -831,7 +831,7 @@ class MemoryMLP(nn.Module):
         silu(W1 x) * sigmoid(W_gate x)  ->  W2  ->  norm(.) + x
         State: 3 weight matrices {W1, W_gate, W2}.
 
-    Low-rank (G262, `low_rank=r`): each of the three weight matrices is
+    Low-rank (, `low_rank=r`): each of the three weight matrices is
     factored into two `nn.Linear` modules with intermediate dim `r`:
         W1_b(W1_a(x))   instead of W1(x)
     Per-step recurrent state grows from 3 keys to 6 keys but each key is
@@ -848,7 +848,7 @@ class MemoryMLP(nn.Module):
     with bf16 state, `x` flows through this MLP in bf16, but
     `self.norm.weight` / `self.norm.bias` remain fp32 (they are
     outer-trained params that AdamW expects in fp32). We explicitly cast
-    through fp32 around the norm to unblock `state_dtype="bf16"` (G256).
+    through fp32 around the norm to unblock `state_dtype="bf16"`.
     """
 
     def __init__(self, d: int, expansion: int = 4, low_rank=None):
@@ -863,7 +863,7 @@ class MemoryMLP(nn.Module):
             self.W_gate = nn.Linear(d, h, bias=False)
             self.W2 = nn.Linear(h, d, bias=False)
         else:
-            # Low-rank factorization: each Wx becomes Wx_b @ Wx_a (G262).
+            # Low-rank factorization: each Wx becomes Wx_b @ Wx_a.
             # We use the suffix '_a' for the d->r (or h->r) projection and
             # '_b' for the r->h (or r->d) projection.
             r = int(low_rank)
@@ -886,7 +886,7 @@ class MemoryMLP(nn.Module):
             y = self.W2_b(self.W2_a(h))
         # Run LayerNorm in fp32 regardless of (x, W*) dtype; cast back to
         # match the input. Identity-cast is free in fp32, ~negligible in
-        # bf16, and unblocks `state_dtype="bf16"` mode (G256).
+        # bf16, and unblocks `state_dtype="bf16"` mode.
         orig_dtype = y.dtype
         y = self.norm(y.float()).to(orig_dtype)
         return y + x.to(orig_dtype)
@@ -895,7 +895,7 @@ class MemoryMLP(nn.Module):
 class NeuralMemoryModule(nn.Module):
     """Online memory module with surprise-driven weight updates.
 
-    The constructor wires together the components from docs/PLAN.md §1.2–§1.4:
+    The constructor wires together the components from docs/archive/PLAN.md §1.2–§1.4:
     Q/K/V projections, the three data-dependent update params, the
     MemoryMLP (whose W*.weight ARE the meta-learned initial state), and
     a learnable per-channel output scale.
@@ -947,7 +947,7 @@ class NeuralMemoryModule(nn.Module):
         if block_size < 1:
             raise ValueError(f"block_size must be >= 1 (got {block_size})")
         self.block_size = int(block_size)
-        # G267: per-token NS5 + per-token θ weighting in the blockwise path.
+        # per-token NS5 + per-token θ weighting in the blockwise path.
         # When True, paper Eq 16's `Σ_t θ_t · NS5(∇_t)` is implemented
         # exactly (instead of v1's `θ_mean · NS5(Σ_t ∇_t)`). Costs more
         # memory (per-token gradient tensors of shape [B, block, H, D]
@@ -955,20 +955,20 @@ class NeuralMemoryModule(nn.Module):
         # No-op when block_size=1 (single-token block has theta_mean = θ_t
         # and per-token NS5 = single NS5).
         self.per_token_ns5 = bool(per_token_ns5)
-        # G268: truncated BPTT — detach (M, S) at each block boundary in the
+        # truncated BPTT — detach (M, S) at each block boundary in the
         # blockwise path so the backward graph spans one block instead of the
         # full chunk. No-op when block_size=1 (only one block per chunk).
         self.detach_state_between_blocks = bool(detach_state_between_blocks)
-        # G269: predictive inner loss — use v_{t+1} as the target for token t
+        # predictive inner loss — use v_{t+1} as the target for token t
         # (next-token reconstruction) instead of v_t (same-token
         # reconstruction). Last token in chunk has no v_{t+1}; its inner-loss
         # contribution is dropped (the chunk-level helpers below produce
         # zero gradient for that position).
         self.lookahead_value = bool(lookahead_value)
-        # G270: per-state-key θ — W_theta projects to K independent scalars
+        # per-state-key θ — W_theta projects to K independent scalars
         # (one per recurrent weight key) instead of one shared scalar.
         self.per_param_lr_modulation = bool(per_param_lr_modulation)
-        # G272: order of the momentum recurrence (>=1). At N>1, S becomes a
+        # order of the momentum recurrence (>=1). At N>1, S becomes a
         # list of N momenta with their own η projections (W_eta gains N
         # output dims). M's update reads the deepest level (S_N).
         if momentum_order < 1:
@@ -1048,7 +1048,7 @@ class NeuralMemoryModule(nn.Module):
 
         # Per-token data-dependent update params (sigmoid+squeeze at call site).
         # W_theta output dim: 1 (default) or K = len(state_keys) when
-        # per_param_lr_modulation is True (G270). Resolve state_keys here
+        # per_param_lr_modulation is True. Resolve state_keys here
         # via memory_mlp's expected layout — we need this BEFORE building
         # memory_mlp itself, so derive it from `low_rank`.
         if self.per_param_lr_modulation:
@@ -1056,7 +1056,7 @@ class NeuralMemoryModule(nn.Module):
         else:
             n_theta = 1
         self.W_theta = nn.Linear(n_embd, n_theta, bias=False)
-        # W_eta output dim: 1 (default) or momentum_order N (G272). Each
+        # W_eta output dim: 1 (default) or momentum_order N. Each
         # level of the momentum stack uses an independently-learned η.
         self.W_eta = nn.Linear(n_embd, self.momentum_order, bias=False)
         self.W_alpha = nn.Linear(n_embd, 1, bias=False)
@@ -1153,13 +1153,13 @@ class NeuralMemoryModule(nn.Module):
         if self.momentum_order == 1:
             S = {k: torch.zeros_like(v) for k, v in M.items()}
         else:
-            # G272: N-th order momentum -> N independent zero-initialized
+            # N-th order momentum -> N independent zero-initialized
             # S levels.
             S = tuple(
                 {k: torch.zeros_like(v) for k, v in M.items()}
                 for _ in range(self.momentum_order)
             )
-        # G275 int8 state: quantize both M and S immediately on construction
+        # int8 state: quantize both M and S immediately on construction
         # so the returned state is in int8 form (with _qs scale companions
         # alongside the value entries in the dict). For a zero S the scale
         # clamp gives a tiny non-zero scale and all int8 values are 0 —
@@ -1427,7 +1427,7 @@ class NeuralMemoryModule(nn.Module):
         low-rank). Variable-arity is required because `torch.utils.checkpoint`
         doesn't pass kwargs to the wrapped callable; the alternative is
         K hard-coded argument names, which would tie this method to
-        full-rank shape only (G262).
+        full-rank shape only.
 
         `db_seg` is the [B, T_seg] bool mask of document boundaries for
         this segment (or None). When a boundary fires, the corresponding
@@ -1557,7 +1557,7 @@ class NeuralMemoryModule(nn.Module):
                 "per_sample_grad_fn's reduction is locked at __init__; "
                 "rebuild the module to change spectral_norm."
             )
-        # G275: int8 state is supported ONLY by the blockwise path.
+        # int8 state is supported ONLY by the blockwise path.
         if self.int8_state:
             raise NotImplementedError(
                 "nmm_state_dtype='int8' is supported only by the blockwise "
@@ -1610,7 +1610,7 @@ class NeuralMemoryModule(nn.Module):
             eta_chunk = eta_chunk.to(self.state_dtype)
             alpha_chunk = alpha_chunk.to(self.state_dtype)
 
-        # G269 lookahead-value: target for token t becomes v_{t+1}. Last
+        # lookahead-value: target for token t becomes v_{t+1}. Last
         # token's θ is zeroed (no v_T+1 within chunk) — the M update at
         # that step is just (1-α)·M decay.
         if self.lookahead_value:
@@ -1679,7 +1679,7 @@ class NeuralMemoryModule(nn.Module):
         state_in: tuple,
         doc_boundaries,
     ) -> tuple:
-        """Chunk-as-update path (G266 — lucidrains-style aggregation).
+        """Chunk-as-update path (lucidrains-style aggregation).
 
         Within each block of `self.block_size` tokens, ONE memory update is
         produced from the aggregate per-block gradient (sum of per-token
@@ -1754,7 +1754,7 @@ class NeuralMemoryModule(nn.Module):
             eta_chunk = eta_chunk.to(self.state_dtype)
             alpha_chunk = alpha_chunk.to(self.state_dtype)
 
-        # G269: shift v left by 1, zero θ at the last position. With theta
+        # shift v left by 1, zero θ at the last position. With theta
         # carrying the last n_theta dim, the helper still works — it
         # slices on the T (dim 1) only.
         if self.lookahead_value:
@@ -1767,7 +1767,7 @@ class NeuralMemoryModule(nn.Module):
 
         # M, S, conv_buf were unpacked at the top of this function.
         N = self.momentum_order
-        # G275 int8 state: dequantize on entry. Within the block the math
+        # int8 state: dequantize on entry. Within the block the math
         # runs in the standard state_dtype (fp32 here); at chunk end we
         # requantize before returning.
         was_int8 = self.int8_state and (
@@ -1831,7 +1831,7 @@ class NeuralMemoryModule(nn.Module):
             for s in range(sub_s, sub_e, self.block_size):
                 e = min(s + self.block_size, sub_e)
 
-                # G268 truncated BPTT — detach at every block boundary
+                # truncated BPTT — detach at every block boundary
                 # across the whole chunk. Redundant right after a reset
                 # (init_M is already detached) but harmless.
                 if self.detach_state_between_blocks and s > 0:
@@ -1879,7 +1879,7 @@ class NeuralMemoryModule(nn.Module):
                     theta_per_token = theta_chunk_slice.squeeze(-1)   # [B, block]
 
                 if self.per_token_ns5:
-                    # G267 paper-faithful: per-token NS5 then per-token θ
+                    # paper-faithful: per-token NS5 then per-token θ
                     # weighting then sum. Matches paper Eq 16's
                     # `Σ_t θ_t · NS5(∇_t)`.
                     per_token_grad = _fused.analytical_per_token_grad(
@@ -1958,7 +1958,7 @@ class NeuralMemoryModule(nn.Module):
                 y_blocks.append(y_blk)
 
         y_chunk = torch.cat(y_blocks, dim=1)
-        # G275: requantize before returning so the caller-visible state
+        # requantize before returning so the caller-visible state
         # is in int8 form again.
         if was_int8:
             M = _quant_dict(M, self.state_keys)
@@ -1973,7 +1973,7 @@ class NeuralMemoryModule(nn.Module):
 
         Priority:
           1. **Blockwise** when `block_size > 1` — chunk-as-update path
-             (G266). TC-engaged, sequential between blocks. Approximate at
+. TC-engaged, sequential between blocks. Approximate at
              block_size > 1; bit-equivalent to sequential at block_size=1
              (but using analytical-grad ops instead of `torch.func.grad`).
           2. **Sequential** otherwise — paper-strict per-token recurrence.
@@ -2064,7 +2064,7 @@ class MultiHeadNMM(nn.Module):
             )
             for _ in range(n_heads)
         ])
-        # G271: per_head_learned_params=False — point every head's MemoryMLP
+        # per_head_learned_params=False — point every head's MemoryMLP
         # at the SAME nn.Module instance so the recurrent weight inits are
         # shared. Per-head LayerNorm / out_scale / Q/K/V projections /
         # update-param Linears all remain head-private. State (M, S) per-head

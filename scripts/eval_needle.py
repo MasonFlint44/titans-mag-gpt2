@@ -239,13 +239,13 @@ def _load_model(checkpoint_path: Path, device: torch.device):
     `_unwrap` (strips torch.compile/DDP prefixes)."""
     from model.titans_gpt2 import TitansMAGGPT2
     from model import _unwrap
-    from train import load_checkpoint
+    from cli.train import load_checkpoint
 
     ckpt = load_checkpoint(checkpoint_path, device=device)
     if "config" not in ckpt:
         raise SystemExit(
             f"Checkpoint {checkpoint_path} lacks a 'config' key. "
-            f"Pass a checkpoint saved by `save_checkpoint` from train.py."
+            f"Pass a checkpoint saved by `save_checkpoint` from cli.train.py."
         )
     config = TitansConfig.from_dict(ckpt["config"])
     model = TitansMAGGPT2(config).to(device)

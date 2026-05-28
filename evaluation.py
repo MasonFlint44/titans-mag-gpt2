@@ -16,7 +16,7 @@ def perplexity(model, loader, device: torch.device) -> float:
     average. NMM state carries across the loader (the loader provides
     `doc_boundaries`; the NMM resets at each one).
 
-    Mode captured-and-restored via try/finally (G161). Wrapped in
+    Mode captured-and-restored via try/finally. Wrapped in
     @torch.no_grad to keep the chunked-forward + torch.func.grad graph
     from being built — eval otherwise OOMs at 5-10x training memory.
     """
@@ -71,7 +71,7 @@ def needle_in_haystack(
     via `step_with_conv` (matching training-time semantics) and one
     attention pass via KV cache.
 
-    Mode captured-and-restored via try/finally (G161).
+    Mode captured-and-restored via try/finally.
     """
     was_training = model.training
     model.eval()
@@ -90,7 +90,7 @@ def needle_in_haystack(
         prompt_len = ids.size(1)
         n_decode = len(tokenizer.encode(secret)) + 4
 
-        # Single call handles both short and long prompts (G249). Long
+        # Single call handles both short and long prompts. Long
         # prompts get a chunked-warm-up + tail prepare_decode internally;
         # the resulting cache's `position` lands at block_size, so we cap
         # decode at 1 token in that branch (anything further would need
@@ -178,7 +178,7 @@ def needle_in_haystack_sweep(
     intended for trained-checkpoint evaluation. See TEST_PLAN §10.
 
     Mode is captured-and-restored by the per-pair `needle_in_haystack`
-    call (G161); this function adds no additional mode mutation.
+    call; this function adds no additional mode mutation.
     """
     rng = random.Random(seed)
 

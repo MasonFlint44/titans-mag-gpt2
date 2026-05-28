@@ -12,11 +12,9 @@ on conventions, commands, and traps when making changes.
 - `docs/CONFIG_REFERENCE.md` — every CLI / config knob, its range, defaults,
   and speed/memory tradeoff.
 - `docs/RUNBOOK.md` — symptom → cause table for training failures.
-- `docs/GAP_HISTORY.md` — chronological audit log of bugs found (gap IDs
-  like `G226`, `G277` are referenced from code comments).
 
-When the user mentions a `Gxxx` identifier, look it up in `GAP_HISTORY.md`.
-Code comments cite these — keep that convention when adding new safeguards.
+`docs/archive/` holds the original implementation plan and gap-history audit
+log from the bootstrap phase. Read-only history — don't update or extend it.
 
 ## Layout
 
@@ -25,11 +23,15 @@ Code comments cite these — keep that convention when adding new safeguards.
 | `model/nmm.py` | Neural Memory Module — inner gradient + NS5 normalization. The most complex file in the repo (~1900 lines). Three NS5 variants live here: stock, CANS-stationary, and gram-iteration (`gram_newton_schulz`). |
 | `model/block.py` | MAG block: attention + NMM + learnable gate. |
 | `model/titans_gpt2.py` | Top-level model wrapping HF GPT-2 backbone + MAG blocks. |
+| `model/state_io.py` | NMM state save/load for persistent generate sessions. |
 | `config.py` | `TitansConfig` dataclass — factory methods `gpt2_small/medium/large/xl`. Validation lives here too. |
-| `train.py` | Multi-GPU training loop (DDP) + `run_training`, `build_optimizer`, `save_checkpoint`, `load_checkpoint`. |
-| `scripts/finetune.py` | Single-GPU finetune entry point — wraps `train.py`'s loop with HF pretrained loading. |
-| `scripts/_nmm_cli.py` | Shared `--nmm-*` argparse definitions for both `train.py` and `finetune.py`. |
+| `evaluation.py` | Perplexity + needle-in-haystack helpers (importable library). |
+| `cli/train.py` | Multi-GPU training loop (DDP) + `run_training`, `build_optimizer`, `save_checkpoint`, `load_checkpoint`. |
+| `cli/finetune.py` | Single-GPU finetune entry point — wraps `cli/train.py`'s loop with HF pretrained loading. |
+| `cli/generate.py` | Cached autoregressive sampling CLI + interactive REPL. |
+| `cli/nmm_cli.py` | Shared `--nmm-*` argparse definitions for both `cli/train.py` and `cli/finetune.py`. |
 | `data/` | Tokenizer (tiktoken GPT-2), streaming dataloader, doc-boundary tracking. |
+| `scripts/` | Experiment scripts: corpus prep, eval CLIs, benchmarks, profiling. NOT library code. |
 | `tests/{unit,integration,parity,ddp,performance,behavior,failure_modes}/` | See `docs/TEST_PLAN.md` for tier definitions. |
 
 ## Commands
@@ -63,7 +65,7 @@ Pytest markers: `slow`, `gpu`, `slow_gpu`, `ddp`, `compile`, `perf`. See
 backend toggles and `--compile-model --optim8bit`:
 
 ```bash
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python scripts/finetune.py \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python cli/finetune.py \
     --size small --data corpus.txt \
     --nmm-block-size 64 \
     --nmm-state-dtype bf16 \
@@ -87,14 +89,14 @@ override.
   *can* be overridden on resume — currently `nmm_use_gram_ns5`, `nmm_use_cans`,
   `nmm_ns5_steps`. These swap the NS5 implementation without touching any
   saved weight. Add new backend-only NMM toggles to that frozenset; both
-  `train.py` and `scripts/finetune.py` import from it.
+  `train.py` and `cli/finetune.py` import from it.
 - Scaffolding flags (`--max-steps`, `--save-dir`, `--grad-accum`,
   `--batch-size`, warmup, save-every) are **not** overridden — the user
   controls them. They're persisted in the checkpoint under `training_args`
   (see `SAVED_TRAINING_ARGS` in `train.py`), and on resume the loader warns
   if the CLI value disagrees with what was saved. Defaults match the
   documented recipe so a bare `--resume-from` is a no-warning resume.
-- `train.py` and `scripts/finetune.py` share the resume helpers
+- `train.py` and `cli/finetune.py` share the resume helpers
   (`apply_resume_overrides_and_warn`, `warn_training_arg_drift`,
   `config_size_label`, `training_args_from_namespace`) so the two entry
   points are behaviorally identical on resume. Don't fork them.
@@ -106,7 +108,7 @@ NMM gradient, selected by mutually exclusive CLI flags:
 
 | Variant | Flag | When to pick it |
 |---|---|---|
-| Stock NS5 | (default) | Paper-faithful; fp32 invariant (G226). |
+| Stock NS5 | (default) | Paper-faithful; fp32 invariant. |
 | CANS-stationary | `--nmm-use-cans` | 3 steps, fp32, Chebyshev coefficients. Better orthogonalization, slower. |
 | Gram-iteration | `--nmm-use-gram-ns5` | POLAR_EXPRESS coefficients + reset at iter 2. fp16 inner loop with `torch.baddbmm` fusion. Fastest of the three. |
 
@@ -117,15 +119,13 @@ external `gram_ns5` package back as a dependency.
 
 ## Conventions
 
-- Comments tag gap-driven safeguards by ID: `# G226 — fp32 NS5 invariant`.
-  Keep this format when adding new ones; cross-reference in `GAP_HISTORY.md`.
 - `_unwrap(state_dict)` in `model/__init__.py` strips both `_orig_mod.`
   (torch.compile) and `module.` (DDP) prefixes. Always use it when loading
   checkpoints across compiled / DDP / plain runs.
 - Inner-loop NS5 must run in fp32 *or* the dedicated fp16 path (gram only).
   Letting bf16 autocast leak into NS5 silently produces NaN loss after a few
   steps (`docs/RUNBOOK.md §NaN loss`).
-- `finetune_mode=True` (default for `scripts/finetune.py`) uses an additive
+- `finetune_mode=True` (default for `cli/finetune.py`) uses an additive
   gate with `out_scale=0` so initial logits match HF GPT-2 exactly. `train.py`
   hard-codes `finetune_mode=False` for from-scratch with the paper's
   multiplicative gate.
@@ -136,7 +136,7 @@ external `gram_ns5` package back as a dependency.
 
 ## Things that are not bugs
 
-- `out_scale=0` at finetune init is deliberate (G279). Don't "fix" the zero.
+- `out_scale=0` at finetune init is deliberate. Don't "fix" the zero.
 - The NMM keeps updating during `generate.py` even under `torch.no_grad()` —
   `torch.func.grad` is independent of the no-grad context. This is the whole
   TITANS premise.

@@ -1,4 +1,4 @@
-"""Tests for the chunk-as-update / blockwise NMM path (G266)."""
+"""Tests for the chunk-as-update / blockwise NMM path."""
 import pytest
 import torch
 import torch.nn.functional as F
@@ -376,7 +376,7 @@ def test_per_token_ns5_matches_paper_eq16_formula():
         n_embd=d, expansion=2, kernel_size=2,
         spectral_norm=True, finetune_mode=False,
         block_size=T,            # one block spanning the chunk
-        per_token_ns5=True,      # G267 paper-faithful
+        per_token_ns5=True,      # paper-faithful
     )
     x = torch.randn(B, T, d) * 0.3
     s0 = nmm.init_state(B, x.device)
@@ -511,7 +511,7 @@ def test_per_token_ns5_theta_actually_has_effect():
         {k: v.clone() for k, v in s0[2].items()}),
         None,
     )
-    # G267 vs v1 should give different outputs (different θ-weighting
+    # vs v1 should give different outputs (different θ-weighting
     # scheme). If they're identical, the refinement is a no-op = bug.
     assert not torch.allclose(y_a, y_v1, atol=1e-3, rtol=1e-3), (
         "per_token_ns5=True produced same output as per_token_ns5=False — "
@@ -576,7 +576,7 @@ def test_dispatcher_uses_sequential_when_block_size_is_1():
 
 
 # ---------------------------------------------------------------------------
-# Tier 1: nmm_detach_state_between_blocks (G268 — truncated BPTT)
+# Tier 1: nmm_detach_state_between_blocks (truncated BPTT)
 # ---------------------------------------------------------------------------
 
 
@@ -791,7 +791,7 @@ def test_detach_state_between_blocks_zero_grad_on_state_in():
 
 
 # ---------------------------------------------------------------------------
-# Tier 2a: nmm_lookahead_value (G269)
+# Tier 2a: nmm_lookahead_value
 # ---------------------------------------------------------------------------
 
 
@@ -923,7 +923,7 @@ def test_lookahead_value_grads_finite():
 
 
 # ---------------------------------------------------------------------------
-# Tier 2b: nmm_per_param_lr_modulation (G270)
+# Tier 2b: nmm_per_param_lr_modulation
 # ---------------------------------------------------------------------------
 
 
@@ -1048,7 +1048,7 @@ def test_per_param_lr_backward_propagates():
 
 
 # ---------------------------------------------------------------------------
-# Tier 3a: nmm_per_head_learned_params (G271)
+# Tier 3a: nmm_per_head_learned_params
 # ---------------------------------------------------------------------------
 
 
@@ -1135,7 +1135,7 @@ def test_shared_memory_mlp_grad_flows_to_shared_weights():
 
 
 # ---------------------------------------------------------------------------
-# Tier 3b: nmm_momentum_order (G272)
+# Tier 3b: nmm_momentum_order
 # ---------------------------------------------------------------------------
 
 
@@ -1385,7 +1385,7 @@ def test_gram_ns5_produces_spectrally_normalized_output():
 
 
 # ---------------------------------------------------------------------------
-# #2: nmm_state_dtype='int8' (G275)
+# #2: nmm_state_dtype='int8'
 # ---------------------------------------------------------------------------
 
 

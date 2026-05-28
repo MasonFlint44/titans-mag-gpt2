@@ -56,7 +56,7 @@ def test_no_mask_attends_to_all_positions():
 
 
 # ---------------------------------------------------------------------------
-# G220 — ValueError (not AssertionError) for bad dims, survives -O
+# ValueError (not AssertionError) for bad dims, survives -O
 # ---------------------------------------------------------------------------
 
 def test_rejects_n_head_not_dividing_n_embd_via_ValueError():
@@ -65,7 +65,7 @@ def test_rejects_n_head_not_dividing_n_embd_via_ValueError():
 
 
 def test_attention_validation_survives_python_O():
-    """G220: must use raise ValueError, not assert — survives -O strip."""
+    """must use raise ValueError, not assert — survives -O strip."""
     result = subprocess.run(
         [
             sys.executable, "-O", "-c",

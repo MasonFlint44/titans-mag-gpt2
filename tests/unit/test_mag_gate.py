@@ -45,7 +45,7 @@ def test_gates_init_to_ones():
 
 
 def test_finetune_additive_gate_at_init_equals_y_attn_exactly():
-    """G123 closing test: at finetune init, out_scale=0 -> y_mem=0 -> o = y_attn.
+    """closing test: at finetune init, out_scale=0 -> y_mem=0 -> o = y_attn.
     Verified end-to-end by comparing the additive gate's output to the attention
     output alone for a one-block forward."""
     block = TitansMAGBlock(_cfg(finetune_mode=True))

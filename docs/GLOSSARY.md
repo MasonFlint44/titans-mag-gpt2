@@ -36,7 +36,7 @@ Terms used across this codebase, in roughly conceptual order (foundations → va
 
 **ResidualNorm.** `norm(W2·h) + x` — applies LayerNorm to the W2 output then adds the residual. Stabilizes memory output scale (from lucidrains; not in paper).
 
-**`out_scale`.** Learnable `[d_model]` parameter multiplied element-wise onto the NMM output. Init = zeros when `finetune_mode=True` (so memory contribution starts at zero exactly), ones when `False`. The only reliable way to silence the NMM at fine-tune init given that ResidualNorm passes `x` through even when `W2≈0` (G123).
+**`out_scale`.** Learnable `[d_model]` parameter multiplied element-wise onto the NMM output. Init = zeros when `finetune_mode=True` (so memory contribution starts at zero exactly), ones when `False`. The only reliable way to silence the NMM at fine-tune init given that ResidualNorm passes `x` through even when `W2≈0`.
 
 **`θ_t, η_t, α_t`.** Per-token data-dependent scalars produced by three `Linear(d_model, 1)` projections of the input token:
 - `θ_t = sigmoid(W_θ · x_t)` — inner-loop learning rate
@@ -53,7 +53,7 @@ Per paper §3.2 ("functions of tokens"). All three are scalars `[B, T]` (not per
 
 ## Update rule details
 
-**Newton-Schulz spectral normalization (NS5).** Five-step iteration that drives a matrix's singular values toward 1 (spectral norm ≈ 1). Applied to the per-token gradient `g_t` to prevent inner-loop blow-up. Must run in fp32 with autocast disabled (G226). Transpose tall matrices before iteration, back after (G198) — NS converges on wide (cols ≥ rows) matrices.
+**Newton-Schulz spectral normalization (NS5).** Five-step iteration that drives a matrix's singular values toward 1 (spectral norm ≈ 1). Applied to the per-token gradient `g_t` to prevent inner-loop blow-up. Must run in fp32 with autocast disabled. Transpose tall matrices before iteration, back after — NS converges on wide (cols ≥ rows) matrices.
 
 **Write-then-read.** Retrieval ordering: update `M_{t-1} → M_t` first, then read `y_t = MemoryMLP(M_t; q̂_t)`. The current token's query sees the freshly-updated memory. Contrast with read-then-write (`y_t = MemoryMLP(M_{t-1}; q̂_t)`, paper Eq. 15) — both are valid; we follow lucidrains for marginally better behavior on associative recall tasks.
 
@@ -67,7 +67,7 @@ Per paper §3.2 ("functions of tokens"). All three are scalars `[B, T]` (not per
 
 **TBPTT (Truncated BackPropagation Through Time).** Standard technique for training recurrent models: process a long sequence in chunks, backprop within each chunk, **detach** the state between chunks to bound the graph. Without detach, every chunk extends the autograd graph and memory blows up linearly.
 
-**`detach_states`.** Method that calls `.detach()` on every leaf of the nested `(M, S, conv_buf)` state. Called between TBPTT chunks. Must handle `state=None` (G149).
+**`detach_states`.** Method that calls `.detach()` on every leaf of the nested `(M, S, conv_buf)` state. Called between TBPTT chunks. Must handle `state=None`.
 
 **`chunk_size`.** Length of one TBPTT chunk. Bounded by `block_size` (GPT-2 position embedding table covers 0..1023). Positions reset to 0 at each chunk boundary; cross-chunk context lives in the NMM state, not in the attention.
 
@@ -75,19 +75,19 @@ Per paper §3.2 ("functions of tokens"). All three are scalars `[B, T]` (not per
 
 **`ParallelStreamLoader`.** Our TBPTT-aware data loader. Maintains B independent sub-streams; position `i` of every batch in a row continues the same document stream across calls. A naive `DataLoader(shuffle=False)` does NOT give this property — see `diagrams/data_pipeline.mmd`.
 
-**Gradient accumulation.** Compute K micro-batches of gradients, all-reduce once, optimizer step once. Under DDP, the first K-1 micro-batches run inside `model.no_sync()` to suppress all-reduce; the final one triggers the all-reduce (G200).
+**Gradient accumulation.** Compute K micro-batches of gradients, all-reduce once, optimizer step once. Under DDP, the first K-1 micro-batches run inside `model.no_sync()` to suppress all-reduce; the final one triggers the all-reduce.
 
 **`no_sync()`.** PyTorch DDP context manager that disables gradient all-reduce on backward. Used during gradient accumulation to defer sync to the last micro-batch.
 
-**Partial cycle.** When `next(loader)` raises `StopIteration` mid-accumulation. The skip condition must be `(batch is None) and (accum_i > 0)`, NOT `accum_i < ACCUM_STEPS - 1` (G222) — the latter silently desyncs ranks.
+**Partial cycle.** When `next(loader)` raises `StopIteration` mid-accumulation. The skip condition must be `(batch is None) and (accum_i > 0)`, NOT `accum_i < ACCUM_STEPS - 1` — the latter silently desyncs ranks.
 
 ---
 
 ## Precision and numerical
 
-**bf16 autocast.** PyTorch mixed-precision context: forward ops run in bfloat16, backward and optimizer in fp32. Wraps the *forward* pass only; backward + clip + step must run in fp32 (G159).
+**bf16 autocast.** PyTorch mixed-precision context: forward ops run in bfloat16, backward and optimizer in fp32. Wraps the *forward* pass only; backward + clip + step must run in fp32.
 
-**Autocast leakage.** When `.float()` inside an `autocast(enabled=True)` region is silently undone — matmul inputs get re-cast to bf16. Fix: wrap the explicitly-fp32 block in `autocast(enabled=False)` (G226). This is the single most common silent killer in the inner loop.
+**Autocast leakage.** When `.float()` inside an `autocast(enabled=True)` region is silently undone — matmul inputs get re-cast to bf16. Fix: wrap the explicitly-fp32 block in `autocast(enabled=False)`. This is the single most common silent killer in the inner loop.
 
 **`fp32 master weights`.** Optimizer keeps fp32 copies of the parameters; the bf16 cast is only for the forward computation. Standard mixed-precision training pattern.
 
@@ -99,7 +99,7 @@ Per paper §3.2 ("functions of tokens"). All three are scalars `[B, T]` (not per
 
 **KV cache.** Standard attention key/value cache for autoregressive generation. Captured by `CausalSelfAttention.project_kv` during warm-up (length `N_p + T_prompt`, includes persistent prefix); extended one token at a time by `forward_with_kv_cache`. Separate from NMM state.
 
-**Cached decode.** The production generation pipeline: `model.prepare_decode(prompt)` warms up + captures `(k_cache, v_cache)` per block; the NMM conv buffer threads through `cache["nmm_states"]` automatically (item 6, no longer a separate cache field). `model.forward_step(token, cache)` per decoded token gets exactly one NMM update via `step_with_conv` and one attention pass via KV cache. Replaces the v1 sliding-window pattern that re-fed the entire `block_size` window through the NMM at every decoded token. See `eval.py:needle_in_haystack`, `generate.py`.
+**Cached decode.** The production generation pipeline: `model.prepare_decode(prompt)` warms up + captures `(k_cache, v_cache)` per block; the NMM conv buffer threads through `cache["nmm_states"]` automatically (item 6, no longer a separate cache field). `model.forward_step(token, cache)` per decoded token gets exactly one NMM update via `step_with_conv` and one attention pass via KV cache. Replaces the v1 sliding-window pattern that re-fed the entire `block_size` window through the NMM at every decoded token. See `evaluation.py:needle_in_haystack`, `generate.py`.
 
 **Sliding window context strategy.** For generation past `block_size`, slide the attention window but keep the NMM state continuous. The NMM provides the long-range memory; attention covers local context. In v2 with Option B, `generate.py`'s long-prompt path chunks the prefix through `forward()` (NMM state threads) and calls `prepare_decode(tail, initial_nmm_states=...)` on the last `block_size` tokens.
 
@@ -109,7 +109,7 @@ Per paper §3.2 ("functions of tokens"). All three are scalars `[B, T]` (not per
 
 **4-group optimizer.** Params split into four groups: `gpt2_decay`, `gpt2_no_decay`, `nmm_decay`, `nmm_no_decay`. NMM groups use 3× the GPT-2 LR (paper ratio). `out_scale`, `gamma_*`, `persistent_mem` are no-decay (decay would shrink them toward zero).
 
-**`base_lrs`.** The peak learning rates per group, fed to `apply_lr` to compute the scheduled LR. **Must come from code-level constants, not from `optimizer.param_groups[i]['lr']`** — the latter compounds LR deflation across resumes (G162).
+**`base_lrs`.** The peak learning rates per group, fed to `apply_lr` to compute the scheduled LR. **Must come from code-level constants, not from `optimizer.param_groups[i]['lr']`** — the latter compounds LR deflation across resumes.
 
 **Cosine schedule with warmup.** Linear warmup for `warmup_steps`, then cosine decay to `min_ratio × peak` over `max_steps - warmup_steps`. Standard for transformer training.
 
@@ -123,13 +123,11 @@ Per paper §3.2 ("functions of tokens"). All three are scalars `[B, T]` (not per
 
 **All-reduce.** Collective operation that sums gradients across ranks and broadcasts the result. Triggered automatically by DDP on `loss.backward()` unless inside `no_sync()`.
 
-**Per-rank seed.** Each rank gets a different RNG seed (typically `base_seed + rank`) **set after model construction** so the model is identical across ranks but dropout masks diverge (G204).
+**Per-rank seed.** Each rank gets a different RNG seed (typically `base_seed + rank`) **set after model construction** so the model is identical across ranks but dropout masks diverge.
 
 ---
 
 ## Implementation references
-
-**G-number (Gnnn).** Audit gap identifier — e.g., G226 is the bf16-autocast leakage gap. See `GAP_HISTORY.md` for the full incident description, root cause, and fix.
 
 **lucidrains/titans-pytorch.** Reference implementation by Phil Wang. Has many enhancements beyond the paper (spectral norm, `torch.func.grad`, ResidualNorm). **We do NOT depend on it as a runtime dependency** — implement from scratch, reference only.
 

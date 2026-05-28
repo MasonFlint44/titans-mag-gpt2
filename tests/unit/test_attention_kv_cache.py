@@ -143,11 +143,11 @@ def test_cached_forward_rejects_multi_token_x():
 
 
 # ---------------------------------------------------------------------------
-# SWA at decode (G238)
+# SWA at decode
 # ---------------------------------------------------------------------------
 
 def test_cached_forward_swa_masks_far_past_real_positions():
-    """G238 — with swa_window set, the new token must NOT attend to real
+    """with swa_window set, the new token must NOT attend to real
     positions farther back than swa_window. The persistent prefix is
     always visible.
 
@@ -269,7 +269,7 @@ def test_cached_forward_swa_persistent_prefix_always_visible():
 
 
 # ---------------------------------------------------------------------------
-# G279: int8 KV cache for decode
+# int8 KV cache for decode
 # ---------------------------------------------------------------------------
 
 

@@ -1,4 +1,4 @@
-"""Shared CLI helper: NMM perf knobs for train.py / scripts/finetune.py.
+"""Shared CLI helper: NMM perf knobs for train.py / cli/finetune.py.
 
 Registers `--nmm-*` flags on an `argparse.ArgumentParser` and converts the
 parsed namespace into a kwargs dict ready to splat into a `TitansConfig`

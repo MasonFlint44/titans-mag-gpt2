@@ -28,7 +28,7 @@ _HF_GPT2_NAMES = {
 def load_pretrained(model, config) -> None:
     """Overwrite `model`'s backbone params from HF GPT-2; NMM params untouched.
 
-    Selects the HF checkpoint by `config.n_embd` (G216) — hard-coding the small
+    Selects the HF checkpoint by `config.n_embd` — hard-coding the small
     variant would silently shape-mismatch with medium/large/xl configs.
 
     Args:

@@ -1,4 +1,4 @@
-"""Tests for scripts.nmm_state_io — persistent NMM state across generate calls.
+"""Tests for model.state_io — persistent NMM state across generate calls.
 
 Covers:
 - Round-trip: save state, load it, tensor values match.
@@ -19,7 +19,7 @@ import torch
 
 from config import TitansConfig
 from model.titans_gpt2 import TitansMAGGPT2
-from scripts.nmm_state_io import (
+from model.state_io import (
     StateConfigMismatch, load_nmm_state, save_nmm_state, _fingerprint,
 )
 
@@ -260,7 +260,7 @@ def _real_vocab_cfg(**overrides):
 def test_generate_with_state_returns_state_with_correct_structure():
     """`generate_with_state` must return a 2-tuple (text, state) where state
     is the same shape as `forward()`'s output (one (M, S) per layer)."""
-    from generate import generate_with_state
+    from cli.generate import generate_with_state
     cfg = _real_vocab_cfg()
     model = TitansMAGGPT2(cfg).eval()
     text, state = generate_with_state(
@@ -280,7 +280,7 @@ def test_generate_with_state_session_continuity():
     """End-to-end smoke: thread NMM state from one generate call into the
     next. Both turns must run cleanly without error; deeper state-propagation
     proof is in test_prepare_decode_chunked_honors_initial_nmm_states."""
-    from generate import generate_with_state
+    from cli.generate import generate_with_state
     cfg = _real_vocab_cfg()
     torch.manual_seed(0)
     model = TitansMAGGPT2(cfg).eval()

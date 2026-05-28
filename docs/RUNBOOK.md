@@ -1,6 +1,6 @@
 # Runbook — When Training Breaks
 
-Operational guide for diagnosing and recovering from common failures. Each section names the symptom, the most likely root cause, the verification step, and the fix. Gap IDs (Gnnn) link to `GAP_HISTORY.md` for the original incident.
+Operational guide for diagnosing and recovering from common failures. Each section names the symptom, the most likely root cause, the verification step, and the fix.
 
 When in doubt: read **§ First moves** first.
 
@@ -33,21 +33,21 @@ if not torch.isfinite(loss):
 
 ### Most likely causes (in order)
 
-1. **Newton-Schulz overflow under bf16 autocast (G226).** The single most common silent killer. `.float()` inside the NS5 iteration is *not enough* — ambient `autocast` re-casts matmul inputs to bf16. Wrap the iteration in `torch.amp.autocast(device_type=device.type, enabled=False)`.
+1. **Newton-Schulz overflow under bf16 autocast.** The single most common silent killer. `.float()` inside the NS5 iteration is *not enough* — ambient `autocast` re-casts matmul inputs to bf16. Wrap the iteration in `torch.amp.autocast(device_type=device.type, enabled=False)`.
 
    **Verify:** put a `print(G.dtype)` inside the iteration. If it says `bfloat16`, that's it.
 
-2. **`θ_t` applied pre-NS (G140).** NS divides by the Frobenius norm — pre-scaling by θ cancels exactly. Then S has no LR control and blows up.
+2. **`θ_t` applied pre-NS.** NS divides by the Frobenius norm — pre-scaling by θ cancels exactly. Then S has no LR control and blows up.
 
    **Verify:** Read the NMM step code. The order must be `g̃ = NS(g); S = η·S - θ·g̃` — NOT `g̃ = NS(θ·g)` or `g = θ·∇ℓ; g̃ = NS(g)`.
 
-3. **Inner-loss reduction mismatched with `nmm_spectral_norm` (G160).** If `nmm_spectral_norm=False` and reduction is still `'sum'`, gradients are `d_model×` too large. See `CONFIG_REFERENCE.md` — flip both together.
+3. **Inner-loss reduction mismatched with `nmm_spectral_norm`.** If `nmm_spectral_norm=False` and reduction is still `'sum'`, gradients are `d_model×` too large. See `CONFIG_REFERENCE.md` — flip both together.
 
-4. **Backward in bf16 (G159).** Backward + clip + step must run in fp32 even under bf16 autocast. The forward exits the autocast context before `loss.backward()`.
+4. **Backward in bf16.** Backward + clip + step must run in fp32 even under bf16 autocast. The forward exits the autocast context before `loss.backward()`.
 
 ### Recovery (in-loop)
 
-`train_step` should already have the NaN-skip path (G213, G217):
+`train_step` should already have the NaN-skip path:
 
 ```python
 if not torch.isfinite(loss):
@@ -55,7 +55,7 @@ if not torch.isfinite(loss):
     return loss, None, None        # caller re-initializes nmm_states
 ```
 
-The caller MUST reset `nmm_states` to `None` after a NaN — otherwise the corrupted state persists and the next step NaNs again immediately. Also reset in the DDP accumulation block (G217).
+The caller MUST reset `nmm_states` to `None` after a NaN — otherwise the corrupted state persists and the next step NaNs again immediately. Also reset in the DDP accumulation block.
 
 ### Recovery (post-mortem)
 
@@ -88,7 +88,7 @@ print(diff)                      # must be < 1e-4
 
 3. **`N_p ≠ 0` for the parity test.** Persistent tokens change the attention mask shape. Set `nmm_n_persistent=0` for parity.
 
-4. **HF model name mismatch.** `n_embd=768` must pull `openai-community/gpt2` (small), not `gpt2-medium`. Derive from `n_embd`, not a hardcoded string (G216).
+4. **HF model name mismatch.** `n_embd=768` must pull `openai-community/gpt2` (small), not `gpt2-medium`. Derive from `n_embd`, not a hardcoded string.
 
 5. **wte/lm_head tie missing.** `lm_head = wte.weight.T`. Without the tie, the head is random init and logits diverge instantly.
 
@@ -105,18 +105,18 @@ Patch the specific transpose / tie / scale, re-run the parity test. Add it to CI
 
 ### Most likely causes
 
-1. **Missing `model.no_sync()` during gradient accumulation (G200).** Without it, all-reduce fires on every micro-batch and ranks desync.
+1. **Missing `model.no_sync()` during gradient accumulation.** Without it, all-reduce fires on every micro-batch and ranks desync.
 
-2. **Partial-cycle off-by-one (G222).** The check must be:
+2. **Partial-cycle off-by-one.** The check must be:
    ```python
    is_partial_cycle = (batch is None) and (accum_i > 0)
    # NOT: accum_i < ACCUM_STEPS - 1
    ```
    When `StopIteration` fires at iteration `K-1`, the off-by-one version routes one rank into the no_sync branch while the other does not → all-reduce mismatch → hang.
 
-3. **Per-rank seed identical** (G204 inverse). If ranks have the same seed, dropout masks are identical and there's nothing to all-reduce — looks like a hang but is actually working. **Verify by checking gradient diversity across ranks.**
+3. **Per-rank seed identical** (inverse). If ranks have the same seed, dropout masks are identical and there's nothing to all-reduce — looks like a hang but is actually working. **Verify by checking gradient diversity across ranks.**
 
-4. **NCCL communicator already destroyed** by an earlier exception path that didn't go through `try/finally` (G225). Subsequent ranks block waiting on a dead communicator.
+4. **NCCL communicator already destroyed** by an earlier exception path that didn't go through `try/finally`. Subsequent ranks block waiting on a dead communicator.
 
 ### Diagnose
 ```bash
@@ -129,13 +129,13 @@ Look for `dist.all_reduce` in the stack — that confirms a collective wait.
 - Verify `model.no_sync()` wraps non-final accumulation steps.
 - Verify `is_partial_cycle` uses the `batch is None` form.
 - Verify `try/finally: dist.destroy_process_group()` wraps the entire train loop.
-- Add the indentation static check (G227) to CI — inconsistent indent in the try body can silently skip cleanup.
+- Add the indentation static check to CI — inconsistent indent in the try body can silently skip cleanup.
 
 ---
 
 ## Resuming a training run
 
-Use `--resume-from PATH` on `scripts/finetune.py` (or `train.py`). The flag accepts a step-N checkpoint (`step_NNNNNNN.pt`) or `latest.pt` and restores:
+Use `--resume-from PATH` on `cli/finetune.py` (or `train.py`). The flag accepts a step-N checkpoint (`step_NNNNNNN.pt`) or `latest.pt` and restores:
 
 - **Model weights** via `load_state_dict` (with `_unwrap` to strip `_orig_mod.` / `module.` prefixes from compile/DDP wrapping).
 - **Optimizer state** — m, v moments and step counter survive across resume. Including for 8-bit AdamW (bitsandbytes).
@@ -150,7 +150,7 @@ Loader state is NOT restored — the data iterator restarts at the corpus head o
 
 Extend a finished 5000-step run by 5000 more:
 ```bash
-uv run python scripts/finetune.py \
+uv run python cli/finetune.py \
     --resume-from ckpts/titans/latest.pt \
     --data corpus.txt \
     --max-steps 10000 --save-dir ckpts/titans
@@ -158,7 +158,7 @@ uv run python scripts/finetune.py \
 
 Recover from a crash mid-training:
 ```bash
-uv run python scripts/finetune.py \
+uv run python cli/finetune.py \
     --resume-from ckpts/titans/latest.pt \
     --data corpus.txt \
     --max-steps 5000 --save-dir ckpts/titans \
@@ -173,7 +173,7 @@ The `[finetune] resumed from ... (saved at step N, continuing from cycle N+1)` l
 
 **Symptom.** Each time you resume from a checkpoint, the effective LR is lower than the previous run. After 3-4 resumes the model barely trains.
 
-### Cause (G162)
+### Cause
 `base_lrs` was read from `optimizer.param_groups[i]['lr']` *after* `optimizer.load_state_dict(...)`. The loaded state contains the current (scheduled-down) LR, not the original peak. Each resume re-anchors the schedule on the deflated value.
 
 ### Verify
@@ -211,7 +211,7 @@ base_lrs = [g['lr'] for g in optimizer.param_groups]  # BUG
 2. **fp32 NMM state.** Per-step `(M, S)` buffers in fp32 dominate at long
    T. **Fix:** set `nmm_state_dtype="bf16"` to halve them, or
    `"int8"` (blockwise-only) to quarter them. NS5 still runs in fp32
-   internally (G226 invariant preserved).
+   internally (invariant preserved).
 
 3. **NMM state base size too big.** State per layer scales with `B·d²`.
    **Fix:** `nmm_low_rank=64` factors `memory_mlp` weights and shrinks
@@ -268,7 +268,7 @@ cfg = TitansConfig.gpt2_small(
     nmm_layer_indices=[0, 3, 6, 9],
 )
 
-# 4. Inner-loop compile (G264a): 1.7-1.9x step-time speedup with
+# 4. Inner-loop compile: 1.7-1.9x step-time speedup with
 #    paper-faithful sequential semantics. Stacks on top of all of the
 #    above. First step pays a one-time torch.compile cost (~30-60s).
 cfg = TitansConfig.gpt2_small(
@@ -285,7 +285,7 @@ cfg = TitansConfig.gpt2_small(
 ```
 
 The same knobs are exposed as `--nmm-*` flags on `train.py` and
-`scripts/finetune.py` — no need to edit the script. The recommended
+`cli/finetune.py` — no need to edit the script. The recommended
 **consumer-GPU default** (full-rank, 16 GiB VRAM, T=1024) is:
 
 ```bash
@@ -327,11 +327,11 @@ If you find detach materially hurts your task, the alternatives are:
 
 1. **Conv window not maintained at T=1 step.** The depthwise conv is stateless (intentionally — not in `(M, S)`). At training time the conv sees a `kernel_size`-token window; at T=1 step it sees a 1-token window. Mitigation: keep a rolling conv buffer externally, see `diagrams/inference_sequence.mmd`.
 
-2. **Position embedding past `block_size`.** GPT-2's wpe table only covers 0..1023. Chunks reset positions, but within a single forward call you cannot exceed `block_size`. For long generation, chunk the prompt + carry NMM state (G176).
+2. **Position embedding past `block_size`.** GPT-2's wpe table only covers 0..1023. Chunks reset positions, but within a single forward call you cannot exceed `block_size`. For long generation, chunk the prompt + carry NMM state.
 
 3. **From-scratch model with `chunk_size < block_size`.** Untrained wpe rows beyond `chunk_size` silently degrade long-context generation. The config emits a `warnings.warn` for this case — check the run logs.
 
-4. **(FIXED in v2 via Option B — KV cache + `step_with_conv` for NMM.)** Previously `generate.py` re-fed the entire `block_size` window through the NMM at every decoded token, compounding state updates ~`block_size`× per generated token. The current `generate.py` uses `model.prepare_decode` + `model.forward_step`: each decoded token gets exactly one NMM update via `step_with_conv` (full k-token conv context via a conv buffer) and one attention pass via KV cache. Per-step decode cost is now O(1) for NMM and O(T) for attention, matching standard transformer decoding. `eval.needle_in_haystack` was on the same broken path in v1 and was ported to the cached pipeline in the same fix; a call-counting regression test (`tests/integration/test_needle_smoke.py::test_needle_in_haystack_uses_cached_decode_path`) defends against accidental reintroduction. If you're debugging older checkpoints/scripts that still re-feed the window, port to the new entry points or accept the drift.
+4. **(FIXED in v2 via Option B — KV cache + `step_with_conv` for NMM.)** Previously `generate.py` re-fed the entire `block_size` window through the NMM at every decoded token, compounding state updates ~`block_size`× per generated token. The current `generate.py` uses `model.prepare_decode` + `model.forward_step`: each decoded token gets exactly one NMM update via `step_with_conv` (full k-token conv context via a conv buffer) and one attention pass via KV cache. Per-step decode cost is now O(1) for NMM and O(T) for attention, matching standard transformer decoding. `evaluation.needle_in_haystack` was on the same broken path in v1 and was ported to the cached pipeline in the same fix; a call-counting regression test (`tests/integration/test_needle_smoke.py::test_needle_in_haystack_uses_cached_decode_path`) defends against accidental reintroduction. If you're debugging older checkpoints/scripts that still re-feed the window, port to the new entry points or accept the drift.
 
 ### Fix
 - Chunk long prompts through the model — never feed >`block_size` tokens in one forward (the new `generate.py` handles this automatically via the chunked warm-up path).
@@ -346,7 +346,7 @@ If you find detach materially hurts your task, the alternatives are:
 
 ### Causes
 
-1. **Same seed on all ranks (inverse of G204).** Dropout masks must diverge across ranks; if they don't, you're effectively training with a much smaller effective batch.
+1. **Same seed on all ranks (inverse of).** Dropout masks must diverge across ranks; if they don't, you're effectively training with a much smaller effective batch.
 
 2. **Different config across ranks.** Verify `dist.barrier()` after config load, and that all ranks read the same config file.
 
@@ -363,7 +363,7 @@ for n, p in model.named_parameters():
 ```
 
 ### Fix
-- Per-rank seed: `torch.manual_seed(base_seed + rank)` AFTER model construction (G204).
+- Per-rank seed: `torch.manual_seed(base_seed + rank)` AFTER model construction.
 - Set `find_unused_parameters=False` unless you genuinely need it (it's the default we recommend).
 
 ---
@@ -403,22 +403,22 @@ If the ratio is ~0 the NMM is disconnected from the graph.
 
 ### Causes
 
-1. **`weights_only=True`.** Our checkpoint contains nested dicts (optimizer state, scheduler state, step). `torch.load(..., weights_only=False)` is required (G168).
+1. **`weights_only=True`.** Our checkpoint contains nested dicts (optimizer state, scheduler state, step). `torch.load(..., weights_only=False)` is required.
 
-2. **`_orig_mod.` prefix from `torch.compile`.** If the checkpoint was saved on a compiled model, all keys are prefixed. Save via `_unwrap(model).state_dict()` to strip (G184).
+2. **`_orig_mod.` prefix from `torch.compile`.** If the checkpoint was saved on a compiled model, all keys are prefixed. Save via `_unwrap(model).state_dict()` to strip.
 
-3. **Missing `'optimizer'` key.** HF-initialized checkpoints have no optimizer state. Resume must tolerate this (G219) — only load optimizer if the key exists.
+3. **Missing `'optimizer'` key.** HF-initialized checkpoints have no optimizer state. Resume must tolerate this — only load optimizer if the key exists.
 
-4. **NMM state in checkpoint.** It shouldn't be there. If a forked checkpoint format includes `nmm_states`, ignore them on load and reset via `init_state` (G198).
+4. **NMM state in checkpoint.** It shouldn't be there. If a forked checkpoint format includes `nmm_states`, ignore them on load and reset via `init_state`.
 
 ### Fix
-Per case above. The canonical resume order (G209):
+Per case above. The canonical resume order:
 1. Build model from config
 2. `model.load_state_dict(ckpt['model'])`
 3. Wrap with DDP
 4. Build optimizer
 5. `optimizer.load_state_dict(ckpt['optimizer'])` if key exists
-6. `model.train()` (G221)
+6. `model.train()`
 
 ---
 
@@ -427,4 +427,3 @@ Per case above. The canonical resume order (G209):
 - Re-run with `nmm_spectral_norm=False`, `finetune_mode=True`, `N_p=0`, `chunk_size=block_size`. This isolates the NMM down to its minimal contribution. If training is still broken, the bug is in the GPT-2 path.
 - Run the parity test (TEST_PLAN.md §9). If it fails, weight loading is wrong, not training.
 - Run `pytest tests/unit/ -x` to localize to a single failing component.
-- Read `GAP_HISTORY.md` for the symptom — 227 entries, search for keywords.

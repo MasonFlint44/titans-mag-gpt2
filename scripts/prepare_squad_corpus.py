@@ -298,7 +298,7 @@ def load_squad_eval(
     n_records: int | None = None, seed: int = 0,
 ) -> list[SquadRecord]:
     """Load the SQuAD validation split and subsample. Validation is the
-    "held-out" set in SQuAD's own definition — disjoint from train by
+    "held-out" set in SQuAD's own definition — disjoint from cli.train by
     construction."""
     from datasets import load_dataset
     ds = load_dataset("rajpurkar/squad", split="validation")

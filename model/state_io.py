@@ -136,7 +136,7 @@ def load_nmm_state(path, config, device) -> list:
 
     # weights_only=False: state can contain non-tensor structure (None
     # entries for plain blocks, tuple-of-dicts for multi-head). Same
-    # rationale as `load_checkpoint` in train.py (G168).
+    # rationale as `load_checkpoint` in train.py.
     payload = torch.load(path, map_location="cpu", weights_only=False)
 
     fmt = payload.get("format_version")

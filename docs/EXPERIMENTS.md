@@ -164,7 +164,7 @@ The last row is informative: it's the "frozen backbone" experiment that fails pe
 - Tokens/sec at `gpt2_small`, `batch_size=8`, `chunk_size=1024`, single A100
 - Baseline: vanilla GPT-2 with same config (no NMM)
 - Expected: TITANS-MAG runs at 0.4-0.7× vanilla throughput (the inner loop is the bottleneck)
-- If <0.3×, the inner loop has a bug — check that the chunk-forward runs the conv on the full chunk, not per-token (G154)
+- If <0.3×, the inner loop has a bug — check that the chunk-forward runs the conv on the full chunk, not per-token
 
 ### 5.2 Memory footprint
 - Peak GPU memory during a 1024-token chunk forward+backward

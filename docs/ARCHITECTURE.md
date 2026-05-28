@@ -172,7 +172,7 @@ to the most recent `swa_window` tokens, making attention O(n · swa_window).
 
 SWA is available as a config option (`use_swa=True`, `swa_window=256`) for experiments
 targeting longer contexts trained from scratch. The config field is `swa_window` (not
-`window_size`); see PLAN.md task 0.2.
+`window_size`).
 
 ---
 
@@ -238,8 +238,8 @@ y_attn = attn(x̃_norm, mask)[:, N_p:, :]        # drop persistent prefix from o
 
 x_norm         = ln_nmm(x)                       # NMM receives real tokens only (not x̃)
 y_mem, state_t = nmm.forward_chunk(x_norm, state_{t-1}, doc_boundaries)
-# 3-arg call: NMM needs doc_boundaries to reset state at within-chunk document starts
-# (see PLAN.md task 1.8 / 2.4). Calling with only (x_norm, state) drops boundary handling.
+# 3-arg call: NMM needs doc_boundaries to reset state at within-chunk document starts.
+# Calling with only (x_norm, state) drops boundary handling.
 
 # finetune_mode=True (default — initialize from pretrained GPT-2):
 #   At init: out_scale=0 → y_mem=0 → silu(0)=0 → o = y_attn. GPT-2 residual preserved.
@@ -291,21 +291,21 @@ Language model head: `lm_head = wte.weight.T` (tied weights, as in GPT-2).
 | Gated MLP activation | silu(W1·x) * sigmoid(W_gate·x) | Paper says "gated MLP". This is SiLU-GLU (sigmoid gate), NOT SwiGLU (SwiGLU uses a linear gate, no sigmoid). Lucidrains MemoryMLP uses GELU between layers. Our choice is valid; call it "SiLU-GLU" not "SwiGLU" |
 | Attention type | Full causal (SWA optional) | GPT-2 pretrained with full attn; SWA available for long-context |
 | 1D conv in NMM | Depthwise-separable: `Linear → CausalDepthwiseConv1d → Linear (pointwise)`, kernel_size=4 | Paper §4.4 says "depthwise-separable"; the leading Linear is logically the Q/K/V projection, the depthwise mixes temporal, and the trailing pointwise mixes channels post-conv. Lucidrains omits the conv entirely. |
-| Retrieval ordering | DEFAULT paper Eq. 15 (read M_{t-1}, then write); lucidrains write-then-read via `retrieval_from_M_prev=False` | Paper Eq. 15 uses M_{t-1} (read-then-write); lucidrains retrieves from M_t (write-then-read). DEFAULT = paper (G254 default flip); flip the `retrieval_from_M_prev` config flag to False for lucidrains-flavored ablations |
+| Retrieval ordering | DEFAULT paper Eq. 15 (read M_{t-1}, then write); lucidrains write-then-read via `retrieval_from_M_prev=False` | Paper Eq. 15 uses M_{t-1} (read-then-write); lucidrains retrieves from M_t (write-then-read). DEFAULT = paper (default flip); flip the `retrieval_from_M_prev` config flag to False for lucidrains-flavored ablations |
 | MAG gate σ | SiLU | Paper §4.2 says "normalize using learnable vectors, followed by non-linearity σ" without naming σ; SiLU is our choice. Lucidrains uses sigmoid on the memory branch only |
 | θ/η/α granularity | All per-token, linear projection → scalar | Paper: "functions of tokens" §3.2 |
 | NMM depth | L_M = 2 | Paper ablation: L_M ≥ 2 >> L_M = 1 |
 | NMM hidden dim | 4 × d_model | Matches GPT-2 MLP expansion; paper unspecified |
-| Multi-head NMM | DEFAULT single head (d_model). N parallel heads via `nmm_n_heads > 1` (G254) | Not in paper proper — lucidrains enhancement. When `nmm_n_heads > 1`, `MultiHeadNMM` instantiates N parallel `NeuralMemoryModule`s on `head_dim = n_embd // n_heads`. State structure becomes `[per-head (M, S, conv_buf)]` per layer; `detach_states` / `compute_nmm_norm` are recursive to handle the nesting |
+| Multi-head NMM | DEFAULT single head (d_model). N parallel heads via `nmm_n_heads > 1` | Not in paper proper — lucidrains enhancement. When `nmm_n_heads > 1`, `MultiHeadNMM` instantiates N parallel `NeuralMemoryModule`s on `head_dim = n_embd // n_heads`. State structure becomes `[per-head (M, S, conv_buf)]` per layer; `detach_states` / `compute_nmm_norm` are recursive to handle the nesting |
 | MAG gate | silu(γ·y_attn) ⊗ silu(γ·y_mem) | Paper §4.2; Hadamard after learnable normalization |
 | Persistent tokens | N_p = 4. DEFAULT model-wide (paper Eq. 19): one set at the model level prepended once after wte+wpe. `persistent_prefix_mode="per_block"` available as an opt-in for the legacy per-block layout. | Model-wide matches the literal reading of §3.4 / Eq. 19. Per-block remains as a flag for back-compat and ablation. |
 | Memory reset | torch.where at doc boundaries (non-mutating) | Prevent cross-document leakage; in-place assignment on autograd tensors raises RuntimeError |
 | Frozen backbone warm-up | Do NOT freeze GPT-2 weights | Titans Revisited: NMM-only training against frozen backbone fails |
 | `persistent_mem` weight decay | Excluded (no_decay `'persistent'`) | Learnable prefix embeddings — analogous to learned position embeddings; decay shrinks them toward zero, reducing representational capacity |
-| NMM input in MAG block | DEFAULT paper Eq. 28 `ln_nmm(x̃)` (persistent-augmented); lucidrains real-tokens-only via `feed_persistent_to_nmm=False` (G254) | Paper Eq. 28 has `M(x̃)` where x̃ includes persistent tokens. DEFAULT = paper (G254 default flip): block feeds `ln_nmm(x_aug)` to the NMM, augments doc_boundaries with a False prefix (persistent positions never trigger resets), and slices N_p positions off y_mem before the residual. Flip `feed_persistent_to_nmm=False` for lucidrains-flavored real-tokens-only (slightly lower memory; updates only on real tokens) |
+| NMM input in MAG block | DEFAULT paper Eq. 28 `ln_nmm(x̃)` (persistent-augmented); lucidrains real-tokens-only via `feed_persistent_to_nmm=False` | Paper Eq. 28 has `M(x̃)` where x̃ includes persistent tokens. DEFAULT = paper (default flip): block feeds `ln_nmm(x_aug)` to the NMM, augments doc_boundaries with a False prefix (persistent positions never trigger resets), and slices N_p positions off y_mem before the residual. Flip `feed_persistent_to_nmm=False` for lucidrains-flavored real-tokens-only (slightly lower memory; updates only on real tokens) |
 | Conv buffer in state | Folded into the per-layer NMM state as `(M, S, conv_buf)`. Carries the last (k-1) Q/K/V Linear projections across chunk and decode-step boundaries so the depthwise conv sees a full k-token window everywhere — chunked forward, decode, and across cross-chunk TBPTT. NS still operates only on the 2D recurrent matrices in M and S; conv_buf is a sibling dict alongside, not iterated by NS. Reset at chunk start when `doc_boundaries[:, 0]` fires; rolled forward (drop oldest, append latest linear projection) at every step. Dtype invariant: `state_dtype`. | Replaces the prior "separate per-block decode cache" design. The previous `init_conv_buffer_from_prompt` helper and the legacy `step()` are both removed (the rolling buffer subsumes both). |
 | MAG gate (fine-tuning) | `o = y_attn·(1 + silu(γ_m·y_mem))` | Pure MAG gates away attention at init when W2≈0; additive form preserves GPT-2 residual |
-| NMM output scaling | `out_scale ∈ ℝ^{d_model}`; init=**zeros** when `finetune_mode=True`, init=**ones** when `finetune_mode=False` | ResidualNorm passes x through even with W2≈0 (output = norm(W2h)+x ≈ x); zero-init out_scale is the only reliable way to get y_mem=0 at fine-tuning start. For training from scratch there is no pretrained residual to preserve, so the NMM contributes from step 1 (ones init). Conditional in `NeuralMemoryModule.__init__` (Pass 19 / G123) |
+| NMM output scaling | `out_scale ∈ ℝ^{d_model}`; init=**zeros** when `finetune_mode=True`, init=**ones** when `finetune_mode=False` | ResidualNorm passes x through even with W2≈0 (output = norm(W2h)+x ≈ x); zero-init out_scale is the only reliable way to get y_mem=0 at fine-tuning start. For training from scratch there is no pretrained residual to preserve, so the NMM contributes from step 1 (ones init). Conditional in `NeuralMemoryModule.__init__` (Pass 19 /) |
 | MAG gate (from scratch) | `silu(γ_a·y_attn) ⊗ silu(γ_m·y_mem)` | Paper formula; use when not starting from pretrained weights |
 | Scan approximation | Gradients pre-computed at chunk-start M_0 | g_t depends on M_{t-1}; pre-computing at M_0 makes scan feasible; is an approximation. `torch.associative_scan` requires `torch.compile` for autograd; inference-only without it |
 | chunk_size | ≤ block_size (1024); positions reset per chunk | GPT-2 PE table covers 0–1023; NMM carries cross-chunk context |
@@ -320,7 +320,6 @@ Language model head: `lm_head = wte.weight.T` (tied weights, as in GPT-2).
 ```
 titans-mag-gpt2/
 ├── ARCHITECTURE.md
-├── PLAN.md
 ├── config.py
 ├── model/
 │   ├── __init__.py
@@ -334,7 +333,7 @@ titans-mag-gpt2/
 │   └── dataloader.py
 ├── train.py
 ├── generate.py
-├── eval.py
+├── evaluation.py
 ├── scripts/
 │   ├── load_pretrained.py
 │   └── finetune.py

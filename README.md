@@ -20,14 +20,11 @@ test time — that's the whole point.
 |---|---|
 | [`SPEC.md`](SPEC.md) | **Authoritative implementation spec** — what the code actually does |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Design decisions, equations, block diagram |
-| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Phase-by-phase implementation guide (start here) |
-| [`docs/PLAN.md`](docs/PLAN.md) | Full code sketches and every gap-driven safeguard |
 | [`docs/TEST_PLAN.md`](docs/TEST_PLAN.md) | Unit / integration / parity / DDP test plan |
 | [`docs/CONFIG_REFERENCE.md`](docs/CONFIG_REFERENCE.md) | Every config knob with range and defaults |
 | [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | What to do when training breaks |
 | [`docs/GLOSSARY.md`](docs/GLOSSARY.md) | TITANS terminology |
 | [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) | Ablation plan and success criteria |
-| [`docs/GAP_HISTORY.md`](docs/GAP_HISTORY.md) | Audit log (background reading) |
 | [`diagrams/`](diagrams/) | Mermaid diagrams (architecture, sequences, lifecycle, DDP) |
 
 ## What you get
@@ -80,7 +77,7 @@ The recommended recipe for a 16 GiB consumer card (RTX 5070 Ti / 4080 /
 3090 class), T=1024, full-rank MemoryMLP, 12 NMM layers:
 
 ```bash
-uv run python scripts/finetune.py \
+uv run python cli/finetune.py \
     --size small \
     --data /path/to/corpus.txt \
     --chunk-size 1024 \
@@ -120,7 +117,7 @@ To continue from a saved checkpoint (after a crash, deliberate pause, or
 to extend a finished run with more steps), pass `--resume-from`:
 
 ```bash
-uv run python scripts/finetune.py \
+uv run python cli/finetune.py \
     --resume-from ckpts/titans/latest.pt \
     --data /path/to/corpus.txt \
     --max-steps 10000 \
@@ -137,7 +134,7 @@ the AdamW moments and step counter pick up where they left off; the LR
 schedule advances to the correct position in warmup-then-cosine for the
 resumed step.
 
-The same flag works on `train.py` for from-scratch / DDP runs.
+The same flag works on `cli/train.py` for from-scratch / DDP runs.
 
 See [`docs/CONFIG_REFERENCE.md`](docs/CONFIG_REFERENCE.md) for what each
 flag does, the speed/memory tradeoff space, and alternative recipes.
@@ -145,7 +142,7 @@ flag does, the speed/memory tradeoff space, and alternative recipes.
 ## Train from scratch (multi-GPU)
 
 ```bash
-uv run torchrun --nproc_per_node=4 train.py \
+uv run torchrun --nproc_per_node=4 cli/train.py \
     --size small \
     --data /path/to/corpus.txt \
     --chunk-size 1024 \
@@ -154,15 +151,15 @@ uv run torchrun --nproc_per_node=4 train.py \
     --max-steps 100000
 ```
 
-`train.py` hard-codes `finetune_mode=False` so the paper's pure-multiplicative
+`cli/train.py` hard-codes `finetune_mode=False` so the paper's pure-multiplicative
 MAG gate is used (`o = silu(γ_a·y_attn) · silu(γ_m·y_mem)`) and `out_scale`
 initializes to ones. `block_size` is set equal to `chunk_size` so every wpe row
-sees training (G163).
+sees training.
 
 ## Generate
 
 ```bash
-uv run python generate.py \
+uv run python cli/generate.py \
     --checkpoint ckpts/step_5000.pt \
     --prompt "The capital of France is" \
     --max-new-tokens 100 \
@@ -186,13 +183,13 @@ load on entry if it exists, save on exit (atomic rename).
 
 ```bash
 # Turn 1 — file doesn't exist yet; starts from init, saves at end.
-uv run python generate.py --checkpoint ckpts/latest.pt \
+uv run python cli/generate.py --checkpoint ckpts/latest.pt \
     --prompt "The password is alpha-7-zebra." \
     --max-new-tokens 0 \
     --nmm-state-file session.pt
 
 # Turn 2 — loads session.pt, runs, overwrites session.pt with the new state.
-uv run python generate.py --checkpoint ckpts/latest.pt \
+uv run python cli/generate.py --checkpoint ckpts/latest.pt \
     --prompt "What's the password?" \
     --max-new-tokens 20 \
     --nmm-state-file session.pt
@@ -215,7 +212,7 @@ the model remembers everything within the session — no `--nmm-state-file`
 juggling needed.
 
 ```bash
-uv run python generate.py \
+uv run python cli/generate.py \
     --checkpoint ckpts/latest.pt \
     --interactive \
     --temperature 0 --max-new-tokens 15
@@ -226,7 +223,7 @@ swap `--checkpoint` for `--stock-gpt2`. Useful as a qualitative baseline
 to compare against your fine-tunes:
 
 ```bash
-uv run python generate.py \
+uv run python cli/generate.py \
     --stock-gpt2 --size small \
     --interactive \
     --temperature 0 --max-new-tokens 15
@@ -263,7 +260,7 @@ uv run pytest tests/parity/                       # HF GPT-2 logit/perplexity pa
 uv run pytest tests/ddp/ -m ddp                   # spawns 2-rank ranges
 ```
 
-CI tiers in [`docs/TEST_PLAN.md`](docs/TEST_PLAN.md) §15.
+CI tiers in [`docs/TEST_PLAN.md`](docs/TEST_PLAN.md) §14.
 
 ## Pointers if something is off
 
@@ -271,8 +268,8 @@ CI tiers in [`docs/TEST_PLAN.md`](docs/TEST_PLAN.md) §15.
 |---|---|---|
 | Loss NaN after a few steps | Inner-loop NS5 leaking bf16 | docs/RUNBOOK.md §NaN loss |
 | Logits drift from HF GPT-2 at init | Conv1D transpose or `out_scale ≠ 0` | docs/RUNBOOK.md §Logit parity |
-| DDP hang during accumulation | Missing `model.no_sync()` or G222 off-by-one | docs/RUNBOOK.md §DDP hang |
-| LR shrinking every resume | `base_lrs` read from `param_groups` instead of constants (G162) | docs/RUNBOOK.md §LR deflation |
+| DDP hang during accumulation | Missing `model.no_sync()` or off-by-one | docs/RUNBOOK.md §DDP hang |
+| LR shrinking every resume | `base_lrs` read from `param_groups` instead of constants | docs/RUNBOOK.md §LR deflation |
 | Generation gibberish beyond `block_size` | Conv window not maintained at T=1 step | docs/RUNBOOK.md §Long-context drift |
 
 ## Citation

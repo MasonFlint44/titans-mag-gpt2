@@ -7,7 +7,7 @@ import torch
 
 from config import TitansConfig
 from model.titans_gpt2 import TitansMAGGPT2
-from train import (
+from cli.train import (
     BASE_LR_GPT2,
     BASE_LR_NMM,
     apply_lr,
@@ -51,7 +51,7 @@ def test_cosine_decays_smoothly():
 
 
 # ---------------------------------------------------------------------------
-# G197 — degenerate max_steps <= warmup_steps rejected
+# degenerate max_steps <= warmup_steps rejected
 # ---------------------------------------------------------------------------
 
 def test_max_steps_equal_warmup_rejected():
@@ -65,7 +65,7 @@ def test_max_steps_less_than_warmup_rejected():
 
 
 # ---------------------------------------------------------------------------
-# apply_lr scales ALL 4 groups, preserves 1:1:3:3 ratio (G157)
+# apply_lr scales ALL 4 groups, preserves 1:1:3:3 ratio
 # ---------------------------------------------------------------------------
 
 def _tiny_optimizer():
@@ -89,7 +89,7 @@ def test_apply_lr_scales_all_four_groups_proportionally():
 
 
 def test_apply_lr_preserves_3x_nmm_ratio():
-    """G157: the 1:1:3:3 group LR ratio must persist after apply_lr."""
+    """the 1:1:3:3 group LR ratio must persist after apply_lr."""
     opt = _tiny_optimizer()
     base_lrs = base_lrs_from_constants()
     apply_lr(opt, base_lrs, step=750, warmup_steps=1000, max_steps=10000)
@@ -99,7 +99,7 @@ def test_apply_lr_preserves_3x_nmm_ratio():
 
 
 def test_apply_lr_respects_user_max_and_warmup_steps():
-    """G175: max_steps/warmup_steps are positional — caller can't accidentally
+    """max_steps/warmup_steps are positional — caller can't accidentally
     inherit the 1k/100k defaults when running a 200-step overfit."""
     opt = _tiny_optimizer()
     base_lrs = base_lrs_from_constants()
@@ -111,11 +111,11 @@ def test_apply_lr_respects_user_max_and_warmup_steps():
 
 
 # ---------------------------------------------------------------------------
-# G162 — base_lrs from constants, not from optimizer.param_groups
+# base_lrs from constants, not from optimizer.param_groups
 # ---------------------------------------------------------------------------
 
 def test_base_lrs_from_constants_does_not_read_optimizer_state():
-    """G162: base_lrs derived from CODE constants survives a deflated
+    """base_lrs derived from CODE constants survives a deflated
     `optimizer.param_groups[i]['lr']` after load_state_dict. Simulate the
     deflation by manually setting low LRs on the groups, then re-deriving
     base_lrs from constants — must still produce the peak values."""

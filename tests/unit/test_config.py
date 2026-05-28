@@ -8,7 +8,7 @@ from config import TitansConfig
 
 
 # ---------------------------------------------------------------------------
-# Factory dimensions (G143, G150)
+# Factory dimensions
 # ---------------------------------------------------------------------------
 
 def test_gpt2_small_factory_dims():
@@ -40,7 +40,7 @@ def test_gpt2_xl_factory_dims():
 
 
 # ---------------------------------------------------------------------------
-# Factory accepts overrides (G150)
+# Factory accepts overrides
 # ---------------------------------------------------------------------------
 
 def test_factory_accepts_dropout_override():
@@ -64,11 +64,11 @@ def test_factory_accepts_chunk_size_override():
 
 
 # ---------------------------------------------------------------------------
-# chunk_size > block_size rejected (G190, G206)
+# chunk_size > block_size rejected
 # ---------------------------------------------------------------------------
 
 def test_chunk_size_exceeds_block_size_rejected():
-    # G206: must be ValueError, NOT AssertionError. A test using
+    # must be ValueError, NOT AssertionError. A test using
     # pytest.raises(AssertionError) would silently pass-the-wrong-way once
     # the assert→raise migration happened.
     with pytest.raises(ValueError, match="chunk_size"):
@@ -81,7 +81,7 @@ def test_chunk_size_equal_to_block_size_accepted():
 
 
 # ---------------------------------------------------------------------------
-# n_embd not divisible by n_head rejected at config time (G223)
+# n_embd not divisible by n_head rejected at config time
 # ---------------------------------------------------------------------------
 
 def test_n_embd_not_divisible_by_n_head_rejected():
@@ -99,7 +99,7 @@ def test_n_embd_divisibility_error_quotes_values():
 
 
 # ---------------------------------------------------------------------------
-# SWA window validation (G166)
+# SWA window validation
 # ---------------------------------------------------------------------------
 
 def test_swa_zero_window_rejected():
@@ -143,7 +143,7 @@ def test_nmm_expansion_negative_rejected():
 
 
 # ---------------------------------------------------------------------------
-# G163 — from-scratch + chunk_size < block_size warns; finetune does not
+# from-scratch + chunk_size < block_size warns; finetune does not
 # ---------------------------------------------------------------------------
 
 def test_from_scratch_short_chunk_warns():
@@ -314,7 +314,7 @@ def test_use_cans_propagates_to_nmm():
 
 
 # ---------------------------------------------------------------------------
-# Validation survives `python -O` (G190)
+# Validation survives `python -O`
 # ---------------------------------------------------------------------------
 
 def test_validation_fires_under_python_O():

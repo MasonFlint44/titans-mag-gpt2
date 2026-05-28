@@ -22,7 +22,7 @@ behind every non-obvious choice.
 | `diagrams/training_sequence.mmd` | Training loop: setup → accumulation → TBPTT → step → teardown | Understanding the dynamic training flow |
 | `diagrams/inference_sequence.mmd` | Generation: prompt warm-up → autoregressive loop → test-time NMM learning | Understanding inference |
 | `diagrams/nmm_state_lifecycle.mmd` | (M, S) state machine: init → update → detach → reset → NaN-recover | When reasoning about state correctness |
-| `diagrams/ddp_no_sync.mmd` | 2-rank × K-accumulation with all-reduce suppression and G222 pitfall | When debugging DDP behavior |
+| `diagrams/ddp_no_sync.mmd` | 2-rank × K-accumulation with all-reduce suppression and pitfall | When debugging DDP behavior |
 | `diagrams/data_pipeline.mmd` | ParallelStreamLoader: shards → sub-streams → batches → doc_boundaries | When tracing data flow into training |
 | `diagrams/newton_schulz.mmd` | NS5 with fp32 autocast-disable region and transpose-tall guard | When the inner loop is misbehaving |
 | `diagrams/phase_dag.mmd` | Cross-phase task dependencies; what can be parallelized | When planning implementation order |
@@ -70,7 +70,7 @@ Standard `@dataclass` with: GPT-2 dims (n_layer/n_head/n_embd/block_size/vocab/d
 - `use_swa=True and swa_window < 1` → reject (softmax NaN at step 0)
 - `nmm_n_persistent < 0` → reject
 - `nmm_expansion < 1` → reject
-- `n_embd % n_head != 0` → reject (G223 — fail at config build, not model build)
+- `n_embd % n_head != 0` → reject (fail at config build, not model build)
 - From-scratch + `chunk_size < block_size` → `warnings.warn` (untrained wpe rows beyond chunk_size silently degrade long-context generation)
 
 **⚠ Factory methods must merge via `**{**defaults, **overrides}`** — passing dims as fixed kwargs alongside `**overrides` raises `TypeError: multiple values for keyword argument` whenever a caller overrides one.
@@ -115,7 +115,7 @@ SiLU-GLU two-layer MLP: `silu(W1·x) * sigmoid(W_gate·x)` → hidden → `W2 ·
 
 Add to `NeuralMemoryModule.__init__`:
 - `out_scale` = `Parameter([d_model])`, init zeros when `finetune_mode=True`, ones when False. This is the only reliable way to get `y_mem=0` at finetune init given ResidualNorm passes `x` through.
-- `_build_init_M(device)` helper returns the per-sample-batched initial M dict. Use `.to(device).clone()` order to avoid a wasted source-device copy (G207).
+- `_build_init_M(device)` helper returns the per-sample-batched initial M dict. Use `.to(device).clone()` order to avoid a wasted source-device copy.
 
 → PLAN.md §1.4
 
@@ -124,7 +124,7 @@ Build once in `__init__`:
 ```python
 def inner_loss(params, k_hat, v):
     pred = functional_call(self.memory_mlp, params, k_hat)
-    # ⚠ reduction='sum' for spectral_norm=True; 'mean' for False (G160)
+    # ⚠ reduction='sum' for spectral_norm=True; 'mean' for False
     return F.mse_loss(pred, v, reduction=reduction)
 self.per_sample_grad_fn = vmap(grad(inner_loss), in_dims=(0, 0, 0))
 ```
@@ -138,7 +138,7 @@ self.per_sample_grad_fn = vmap(grad(inner_loss), in_dims=(0, 0, 0))
 ### 1.6 Newton-Schulz spectral normalization
 5-step `NS5(G, steps=5, eps=1e-7)`: cast to fp32, transpose tall matrices (rows>cols) so they're wide, normalize by Frobenius, iterate `G = a·G + (b·A + c·A²)·G` where `A = G·Gᵀ`, transpose back, cast to orig dtype.
 
-**⚠ Wrap the entire iteration in `torch.amp.autocast(device_type=..., enabled=False)`** (G226). A bare `.float()` is silently undone by ambient bf16 autocast — matmul inputs get cast back to bf16 even when explicitly fp32, and the iteration drifts.
+**⚠ Wrap the entire iteration in `torch.amp.autocast(device_type=..., enabled=False)`**. A bare `.float()` is silently undone by ambient bf16 autocast — matmul inputs get cast back to bf16 even when explicitly fp32, and the iteration drifts.
 
 **⚠ The transpose guard matters** — NS converges on wide matrices. W1/W_gate are `[4d, d]` (tall), W2 is `[d, 4d]` (wide). Without the transpose guard, NS on the tall gradients is suboptimal.
 
@@ -165,9 +165,9 @@ The training-time hot path. Two implementations (selected by `_HAS_ASSOC_SCAN` a
 - `_forward_chunk_scan` (Phase 6): pre-computed gradients + `associative_scan`, ~10× faster but approximate.
 
 For `_forward_chunk_sequential`:
-- Run the conv on the full chunk in one shot (not per-token) — that's the whole point vs. T-many `step()` calls (G154).
-- Precompute the per-t boundary mask on CPU; do NOT slice into a CUDA tensor inside the per-token loop (G202).
-- Lazy-build `init_M` only when a doc boundary actually fires (G211).
+- Run the conv on the full chunk in one shot (not per-token) — that's the whole point vs. T-many `step()` calls.
+- Precompute the per-t boundary mask on CPU; do NOT slice into a CUDA tensor inside the per-token loop.
+- Lazy-build `init_M` only when a doc boundary actually fires.
 - For long-T OOM pressure, the recommended path is the blockwise NMM (`nmm_block_size >= 16`) combined with `nmm_low_rank` and `nmm_state_dtype="bf16"`. Blockwise replaces the per-token autograd graph with a per-block one (`T / block_size` smaller) and engages TC via batched matmul. Two earlier custom checkpointing mechanisms (per-token-segmented `nmm_grad_checkpoint` and block-level `nmm_block_grad_checkpoint`) were removed once blockwise covered the same use case more cleanly — if a user genuinely needs attn+MLP recompute, PyTorch's native `torch.utils.checkpoint` works directly on the model.
 
 → PLAN.md §1.8
@@ -176,7 +176,7 @@ For `_forward_chunk_sequential`:
 Three methods on `NeuralMemoryModule`:
 - `init_state(batch_size, device)` — returns `(M, S)` from `_build_init_M`; `S` zeros-like.
 - `reset_state(state, mask)` — `torch.where(mask, init, state)` per tensor; handles `state=None`.
-- `detach_states(states)` — detach every leaf in the nested structure; handle `None` (G149).
+- `detach_states(states)` — detach every leaf in the nested structure; handle `None`.
 
 → PLAN.md §1.9
 
@@ -189,7 +189,7 @@ Compose the NMM with attention into a TITANS MAG block, then stack into a full m
 ### 2.0 `CausalSelfAttention` + `GPT2MLP`
 Standard GPT-2 attention/MLP. CausalSelfAttention takes an explicit `mask` arg (so the block can pass an augmented persistent+causal+SWA mask). `GPT2MLP` is `Linear → gelu(approximate='tanh') → Linear` matching HF parity.
 
-**⚠** CausalSelfAttention must reject `n_head` not dividing `n_embd` via `raise ValueError`, NOT `assert` (G220 — same `-O` strip issue as §0.2).
+**⚠** CausalSelfAttention must reject `n_head` not dividing `n_embd` via `raise ValueError`, NOT `assert` (same `-O` strip issue as §0.2).
 
 → PLAN.md §2.0
 
@@ -239,16 +239,16 @@ def forward(idx, nmm_states=None, doc_boundaries=None) -> (logits, new_nmm_state
 
 `nmm_states=None` → initialize all blocks via `nmm.init_state(...)`.
 
-**⚠** `_apply_gpt2_init` must skip NMM-internal modules by **id-set**, not by name (G203 — renaming `self.nmm` would silently break a name-based skip).
+**⚠** `_apply_gpt2_init` must skip NMM-internal modules by **id-set**, not by name (renaming `self.nmm` would silently break a name-based skip).
 
-**⚠** `_apply_gpt2_init` uses relative import (`from .nmm import NeuralMemoryModule`), NOT `from model.nmm` (G224 — breaks under any top-level package name).
+**⚠** `_apply_gpt2_init` uses relative import (`from.nmm import NeuralMemoryModule`), NOT `from model.nmm` (breaks under any top-level package name).
 
 **⚠** Post-init: `wte.weight.std() ≈ 0.02`, `attn.proj.weight.std() ≈ 0.02/√(2·n_layer)` (residual scaling).
 
 → PLAN.md §2.5
 
 ### 2.6 GPT-2 weight loading
-`load_pretrained(model, config)`: read HF `openai-community/gpt2` (or medium/large/xl, **derived from `config.n_embd`** — G216), transpose Conv1D weights (HF stores `[in, out]`, we store `[out, in]`), copy wte/wpe/ln/attn/mlp.
+`load_pretrained(model, config)`: read HF `openai-community/gpt2` (or medium/large/xl, **derived from `config.n_embd`** —), transpose Conv1D weights (HF stores `[in, out]`, we store `[out, in]`), copy wte/wpe/ln/attn/mlp.
 
 Leave NMM weights at their init. After loading, the model must produce logits identical to HF's GPT-2 (with NMM zeroed via `out_scale=0` and `N_p=0`) up to <1e-4 max diff.
 
@@ -261,7 +261,7 @@ Leave NMM weights at their init. After loading, the model must produce logits id
 The non-obvious challenge: TBPTT requires that **position `i` of every batch in a row continues the same document stream** across calls. A naive `DataLoader(shuffle=False)` does NOT give you this.
 
 ### 3.1 Tokenizer
-`tiktoken` GPT-2 encoding. Wrap with a small adapter that exposes `encode/decode/eot_token` and treats literal `<|endoftext|>` in the source text as BPE tokens (NOT as the EOT id — G152). Default `encode_corpus(file_or_iterable)` is whole-file by default (line-per-doc only on opt-in, with a warning if a raw file handle is passed — G210).
+`tiktoken` GPT-2 encoding. Wrap with a small adapter that exposes `encode/decode/eot_token` and treats literal `<|endoftext|>` in the source text as BPE tokens (NOT as the EOT id —). Default `encode_corpus(file_or_iterable)` is whole-file by default (line-per-doc only on opt-in, with a warning if a raw file handle is passed —).
 
 → PLAN.md §3.1
 
@@ -273,7 +273,7 @@ Only needed for from-scratch experiments with per-document boundary signals. For
 ### 3.3 `ParallelStreamLoader` — TBPTT-aware batching
 Maintains B independent sub-streams. Each `__iter__` yields `(idx_BT, doc_boundaries_BT)`. Sub-stream `b` continues from where it left off the previous call — i.e., `batch_k+1[b, 0]` follows `batch_k[b, -1]` in the same document.
 
-**⚠ Shard streams across DDP ranks correctly** — each rank constructs the loader with its own `rank` and `world_size`. Don't have all ranks see the same data (G151).
+**⚠ Shard streams across DDP ranks correctly** — each rank constructs the loader with its own `rank` and `world_size`. Don't have all ranks see the same data.
 
 → PLAN.md §3.3
 
@@ -296,11 +296,11 @@ Betas `(0.9, 0.95)`. NMM groups get 3× the LR (paper ratio).
 
 ### 4.2 TBPTT `train_step`
 Each call processes ONE chunk:
-1. `.to(device)` on the batch (do NOT pre-move in the loader — G167).
+1. `.to(device)` on the batch (do NOT pre-move in the loader —).
 2. Forward through `model(idx, nmm_states, doc_boundaries)`.
 3. Loss = cross-entropy.
-4. NaN guard: if loss is NaN/inf, zero grads and return `(loss, None, None)` — caller re-initializes `nmm_states` to `None` (G213). Verify a NaN injection does NOT corrupt params (G158).
-5. Backward, clip, step. Run **backward + clip + step in fp32** even under bf16 autocast (G159).
+4. NaN guard: if loss is NaN/inf, zero grads and return `(loss, None, None)` — caller re-initializes `nmm_states` to `None`. Verify a NaN injection does NOT corrupt params.
+5. Backward, clip, step. Run **backward + clip + step in fp32** even under bf16 autocast.
 6. Return `(loss, nmm_states_detached, grad_norm)`.
 
 `detach_states` between chunks. The forward updates the NMM weights via differentiable ops; detach prevents the autograd graph from growing across chunks.
@@ -309,12 +309,12 @@ Each call processes ONE chunk:
 
 ### 4.3 LR schedule, logging, checkpointing
 - `apply_lr(opt, step, base_lrs, max_steps, warmup_steps)` returns `lr_mul`. Warmup → cosine to `min_ratio` of peak.
-- **⚠ Derive `base_lrs` from CODE-LEVEL CONSTANTS, NOT from `optimizer.param_groups[i]['lr']`.** Each save/resume cycle silently compounds LR deflation if you capture from `param_groups` after `load_state_dict` (G162).
-- **⚠ Thread `max_steps` and `warmup_steps` explicitly into `apply_lr`.** Don't rely on defaults (G175).
-- Checkpoint save fires on rank 0 only, followed by `dist.barrier()` (G199).
-- `torch.load(..., weights_only=False)` — `weights_only=True` would reject our nested checkpoint (G168).
-- `compute_nmm_norm(state)` returns `None` when state is `None`, else one float per layer (G172).
-- Resume: build model → load state_dict → wrap DDP → build optimizer → load optimizer (in this order — G209). End with `model.train()` (G221). Tolerate missing `'optimizer'` key for HF-init checkpoints (G219).
+- **⚠ Derive `base_lrs` from CODE-LEVEL CONSTANTS, NOT from `optimizer.param_groups[i]['lr']`.** Each save/resume cycle silently compounds LR deflation if you capture from `param_groups` after `load_state_dict`.
+- **⚠ Thread `max_steps` and `warmup_steps` explicitly into `apply_lr`.** Don't rely on defaults.
+- Checkpoint save fires on rank 0 only, followed by `dist.barrier()`.
+- `torch.load(..., weights_only=False)` — `weights_only=True` would reject our nested checkpoint.
+- `compute_nmm_norm(state)` returns `None` when state is `None`, else one float per layer.
+- Resume: build model → load state_dict → wrap DDP → build optimizer → load optimizer (in this order —). End with `model.train()`. Tolerate missing `'optimizer'` key for HF-init checkpoints.
 
 → PLAN.md §4.3
 
@@ -325,14 +325,14 @@ Thin wrapper that constructs the model from `gpt2_small()`, calls `load_pretrain
 
 ### 4.5 Training-from-scratch entry point
 The consolidated training driver. Key structural rules:
-- Build `config` BEFORE the loader references `config.chunk_size` (G205).
-- Move model to device, then wrap with DDP, then build optimizer (G201).
-- `init_process_group` called once before DDP wrap; `destroy_process_group` at the end (G201).
-- Per-rank seed differs **after model construction** so dropout masks diverge (G204).
-- Gradient accumulation under DDP uses `model.no_sync()` for all but the last micro-batch (G200).
-- **⚠ Partial-cycle skip check:** `is_partial_cycle = (batch is None) and (accum_i > 0)` — NOT `accum_i < ACCUM_STEPS - 1` (G222 — silent off-by-one when StopIteration fires at iter K-1, causes DDP rank divergence).
-- NaN-skip in the accumulation block must ALSO reset `nmm_states` to None (G217).
-- **⚠ Wrap the entire training loop in `try: ... finally: dist.destroy_process_group()`** (G225) so cleanup fires on exceptions. Use consistent 4-space indentation throughout the try body (G227).
+- Build `config` BEFORE the loader references `config.chunk_size`.
+- Move model to device, then wrap with DDP, then build optimizer.
+- `init_process_group` called once before DDP wrap; `destroy_process_group` at the end.
+- Per-rank seed differs **after model construction** so dropout masks diverge.
+- Gradient accumulation under DDP uses `model.no_sync()` for all but the last micro-batch.
+- **⚠ Partial-cycle skip check:** `is_partial_cycle = (batch is None) and (accum_i > 0)` — NOT `accum_i < ACCUM_STEPS - 1` (silent off-by-one when StopIteration fires at iter K-1, causes DDP rank divergence).
+- NaN-skip in the accumulation block must ALSO reset `nmm_states` to None.
+- **⚠ Wrap the entire training loop in `try: ... finally: dist.destroy_process_group()`** so cleanup fires on exceptions. Use consistent 4-space indentation throughout the try body.
 
 → PLAN.md §4.5
 
@@ -342,16 +342,16 @@ The consolidated training driver. Key structural rules:
 
 ### 5.1 Autoregressive generation
 `generate(model, prompt, max_new_tokens, temperature, top_k, tokenizer=None, ...)`:
-- If `len(prompt) > block_size`, chunk the prompt through the model so the NMM sees the full prefix (G176). Carry `nmm_states` across chunks.
-- Order: temperature → top_k → softmax → multinomial (G173).
-- Reuse caller-supplied tokenizer instance (don't construct a new one — G208).
-- `try/finally` to restore `model.training` (G161).
+- If `len(prompt) > block_size`, chunk the prompt through the model so the NMM sees the full prefix. Carry `nmm_states` across chunks.
+- Order: temperature → top_k → softmax → multinomial.
+- Reuse caller-supplied tokenizer instance (don't construct a new one —).
+- `try/finally` to restore `model.training`.
 - For contexts past `block_size`, slide the attention window but keep the NMM state continuous.
 
 → PLAN.md §5.1
 
 ### 5.2 Perplexity evaluation
-Standard CE over a held-out corpus. NMM zeroed, eval mode + no_grad. Baseline must match HF GPT-2 within 5% (G156). `try/finally` for `model.training` restoration.
+Standard CE over a held-out corpus. NMM zeroed, eval mode + no_grad. Baseline must match HF GPT-2 within 5%. `try/finally` for `model.training` restoration.
 
 → PLAN.md §5.2
 
@@ -372,14 +372,14 @@ Inside NMM:
 - Apply NS per gradient.
 - Define an associative op `(a₁, b₁) ⊕ (a₂, b₂) = (a₁·a₂, a₂·b₁ + b₂)` to integrate `M_t = (1-α_t)·M_{t-1} + S_t` as a prefix scan.
 
-**⚠** The dispatcher gates on `torch.is_grad_enabled()`, NOT `self.training` (G164). Scan + autograd requires `torch.compile`; without compile, scan is inference-only.
+**⚠** The dispatcher gates on `torch.is_grad_enabled()`, NOT `self.training`. Scan + autograd requires `torch.compile`; without compile, scan is inference-only.
 
 → PLAN.md §6.1
 
 ### 6.2 Integrate with `torch.associative_scan`
-- Resolve `torch.associative_scan` through documented path first, fall back to private `torch._higher_order_ops.associative_scan` (PyTorch 2.6/2.7) — G215. Bind to module-level `_associative_scan`.
-- `allow_scan_training(model, True)` sets the flag on every `block.nmm` (G180).
-- For `torch.compile` checkpoints, save `_unwrap(model).state_dict()` to strip `_orig_mod.` prefixes (G184).
+- Resolve `torch.associative_scan` through documented path first, fall back to private `torch._higher_order_ops.associative_scan` (PyTorch 2.6/2.7) —. Bind to module-level `_associative_scan`.
+- `allow_scan_training(model, True)` sets the flag on every `block.nmm`.
+- For `torch.compile` checkpoints, save `_unwrap(model).state_dict()` to strip `_orig_mod.` prefixes.
 
 → PLAN.md §6.2
 
@@ -391,21 +391,21 @@ Not exhaustive — every section above flags its own. These are the highest-seve
 
 | # | Invariant | Why it matters |
 |---|---|---|
-| 1 | `__post_init__` and `__init__` validation use `raise ValueError`, never `assert` | `python -O` strips asserts; invalid configs ship silently (G190, G220, G223) |
-| 2 | Newton-Schulz wrapped in `autocast(enabled=False)` | Ambient bf16 autocast silently undoes `.float()` (G226) |
+| 1 | `__post_init__` and `__init__` validation use `raise ValueError`, never `assert` | `python -O` strips asserts; invalid configs ship silently |
+| 2 | Newton-Schulz wrapped in `autocast(enabled=False)` | Ambient bf16 autocast silently undoes `.float()` |
 | 3 | NS applied per-gradient, BEFORE momentum; θ scales POST-NS | Pre-NS θ cancels in Frobenius division (paper §3.2) |
-| 4 | `out_scale` init = zeros when finetune_mode=True | Only reliable way to get y_mem=0 at init (G123) |
-| 5 | `base_lrs` from constants, not from `optimizer.param_groups` | Each resume compounds LR deflation otherwise (G162) |
-| 6 | Backward + clip + step in fp32 under bf16 autocast | Mixed precision must not extend past the forward (G159) |
-| 7 | Partial DDP accumulation: `(batch is None) and (accum_i > 0)` | Off-by-one causes silent rank divergence (G222) |
-| 8 | DDP gradient accumulation uses `model.no_sync()` for non-final micro-batches | Otherwise allreduce fires per micro-batch (slow) or diverges (G200) |
-| 9 | Training loop wrapped in `try/finally: destroy_process_group()` | NCCL communicator leak on exception path (G225) |
-| 10 | `_apply_gpt2_init` skips NMM modules by id, with relative import | Robust to renames and package nesting (G203, G224) |
+| 4 | `out_scale` init = zeros when finetune_mode=True | Only reliable way to get y_mem=0 at init |
+| 5 | `base_lrs` from constants, not from `optimizer.param_groups` | Each resume compounds LR deflation otherwise |
+| 6 | Backward + clip + step in fp32 under bf16 autocast | Mixed precision must not extend past the forward |
+| 7 | Partial DDP accumulation: `(batch is None) and (accum_i > 0)` | Off-by-one causes silent rank divergence |
+| 8 | DDP gradient accumulation uses `model.no_sync()` for non-final micro-batches | Otherwise allreduce fires per micro-batch (slow) or diverges |
+| 9 | Training loop wrapped in `try/finally: destroy_process_group()` | NCCL communicator leak on exception path |
+| 10 | `_apply_gpt2_init` skips NMM modules by id, with relative import | Robust to renames and package nesting |
 | 11 | `torch.where` for doc-boundary state resets | In-place assignment on autograd tensors raises RuntimeError |
-| 12 | `_forward_chunk_sequential` runs the conv on the full chunk, not per-token | Per-token conv loses the lookback that makes the conv useful (G154) |
-| 13 | NaN-skip in train_step resets `nmm_states` to None | Otherwise a corrupt state persists across the next call (G213, G217) |
-| 14 | Per-rank seed differs after model construction | Dropout masks must diverge across ranks (G204) |
-| 15 | Build config BEFORE loader references it | The naive ordering uses an undefined name (G205) |
+| 12 | `_forward_chunk_sequential` runs the conv on the full chunk, not per-token | Per-token conv loses the lookback that makes the conv useful |
+| 13 | NaN-skip in train_step resets `nmm_states` to None | Otherwise a corrupt state persists across the next call |
+| 14 | Per-rank seed differs after model construction | Dropout masks must diverge across ranks |
+| 15 | Build config BEFORE loader references it | The naive ordering uses an undefined name |
 
 For the full audit (all 227 gaps across 53 passes) see `GAP_HISTORY.md`.
 
@@ -415,7 +415,7 @@ For the full audit (all 227 gaps across 53 passes) see `GAP_HISTORY.md`.
 
 1. **Phase 0** end-to-end. Run `python -c "import config; TitansConfig.gpt2_small()"`. Verify the rejection tests for invalid configs (Testing Checkpoints in PLAN.md).
 2. **Phase 1.1 – 1.4** (conv, projections, update params, MemoryMLP). Test each module's shape and basic forward in isolation.
-3. **Phase 1.5 – 1.6** (gradient via torch.func, NS). Test that the NS spectral norm bound holds for random tall/wide matrices, including under bf16 autocast (the G198/G226 tests).
+3. **Phase 1.5 – 1.6** (gradient via torch.func, NS). Test that the NS spectral norm bound holds for random tall/wide matrices, including under bf16 autocast (the/tests).
 4. **Phase 1.7 – 1.9** (sequential step, chunked forward, state mgmt). Overfit a single key→value pair. If loss doesn't go to ~0, the inner loop is wrong before you go further.
 5. **Phase 2.0 – 2.2** (attention, MLP, persistent tokens, ln_nmm). Test the augmented mask block structure.
 6. **Phase 2.3 – 2.5** (MAG gate, block forward, full model). Confirm `out_scale=0 → o = y_attn` exactly.

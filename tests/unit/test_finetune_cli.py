@@ -1,4 +1,4 @@
-"""Tests for scripts.finetune CLI flag plumbing.
+"""Tests for cli.finetune CLI flag plumbing.
 
 The finetune entry point is a thin wrapper around train.run_training; we
 don't run training in these tests. We just verify the CLI parser exposes
@@ -9,7 +9,7 @@ break copy-pasted commands the user actually runs.
 
 import pytest
 
-from scripts.finetune import build_parser
+from cli.finetune import build_parser
 
 
 def _parse(*argv):
@@ -22,15 +22,15 @@ def _parse(*argv):
 # ---------------------------------------------------------------------------
 
 def test_compile_model_flag_exists_and_defaults_false():
-    """G277. The flag must EXIST on finetune.py (the README recipe sends it
+    """. The flag must EXIST on finetune.py (the README recipe sends it
     here, not to train.py). Default False so omitting the flag preserves
-    pre-G277 behavior."""
+    pre-behavior."""
     args = _parse()
     assert args.compile_model is False
 
 
 def test_optim8bit_flag_exists_and_defaults_false():
-    """G278. bitsandbytes is an OPTIONAL extra — the default must be False
+    """. bitsandbytes is an OPTIONAL extra — the default must be False
     so users without bitsandbytes installed can still fine-tune."""
     args = _parse()
     assert args.optim8bit is False
@@ -51,9 +51,9 @@ def test_optim8bit_round_trip():
 # ---------------------------------------------------------------------------
 
 def test_full_titans_recipe_parses():
-    """End-to-end: the exact TITANS recipe documented in README.md +
-    docs/QA_RECALL_PLAN.md must parse cleanly. Acts as a regression guard
-    against any future flag rename."""
+    """End-to-end: the exact TITANS recipe documented in README.md must
+    parse cleanly. Acts as a regression guard against any future flag
+    rename."""
     args = _parse(
         "--size", "small",
         "--chunk-size", "1024",
@@ -79,8 +79,8 @@ def test_full_titans_recipe_parses():
 
 
 def test_vanilla_gpt2_recipe_parses():
-    """The vanilla GPT-2 control recipe (also from QA_RECALL_PLAN.md) must
-    parse cleanly with --vanilla-gpt2 alongside the other perf flags."""
+    """The vanilla GPT-2 control recipe must parse cleanly with
+    --vanilla-gpt2 alongside the other perf flags."""
     args = _parse(
         "--size", "small",
         "--chunk-size", "1024",
@@ -141,8 +141,8 @@ def test_resume_compatible_with_recipe_flags():
 def test_config_size_label_helper_round_trips():
     """`config_size_label` powers the resume-mode "ignored --size" warning.
     Must correctly identify each preset by its (n_layer, n_embd) signature.
-    Lives in train.py (shared between train.py and scripts/finetune.py)."""
-    from train import config_size_label
+    Lives in train.py (shared between train.py and cli/finetune.py)."""
+    from cli.train import config_size_label
     from config import TitansConfig
     assert config_size_label(TitansConfig.gpt2_small()) == "small"
     assert config_size_label(TitansConfig.gpt2_medium()) == "medium"
@@ -153,7 +153,7 @@ def test_config_size_label_helper_round_trips():
 def test_config_size_label_handles_custom_dims():
     """For custom configs not matching any factory, return 'custom' rather
     than guessing — the warning would otherwise be misleading."""
-    from train import config_size_label
+    from cli.train import config_size_label
     from config import TitansConfig
     custom = TitansConfig(
         n_layer=4, n_head=2, n_embd=8, vocab_size=16,

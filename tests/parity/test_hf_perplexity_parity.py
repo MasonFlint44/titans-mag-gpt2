@@ -1,4 +1,4 @@
-"""Phase 5.2 — perplexity baseline parity vs HF GPT-2 (G156).
+"""Phase 5.2 — perplexity baseline parity vs HF GPT-2.
 
 With NMM zeroed (out_scale=0) and N_p=0, our perplexity must be within
 5% of HF GPT-2's on the same text — same arithmetic-equivalence
@@ -13,7 +13,7 @@ import torch.nn.functional as F
 
 from config import TitansConfig
 from data.tokenizer import Tokenizer
-from eval import perplexity
+from evaluation import perplexity
 from model.titans_gpt2 import TitansMAGGPT2
 from scripts.load_pretrained import load_pretrained
 
@@ -61,7 +61,7 @@ def test_perplexity_within_5pct_of_HF_on_tiny_text(loaded_titans, hf_gpt2_small)
 
     theirs = _hf_perplexity_on_ids(hf_gpt2_small, ids)
 
-    # 5% relative tolerance per G156.
+    # 5% relative tolerance.
     rel = abs(ours - theirs) / theirs
     assert rel < 0.05, (
         f"perplexity drift > 5%: ours={ours:.4f}, theirs={theirs:.4f}, "

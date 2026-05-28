@@ -144,11 +144,11 @@ def test_nmm_receives_only_real_tokens_when_feed_persistent_flag_is_False():
     block.forward(x) where x has T real tokens calls nmm.forward_chunk with
     a [B, T, d] tensor — NOT [B, T+N_p, d].
 
-    This is the lucidrains-flavored behavior. The DEFAULT (post-G254 default
+    This is the lucidrains-flavored behavior. The DEFAULT (post-default
     flip) is feed_persistent_to_nmm=True, where the block feeds [B, T+N_p, d]
     (paper Eq. 28) — verified by the complementary test below.
 
-    Spec from docs/TEST_PLAN.md §4 + G254: "patch nmm.forward_chunk to record
+    Spec from docs/TEST_PLAN.md §4 + "patch nmm.forward_chunk to record
     x.shape[1]; verify T (real tokens) when flag False, T+N_p when True".
     """
     cfg = _cfg(N_p=4, T=6, feed_persistent_to_nmm=False)
@@ -168,7 +168,7 @@ def test_nmm_receives_only_real_tokens_when_feed_persistent_flag_is_False():
 
 
 def test_nmm_receives_persistent_augmented_when_feed_persistent_flag_is_True():
-    """T12 (paper-strict branch, post-G254 default) — with
+    """T12 (paper-strict branch, post-default) — with
     `feed_persistent_to_nmm=True` (the new default), the NMM sees the
     persistent-augmented input [B, T+N_p, d] per paper Eq. 28."""
     cfg = _cfg(N_p=4, T=6, feed_persistent_to_nmm=True)
@@ -220,7 +220,7 @@ def test_nmm_forward_chunk_called_with_doc_boundaries_arg_lucidrains_branch():
 
 
 def test_nmm_forward_chunk_called_with_augmented_doc_boundaries_paper_branch():
-    """T13 (paper-strict branch, post-G254 default) — with
+    """T13 (paper-strict branch, post-default) — with
     `feed_persistent_to_nmm=True` the block augments doc_boundaries with
     N_p False entries at the front (persistent positions never trigger doc
     resets). NMM receives a [B, N_p + T] bool tensor whose first N_p columns

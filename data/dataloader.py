@@ -11,13 +11,13 @@ class ParallelStreamLoader:
     The naive `DataLoader(shuffle=False, batch_size=B)` collates chunks
     [0..B-1] into batch 0, [B..2B-1] into batch 1, etc. The carried
     `nmm_states[i]` then jumps over B-1 chunks between batches —
-    cross-document state corruption with no error (G151).
+    cross-document state corruption with no error.
 
     Correct: reshape the token stream into B parallel sub-streams of equal
     length; each batch is one chunk from each sub-stream. Position-i at
     batch N+1 directly continues position-i at batch N.
 
-    DDP: each rank reads a CONTIGUOUS segment of the corpus (G191) so
+    DDP: each rank reads a CONTIGUOUS segment of the corpus so
     aggregate batch size scales linearly with world_size. Per-rank
     boundaries[:, 0] is True (segment start has no cross-rank predecessor).
     """

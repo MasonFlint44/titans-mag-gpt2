@@ -5,7 +5,7 @@ import torch
 
 from config import TitansConfig
 from model.titans_gpt2 import TitansMAGGPT2
-from train import BASE_LR_GPT2, BASE_LR_NMM, BETAS, WEIGHT_DECAY, build_optimizer
+from cli.train import BASE_LR_GPT2, BASE_LR_NMM, BETAS, WEIGHT_DECAY, build_optimizer
 
 
 def _tiny_model(**overrides):
@@ -166,7 +166,7 @@ def test_memory_mlp_norm_routed_to_nmm_no_decay():
 
 
 # ---------------------------------------------------------------------------
-# G278: bitsandbytes 8-bit AdamW
+# bitsandbytes 8-bit AdamW
 # ---------------------------------------------------------------------------
 
 

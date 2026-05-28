@@ -63,3 +63,5 @@ profiles/
 
 # Logs
 *.log
+logs/*
+!logs/.gitkeep

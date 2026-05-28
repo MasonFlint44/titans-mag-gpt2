@@ -1,4 +1,4 @@
-"""GPU-tier: torch.compile + _unwrap save/load round-trip (G184/G186/G195).
+"""GPU-tier: torch.compile + _unwrap save/load round-trip.
 
 The fake-wrapper tests in test_scan_dispatcher.py exercise the _unwrap
 logic but not the real torch.compile path. Without _unwrap, a compiled
@@ -17,7 +17,7 @@ import torch
 from config import TitansConfig
 from model import _unwrap
 from model.titans_gpt2 import TitansMAGGPT2
-from train import build_optimizer, load_checkpoint, save_checkpoint
+from cli.train import build_optimizer, load_checkpoint, save_checkpoint
 
 
 pytestmark = [pytest.mark.gpu, pytest.mark.slow]
@@ -42,7 +42,7 @@ def _tiny_model():
 
 def test_compiled_model_state_dict_has_orig_mod_prefix():
     """Sanity: torch.compile DOES add the _orig_mod. prefix (confirms the
-    G184 hazard is real on this PyTorch version)."""
+ hazard is real on this PyTorch version)."""
     cfg, model = _tiny_model()
     compiled = torch.compile(model)
     keys = list(compiled.state_dict().keys())
@@ -53,7 +53,7 @@ def test_compiled_model_state_dict_has_orig_mod_prefix():
 
 
 def test_unwrap_strips_orig_mod_from_real_compiled_model():
-    """G184: _unwrap on a real torch.compile output returns the inner
+    """_unwrap on a real torch.compile output returns the inner
     model whose state_dict has NO _orig_mod. prefix."""
     cfg, model = _tiny_model()
     compiled = torch.compile(model)

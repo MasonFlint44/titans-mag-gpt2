@@ -1,6 +1,6 @@
 """HF GPT-2 weight transfer correctness — Phase 2.6 / `scripts.load_pretrained`.
 
-Defends G216 (HF model name derived from n_embd; previously named test
+(HF model name derived from n_embd; previously named test
 in regression matrix didn't exist). Also covers Conv1D-transpose
 correctness and all-params-loaded invariants from docs/TEST_PLAN.md §4.
 
@@ -20,7 +20,7 @@ from scripts.load_pretrained import _HF_GPT2_NAMES, load_pretrained
 
 
 # ---------------------------------------------------------------------------
-# G216 — HF model name derived from n_embd
+# HF model name derived from n_embd
 # ---------------------------------------------------------------------------
 
 def test_hf_model_name_from_n_embd_table():

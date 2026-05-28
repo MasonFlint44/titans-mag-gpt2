@@ -5,8 +5,8 @@ import torch
 
 from config import TitansConfig
 from data.tokenizer import Tokenizer
-from eval import perplexity
-from generate import generate
+from evaluation import perplexity
+from cli.generate import generate
 from model.titans_gpt2 import TitansMAGGPT2
 
 
@@ -22,7 +22,7 @@ def _tiny_model_real_vocab():
 
 
 # ---------------------------------------------------------------------------
-# G161 — generate restores model.training
+# generate restores model.training
 # ---------------------------------------------------------------------------
 
 def test_generate_restores_training_mode_when_called_in_train_mode():
@@ -42,7 +42,7 @@ def test_generate_keeps_eval_mode_if_caller_was_in_eval():
 
 
 # ---------------------------------------------------------------------------
-# G173 — sampling order: temperature, top_k, softmax
+# sampling order: temperature, top_k, softmax
 # ---------------------------------------------------------------------------
 
 def test_temperature_zero_is_deterministic_argmax():
@@ -67,7 +67,7 @@ def test_top_k_actually_filters_to_top_k_tokens():
 
 
 # ---------------------------------------------------------------------------
-# G208 — tokenizer reuse
+# tokenizer reuse
 # ---------------------------------------------------------------------------
 
 def test_generate_accepts_caller_supplied_tokenizer():
@@ -87,11 +87,11 @@ def test_generate_constructs_default_tokenizer_when_none_passed():
 
 
 # ---------------------------------------------------------------------------
-# G176 — prompts > block_size are chunked, not truncated
+# prompts > block_size are chunked, not truncated
 # ---------------------------------------------------------------------------
 
 def test_generate_chunks_long_prompts_through_NMM():
-    """G176 — for prompt_len > block_size, the full prompt is processed
+    """for prompt_len > block_size, the full prompt is processed
     (no [-block_size:] truncation). The new cached-decode generate splits
     this into:
       - model.forward() calls for the prefix [0 .. prompt_len - block_size]
@@ -223,7 +223,7 @@ def test_generate_short_prompt_respects_new_cap():
 
 
 # ---------------------------------------------------------------------------
-# Perplexity contract + G161 mode restore
+# Perplexity contract + mode restore
 # ---------------------------------------------------------------------------
 
 def test_perplexity_returns_positive_float():
@@ -281,7 +281,7 @@ def _scripted_input(lines):
 def test_interactive_quit_command_exits_cleanly():
     """`/quit` exits the loop without trying to send anything to the
     model. Final state is whatever we passed in (None here)."""
-    from generate import _run_interactive_loop
+    from cli.generate import _run_interactive_loop
     cfg, model = _tiny_model_real_vocab()
     model.eval()
     out = io.StringIO()
@@ -299,7 +299,7 @@ def test_interactive_quit_command_exits_cleanly():
 def test_interactive_eof_exits_cleanly():
     """Ctrl-D (EOFError) ends the session — matches shell convention. Final
     state returned so the caller can persist via --nmm-state-file."""
-    from generate import _run_interactive_loop
+    from cli.generate import _run_interactive_loop
     cfg, model = _tiny_model_real_vocab()
     model.eval()
     out = io.StringIO()
@@ -318,7 +318,7 @@ def test_interactive_sends_prompt_on_blank_line():
     blank line, then sends the joined prompt to the model. Verify by
     checking that *some* generated text reaches the output stream
     (we don't care what — untrained tiny model produces gibberish)."""
-    from generate import _run_interactive_loop
+    from cli.generate import _run_interactive_loop
     cfg, model = _tiny_model_real_vocab()
     model.eval()
     out = io.StringIO()
@@ -346,7 +346,7 @@ def test_interactive_reset_clears_state_between_turns():
     context. Verify by sending one prompt, /reset, then /quit:
     the state returned at exit must be None (reset's value), not the
     state from the first prompt's evaluation."""
-    from generate import _run_interactive_loop
+    from cli.generate import _run_interactive_loop
     cfg, model = _tiny_model_real_vocab()
     model.eval()
     out = io.StringIO()
@@ -369,7 +369,7 @@ def test_interactive_help_command_shows_commands_and_continues():
     """`/help` must NOT exit the loop and must NOT clear state — it's
     a query-only command. Verify by sending /help then /quit and
     checking the help text appears in output."""
-    from generate import _run_interactive_loop, _INTERACTIVE_HELP
+    from cli.generate import _run_interactive_loop, _INTERACTIVE_HELP
     cfg, model = _tiny_model_real_vocab()
     model.eval()
     out = io.StringIO()
@@ -388,7 +388,7 @@ def test_interactive_leading_blank_lines_ignored():
     (would dispatch an empty prompt to the model, which is wasted compute
     and may produce confusing EOT-only output). Leading blanks are dropped
     until the user actually types something."""
-    from generate import _run_interactive_loop
+    from cli.generate import _run_interactive_loop
     cfg, model = _tiny_model_real_vocab()
     model.eval()
     out = io.StringIO()

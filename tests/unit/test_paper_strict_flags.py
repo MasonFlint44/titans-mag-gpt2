@@ -1,4 +1,4 @@
-"""Tests for the 3 paper-strict ablation flags (G254).
+"""Tests for the 3 paper-strict ablation flags.
 
 Three independent config flags expose deliberate paper/lucidrains
 divergences as runtime-flippable behavior:
@@ -42,7 +42,7 @@ def _nmm(retrieval_from_M_prev=False, n_embd=8):
 
 
 def test_retrieval_from_M_prev_default_is_True():
-    """Post-G254-default-flip: default config prefers paper Eq. 15 (read-
+    """Post--default-flip: default config prefers paper Eq. 15 (read-
     then-write). Flip to False for lucidrains-flavored write-then-read."""
     cfg = TitansConfig()
     assert cfg.retrieval_from_M_prev is True
@@ -152,7 +152,7 @@ def _cfg_feed_persistent(feed):
 
 
 def test_feed_persistent_to_nmm_default_is_True():
-    """Post-G254-default-flip: default config prefers paper Eq. 28 (NMM
+    """Post--default-flip: default config prefers paper Eq. 28 (NMM
     sees x̃, the persistent-augmented input). Flip to False for lucidrains-
     flavored real-tokens-only NMM input."""
     cfg = TitansConfig()
@@ -417,7 +417,7 @@ def test_detach_states_single_head_unchanged():
 def test_compute_nmm_norm_handles_multi_head_nested_structure():
     """compute_nmm_norm returns one float per layer regardless of head count
     — multi-head averages across heads."""
-    from train import compute_nmm_norm
+    from cli.train import compute_nmm_norm
 
     cfg = _cfg_n_heads(2)
     block = TitansMAGBlock(cfg)
@@ -430,7 +430,7 @@ def test_compute_nmm_norm_handles_multi_head_nested_structure():
 
 
 def test_compute_nmm_norm_returns_none_on_none_multi_head_safe():
-    from train import compute_nmm_norm
+    from cli.train import compute_nmm_norm
     assert compute_nmm_norm(None) is None
 
 

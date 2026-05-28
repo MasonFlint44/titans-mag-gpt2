@@ -52,7 +52,7 @@ class Tokenizer:
                 "boundary — the NMM's long-range memory is silently disabled "
                 "by per-line resets. Use encode_corpus([f.read()]) for "
                 "whole-file-as-one-document, or split the text into logical "
-                "documents first. (See G210 in docs/GAP_HISTORY.md.)",
+                "documents first. (See in docs/archive/GAP_HISTORY.md.)",
                 UserWarning,
                 stacklevel=2,
             )

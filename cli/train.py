@@ -19,7 +19,7 @@ from tqdm.auto import tqdm
 
 # --- Resume-flow shared constants and helpers ----------------------------------
 # These are used by both `train.py` (from-scratch / DDP) and
-# `scripts/finetune.py` (single-GPU finetune) so the two entry points have
+# `cli/finetune.py` (single-GPU finetune) so the two entry points have
 # matching behavior on `--resume-from`. Adding a new backend-only NMM flag?
 # Append to RESUME_OVERRIDABLE_BACKEND_FLAGS so both paths honor it.
 
@@ -47,7 +47,7 @@ SAVED_TRAINING_ARGS = (
 )
 
 
-# G282 — graph-break suppression for the NMM's `bool(doc_boundaries.any())`
+# graph-break suppression for the NMM's `bool(doc_boundaries.any())`
 # scalar read at `model/nmm.py:_forward_chunk_blockwise` (and the matching
 # sequential-path call). Without this, `torch.compile` warns at first
 # encounter and SPLITS the compiled forward at every NMM block boundary,
@@ -62,8 +62,8 @@ SAVED_TRAINING_ARGS = (
 # steps.
 #
 # Set at module import — runs before any `torch.compile(...)` call in
-# downstream entry points (scripts/finetune.py wraps the model AFTER
-# `from train import ...`). Idempotent if set again elsewhere.
+# downstream entry points (cli/finetune.py wraps the model AFTER
+# `from cli.train import ...`). Idempotent if set again elsewhere.
 torch._dynamo.config.capture_scalar_outputs = True
 
 
@@ -71,11 +71,11 @@ torch._dynamo.config.capture_scalar_outputs = True
 # 4.1 — 4-group optimizer
 # ---------------------------------------------------------------------------
 
-# Code-level constants so apply_lr's base_lrs cannot drift on resume (G162).
+# Code-level constants so apply_lr's base_lrs cannot drift on resume.
 BASE_LR_GPT2 = 3e-4
 BASE_LR_NMM = 9e-4  # 3x GPT-2 per paper
 WEIGHT_DECAY = 0.1
-BETAS = (0.9, 0.95)  # NOT PyTorch default (0.9, 0.999); G153
+BETAS = (0.9, 0.95)  # NOT PyTorch default (0.9, 0.999)
 ADAM_EPS = 1e-8
 GRAD_CLIP = 1.0
 
@@ -113,7 +113,7 @@ def build_optimizer(
     eps: float = ADAM_EPS,
     use_8bit: bool = False,
 ):
-    """Build the 4-group AdamW (G278: optional 8-bit variant).
+    """Build the 4-group AdamW (optional 8-bit variant).
 
     Groups: (gpt2_decay, gpt2_no_decay, nmm_decay, nmm_no_decay).
     NMM groups get a higher LR (paper uses 3x); no_decay groups have wd=0.
@@ -190,19 +190,19 @@ def train_step(
 
     Returns (loss, new_nmm_states, grad_norm) where loss/grad_norm are floats.
     On NaN/Inf grad-norm: zero grads, RETURN None for nmm_states so the
-    caller's next call re-initializes (G158, G213). Returning the existing
+    caller's next call re-initializes. Returning the existing
     state would propagate a NaN-tainted M through the next forward and
     livelock until the next document boundary.
 
     `autocast_dtype=None` (the default) runs forward in fp32 — required for
     CPU tests. On CUDA, the entry points pass `torch.bfloat16` to enable the
-    bf16-autocast forward + fp32 backward pattern (G159). Mixing CPU autocast
+    bf16-autocast forward + fp32 backward pattern. Mixing CPU autocast
     with our torch.func.grad inner loop produces a mixed-dtype backward graph
     that fails with "expected BFloat16 but found Float" — autocast on CPU
     has narrower op coverage than CUDA, so we don't enable it there by default.
 
     Mixed precision: backward + clip + step always run outside autocast in
-    fp32 (G159). clip_grad_norm_ inside autocast computes the norm in low
+    fp32. clip_grad_norm_ inside autocast computes the norm in low
     precision, defeating gradient clipping.
 
     Note: detach_states is imported lazily to avoid a circular import at
@@ -258,7 +258,7 @@ def get_lr_multiplier(
     Returns a scalar in [min_ratio, 1.0]. Caller multiplies each
     param_group's base LR by this.
 
-    Validates max_steps > warmup_steps (G197). max_steps == warmup_steps
+    Validates max_steps > warmup_steps. max_steps == warmup_steps
     yields a degenerate zero-length cosine; max_steps < warmup_steps lets
     the warmup branch fire past max_steps and never decay. Both are silent
     miscalibrations — raise loudly instead.
@@ -286,17 +286,17 @@ def apply_lr(
     min_ratio: float = 0.1,
 ) -> float:
     """Scale every param_group's LR by the schedule multiplier. Preserves the
-    1:1:3:3 gpt2/nmm LR ratio across groups (G157) — naive single-group or
+    1:1:3:3 gpt2/nmm LR ratio across groups — naive single-group or
     uniform-clobber updates would either skip groups or destroy the ratio.
 
-    `base_lrs` MUST come from code-level constants (G162), never from
+    `base_lrs` MUST come from code-level constants, never from
     `optimizer.param_groups[i]['lr']` after `load_state_dict` — that path
     captures the mid-cosine deflated value and compounds the deflation
     every resume.
 
     `warmup_steps` and `max_steps` are required positional args (no
     defaults) so the caller cannot silently inherit the 1k/100k schedule
-    when running a 200-step overfit (G175).
+    when running a 200-step overfit.
     """
     lr_mul = get_lr_multiplier(
         step,
@@ -312,7 +312,7 @@ def apply_lr(
 def base_lrs_from_constants() -> list:
     """The canonical base_lrs derivation: from code constants, matching the
     4-group order in build_optimizer (gpt2_decay, gpt2_no_decay, nmm_decay,
-    nmm_no_decay). Resume-safe by construction (G162)."""
+    nmm_no_decay). Resume-safe by construction."""
     return [BASE_LR_GPT2, BASE_LR_GPT2, BASE_LR_NMM, BASE_LR_NMM]
 
 
@@ -320,9 +320,9 @@ def _layer_norm_M(layer_state):
     """Compute ||M||_F (batch-mean) for a single per-layer state. Handles
     three shapes:
       - None: returns None. Plain (non-NMM) blocks have None state slots
-        when `nmm_layer_indices` is set (G261).
+        when `nmm_layer_indices` is set.
       - single-head: `(M, S, conv_buf)` tuple — item 6.
-      - multi-head: `[(M_h, S_h, conv_buf_h), ...]` list (G254) — returns
+      - multi-head: `[(M_h, S_h, conv_buf_h), ...]` list — returns
         per-head mean.
 
     `_qs` int8 scale companions in M are filtered out so they don't
@@ -343,14 +343,14 @@ def _layer_norm_M(layer_state):
 
 def compute_nmm_norm(nmm_states) -> list:
     """Per-layer ||M||_F (treating W1/W_gate/W2 as one block), averaged across
-    batch. Returns None if states is None (first-step case, G172).
+    batch. Returns None if states is None (first-step case).
 
-    Multi-head safe (G254): when `nmm_n_heads > 1`, the per-layer state is a
+    Multi-head safe: when `nmm_n_heads > 1`, the per-layer state is a
     list of per-head `(M, S)` tuples; we report the mean of per-head norms
     per layer (so the returned list has length n_layer regardless of head
     count — convenient for log parsers).
 
-    Subset-of-layers safe (G261): plain (non-NMM) blocks contribute a None
+    Subset-of-layers safe: plain (non-NMM) blocks contribute a None
     entry at their position rather than skewing the average."""
     if nmm_states is None:
         return None
@@ -387,7 +387,7 @@ def save_checkpoint(
     accumulators, not model state. Resume re-initializes from
     memory_mlp.W*.weight.
     """
-    # G184/G186/G195 — _unwrap strips torch.compile and DDP/FSDP prefixes so
+    #//— _unwrap strips torch.compile and DDP/FSDP prefixes so
     # the saved state_dict is portable across wrapping choices on resume.
     from model import _unwrap
 
@@ -403,7 +403,7 @@ def save_checkpoint(
 
 
 def load_checkpoint(path, device: torch.device) -> dict:
-    """Load checkpoint dict. weights_only=False is required (G168): PyTorch
+    """Load checkpoint dict. weights_only=False is required: PyTorch
     2.6+ flipped the default to True and would reject our nested optimizer
     state on some version combos.
 
@@ -411,7 +411,7 @@ def load_checkpoint(path, device: torch.device) -> dict:
     then `model.load_state_dict(ckpt['state_dict'])`, then optimizer-
     construct + (optional) `optimizer.load_state_dict(ckpt['optimizer'])`.
     Missing 'optimizer' key (HF-init checkpoint from load_pretrained) is
-    handled by the caller (G219).
+    handled by the caller.
     """
     return torch.load(path, map_location=device, weights_only=False)
 
@@ -620,7 +620,7 @@ def save_checkpoint_rotating(
 # ---------------------------------------------------------------------------
 
 def is_partial_cycle(batch, accum_i: int) -> bool:
-    """G222: the correct partial-cycle skip condition.
+    """the correct partial-cycle skip condition.
 
     A partial cycle is when the loader's StopIteration fires mid-accumulation
     (i.e., before the final micro-batch of an accumulation cycle that would
@@ -669,23 +669,23 @@ def run_training(
 
     DDP: caller wraps `model` with DDP and passes `is_distributed=True`. All
     micro-batches except the last in a cycle run inside `model.no_sync()` to
-    suppress per-microbatch all-reduce (G200). Partial cycle at corpus end
-    is detected via G222's `(batch is None) and (accum_i > 0)` check and
+    suppress per-microbatch all-reduce. Partial cycle at corpus end
+    is detected via's `(batch is None) and (accum_i > 0)` check and
     skipped to avoid rank divergence — the per-rank `.grad` buffers were
     never AllReduce'd. On single GPU, partial cycles step normally.
 
     NaN-skip: if accumulated grad_norm is non-finite, zero grads AND reset
-    nmm_states to None (G217) so the next cycle's first micro-batch hits
+    nmm_states to None so the next cycle's first micro-batch hits
     model.forward's None branch and re-inits — otherwise NaN-tainted M
     livelocks until the next document boundary.
 
-    NCCL teardown (try/finally with destroy_process_group, G225/G227) lives
+    NCCL teardown (try/finally with destroy_process_group) lives
     in the entry-point script that wraps this call, not here — keeps this
     function single-purpose and reusable from notebooks / tests.
 
     Training continues until `step >= max_steps`. When the loader exhausts
     mid-training (max_steps > batches-per-epoch), the iterator is rebuilt
-    and iteration continues — matching docs/PLAN.md §4.5's
+    and iteration continues — matching docs/archive/PLAN.md §4.5's
     `for epoch in range(N_EPOCHS):` structure. Without this, small corpora
     silently early-stop after one pass and the user sees max_steps not
     reached with no error.
@@ -710,7 +710,7 @@ def run_training(
     Resume: pass `start_step > 0` to pick up where a previous run left off.
     The caller is responsible for restoring model + optimizer state from a
     checkpoint BEFORE calling run_training (see `load_checkpoint` and the
-    --resume-from CLI flag on train.py / scripts/finetune.py). The
+    --resume-from CLI flag on train.py / cli/finetune.py). The
     `start_step` value sets the initial step counter so the LR schedule
     resumes at the right point in the warmup-then-cosine trajectory; the
     progress bar starts at `start_step / max_steps` rather than 0. Note
@@ -795,12 +795,12 @@ def run_training(
                         return
 
                 if is_partial_cycle(batch, accum_i):
-                    # G214/G222: under DDP, this cycle's micro-batches ran with
+                    #/: under DDP, this cycle's micro-batches ran with
                     # no_sync; per-rank .grad never AllReduce'd. Stepping would
                     # diverge ranks permanently. Discard + stop.
                     if is_distributed:
                         optimizer.zero_grad(set_to_none=True)
-                        nmm_states = None  # G217 — match NaN-skip semantics
+                        nmm_states = None  # match NaN-skip semantics
                         return
                     # Single-GPU: partial is safe (no AllReduce). Treat as complete.
                     cycle_completed = False
@@ -855,7 +855,7 @@ def run_training(
             if torch.isfinite(grad_norm):
                 optimizer.step()
             else:
-                # G217 — match the train_step NaN-skip pattern.
+                # match the train_step NaN-skip pattern.
                 nmm_states = None
             optimizer.zero_grad(set_to_none=True)
 
@@ -866,9 +866,9 @@ def run_training(
             loss_full = loss.item() * accum_steps
             grad_norm_v = grad_norm.item()
             nmm_norms = compute_nmm_norm(nmm_states)
-            # `compute_nmm_norm` returns None when nmm_states is None (G172,
+            # `compute_nmm_norm` returns None when nmm_states is None (,
             # first-step case) AND emits per-layer Nones for plain blocks
-            # (G261). Under --vanilla-gpt2 every block is plain, so nmm_norms
+            #. Under --vanilla-gpt2 every block is plain, so nmm_norms
             # is a list of Nones — truthy as a list, but `sum([None, ...])`
             # raises TypeError. Filter Nones BEFORE summing so the vanilla
             # control run (and any subset-NMM config) logs cleanly.
@@ -918,7 +918,7 @@ def run_training(
                 )
             )
             if save_due:
-                # G199: rank 0 owns the write; all ranks barrier afterwards so
+                # rank 0 owns the write; all ranks barrier afterwards so
                 # the non-rank-0 processes don't race into the next iteration
                 # while rank 0 is still flushing to disk. Without the barrier,
                 # rank 0 falls behind on the next all-reduce and the timeout
@@ -986,10 +986,10 @@ def main():
     from data.tokenizer import Tokenizer
     from model.titans_gpt2 import TitansMAGGPT2
 
-    # G280: enable TF32 for fp32 matmul. Most of the model runs under
+    # enable TF32 for fp32 matmul. Most of the model runs under
     # bf16 autocast (attention, MLP, NMM Q/K/V projections); the remaining
     # fp32 matmuls live in Newton-Schulz 5 (which opts out of autocast for
-    # the G226 fixed-point guarantee) and the analytical-grad LayerNorm
+    # the fixed-point guarantee) and the analytical-grad LayerNorm
     # internals. TF32 keeps the iteration variable in fp32 and only
     # truncates matmul inputs from 23-bit to 10-bit mantissa — much less
     # aggressive than bf16 throughout, and preserves NS5's spectral-norm
@@ -1036,7 +1036,7 @@ def main():
     parser.add_argument(
         "--optim8bit",
         action="store_true",
-        help="Use bitsandbytes' 8-bit AdamW for optimizer state (G278). Cuts "
+        help="Use bitsandbytes' 8-bit AdamW for optimizer state. Cuts "
              "optimizer memory ~4x (8-byte fp32 moments -> 2-byte 8-bit "
              "moments). Requires `bitsandbytes` package; install via "
              "`pip install bitsandbytes`. Trained quality is empirically "
@@ -1055,7 +1055,7 @@ def main():
              "--save-every, --warmup-steps, --grad-accum) remains user-"
              "controlled. DDP-aware: each rank loads from the same checkpoint.",
     )
-    from scripts._nmm_cli import add_nmm_args, nmm_kwargs_from_args
+    from cli.nmm_cli import add_nmm_args, nmm_kwargs_from_args
     add_nmm_args(parser)
     args = parser.parse_args()
 
@@ -1078,7 +1078,7 @@ def main():
     try:
         # Resume vs fresh. Resume: load config + state from checkpoint and
         # apply backend overrides via the shared helper so train.py and
-        # scripts/finetune.py have matching behavior. Architecture-affecting
+        # cli/finetune.py have matching behavior. Architecture-affecting
         # CLI flags are ignored with a rank-0 warning; backend-only flags
         # listed in RESUME_OVERRIDABLE_BACKEND_FLAGS are applied.
         if args.resume_from is not None:
@@ -1096,7 +1096,7 @@ def main():
                 ckpt, args, log_prefix="[train]", rank=rank,
             )
         else:
-            # Config BEFORE loader (loader reads chunk_size) — G205.
+            # Config BEFORE loader (loader reads chunk_size) —.
             factory = {
                 "small": TitansConfig.gpt2_small,
                 "medium": TitansConfig.gpt2_medium,
@@ -1106,12 +1106,12 @@ def main():
             config = factory(
                 finetune_mode=False,
                 chunk_size=args.chunk_size,
-                block_size=args.chunk_size,  # match so all wpe positions train (G163)
+                block_size=args.chunk_size,  # match so all wpe positions train
                 **nmm_kwargs_from_args(args),
             )
 
         # Seed BEFORE model so all ranks build identical params, then re-seed
-        # PER RANK so dropout masks diverge (G204).
+        # PER RANK so dropout masks diverge.
         torch.manual_seed(args.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
@@ -1123,12 +1123,12 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed + rank)
 
-        # G277 — full-forward torch.compile. Wrap BEFORE DDP so the
+        # full-forward torch.compile. Wrap BEFORE DDP so the
         # compiled graph sees per-rank model without the DDP comm hooks
         # threaded in. The `_unwrap` helper already strips both
         # `_orig_mod.` (compile) and `module.` (DDP) prefixes so
         # checkpoint save/load survives. mode="default" — same rationale
-        # as the inner-loop compile (G264a): dynamic shapes from per-
+        # as the inner-loop compile: dynamic shapes from per-
         # chunk dict rebuilds make "reduce-overhead" + cudagraphs unsafe.
         if args.compile_model:
             model = torch.compile(model, mode="default", dynamic=False)
@@ -1225,7 +1225,7 @@ def main():
             batch_size=args.batch_size,
         )
     finally:
-        # G225/G227 — NCCL cleanup on exception path. Consistent 4-space indent.
+        #/— NCCL cleanup on exception path. Consistent 4-space indent.
         if is_distributed and dist.is_initialized():
             dist.destroy_process_group()
 

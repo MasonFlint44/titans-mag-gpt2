@@ -287,7 +287,7 @@ def test_evaluate_target_never_used_as_own_distractor():
 
 
 def test_evaluate_restores_train_mode():
-    """G161 pattern: if the caller passed a train-mode model, the function
+    """pattern: if the caller passed a train-mode model, the function
     must restore it on exit (the body switches to eval). A model stuck in
     eval after a sweep would silently disable dropout in subsequent training
     — the kind of bug that surfaces as a mysteriously-good loss curve weeks

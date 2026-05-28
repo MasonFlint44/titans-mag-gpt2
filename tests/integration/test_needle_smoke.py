@@ -6,7 +6,7 @@ old broken sliding-window NMM-reprocess pattern. The call-counting test
 below would fail loudly if anyone reintroduced the old pattern, since
 it would call `model.forward()` repeatedly inside the decode loop.
 
-needle_in_haystack_sweep (G251) tests at the bottom — the batched sweep
+needle_in_haystack_sweep tests at the bottom — the batched sweep
 harness that aggregates per-position and per-secret recall stats.
 """
 
@@ -15,7 +15,7 @@ import torch
 
 from config import TitansConfig
 from data.tokenizer import Tokenizer
-from eval import needle_in_haystack, needle_in_haystack_sweep
+from evaluation import needle_in_haystack, needle_in_haystack_sweep
 from model.titans_gpt2 import TitansMAGGPT2
 
 
@@ -111,7 +111,7 @@ def test_needle_in_haystack_uses_cached_decode_path():
 
 
 def test_needle_in_haystack_long_prompt_uses_cached_decode_path():
-    """G242 — long-prompt branch of needle_in_haystack must also use the
+    """long-prompt branch of needle_in_haystack must also use the
     cached pipeline (chunked-warm-up via forward() for the prefix +
     prepare_decode on the tail, with NO per-token forward() inside the
     decode loop).
@@ -209,7 +209,7 @@ def test_needle_in_haystack_long_prompt_uses_cached_decode_path():
 
 
 # ---------------------------------------------------------------------------
-# G251 — needle_in_haystack_sweep
+# needle_in_haystack_sweep
 # ---------------------------------------------------------------------------
 
 def _sweep_model():
@@ -222,7 +222,7 @@ def _sweep_model():
 
 
 def test_sweep_default_grid_returns_expected_structure():
-    """G251 — default sweep with n_positions=9, n_secrets=5 should run 45
+    """default sweep with n_positions=9, n_secrets=5 should run 45
     pairs and return a result dict with the documented keys."""
     cfg, model = _sweep_model()
     tok = Tokenizer()

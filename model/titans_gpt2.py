@@ -48,7 +48,7 @@ class TitansMAGGPT2(nn.Module):
         # Determine which blocks get the full TitansMAGBlock (with NMM /
         # persistent / MAG gate) vs. PlainGPT2Block (attn + MLP only).
         # nmm_layer_indices=None means every block has NMM (default,
-        # paper-faithful). When set, only listed indices get NMM. G261.
+        # paper-faithful). When set, only listed indices get NMM..
         if config.nmm_layer_indices is None:
             nmm_idx_set = set(range(config.n_layer))
         else:
@@ -208,7 +208,7 @@ class TitansMAGGPT2(nn.Module):
                 "dropout while warm-up applies them), silently breaking the "
                 "decode-vs-full-forward parity invariant. Call model.eval() "
                 "first, or use generate()/needle_in_haystack() which manage "
-                "the mode for you (G243)."
+                "the mode for you."
             )
         B, P = prompt_idx.shape
         if P > self.config.block_size:
@@ -248,12 +248,12 @@ class TitansMAGGPT2(nn.Module):
                     f"needs its own (M, S) pair; pass the full per-layer "
                     f"list returned by an earlier forward() / prepare_decode()."
                 )
-            # Same eager-failure rationale (G244): a mismatched B between the
+            # Same eager-failure rationale: a mismatched B between the
             # passed nmm_states and the prompt produces a deep, confusing
             # shape error inside the first block's NMM forward. Find the
-            # first non-None layer state to check batch dim (G261: with
+            # first non-None layer state to check batch dim (with
             # nmm_layer_indices, some entries are None).
-            # Multi-head (G254): each non-None entry is a list-of-states.
+            # Multi-head: each non-None entry is a list-of-states.
             for first_layer in nmm_states:
                 if first_layer is None:
                     continue
@@ -307,8 +307,8 @@ class TitansMAGGPT2(nn.Module):
         """Prepare a decode cache for ANY prompt length (short or long).
 
         Encapsulates the chunked-warm-up + tail-prepare_decode pipeline that
-        previously lived inline in `generate.py`, `eval.needle_in_haystack`,
-        and `tests/behavior/test_cached_generate_parity.py` (G249 — three-way
+        previously lived inline in `generate.py`, `evaluation.needle_in_haystack`,
+        and `tests/behavior/test_cached_generate_parity.py` (three-way
         DRY violation, future-divergence risk).
 
         Behavior:
@@ -330,14 +330,14 @@ class TitansMAGGPT2(nn.Module):
         the model's init weights. Default `None` = init from scratch
         (existing behavior; backward compatible).
 
-        Same eval-mode contract as prepare_decode (G243): asserted up front
+        Same eval-mode contract as prepare_decode: asserted up front
         so the long-prompt prefix chunks don't run their dropout-different
         forward path before the final prepare_decode would have rejected the
         whole thing.
         """
         if self.training:
             raise RuntimeError(
-                "prepare_decode_chunked requires model.eval() mode (G243). "
+                "prepare_decode_chunked requires model.eval() mode. "
                 "Call model.eval() first, or use generate() / "
                 "needle_in_haystack() which manage the mode for you."
             )
@@ -375,14 +375,14 @@ class TitansMAGGPT2(nn.Module):
         position bounded by block_size — wpe lookup goes OOB past that.
         Caller should respect that bound.
         """
-        # Same eval-mode contract as prepare_decode (see G243). The two
+        # Same eval-mode contract as prepare_decode (see). The two
         # methods share the cache structure; if forward_step were allowed
         # in train mode while prepare_decode required eval, a caller could
         # silently combine an eval-mode cache with train-mode decode steps
         # and hit the same parity divergence.
         if self.training:
             raise RuntimeError(
-                "forward_step requires model.eval() mode (G243). Call "
+                "forward_step requires model.eval() mode. Call "
                 "model.eval() first, or use generate()/needle_in_haystack() "
                 "which manage the mode for you."
             )

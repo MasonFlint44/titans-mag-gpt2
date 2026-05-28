@@ -1,4 +1,4 @@
-"""Tests for the shared NMM CLI helper in scripts/_nmm_cli.py.
+"""Tests for the shared NMM CLI helper in cli/nmm_cli.py.
 
 Covers:
 - Defaults: omitting all flags leaves the kwargs dict empty (factory defaults
@@ -14,7 +14,7 @@ import argparse
 import pytest
 
 from config import TitansConfig
-from scripts._nmm_cli import add_nmm_args, nmm_kwargs_from_args
+from cli.nmm_cli import add_nmm_args, nmm_kwargs_from_args
 
 
 def _parse(*argv):

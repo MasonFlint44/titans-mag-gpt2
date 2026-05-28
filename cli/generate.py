@@ -2,7 +2,7 @@
 
 Option B from the audit: each decoded token gets exactly ONE NMM update
 (matching the TITANS spec) instead of re-feeding the full sliding window
-through the NMM at every step (the old behavior). See docs/PLAN.md §5.1 +
+through the NMM at every step (the old behavior). See docs/archive/PLAN.md §5.1 +
 docs/RUNBOOK.md "Long-context generation drift" §4.
 
 Pipeline:
@@ -44,7 +44,7 @@ def generate_with_state(
 
     Returns `(generated_text, final_nmm_states)`. The state is the per-layer
     list of `(M, S)` tuples from the end of the decode loop — suitable for
-    saving via `scripts.nmm_state_io.save_nmm_state` so a later call can
+    saving via `model.state_io.save_nmm_state` so a later call can
     `initial_nmm_states=...` to continue the same session.
 
     `generate()` is a thin wrapper that calls this and drops the state.
@@ -65,8 +65,8 @@ def generate_with_state(
         prompt_len = context_ids.size(1)
 
         # Single call handles both short prompts (one-shot prepare_decode) and
-        # long prompts (chunked-warm-up + tail prepare_decode). G249.
-        # G279: `int8_kv_cache=True` quantizes the cache to int8 + per-(B,h,t)
+        # long prompts (chunked-warm-up + tail prepare_decode)..
+        # `int8_kv_cache=True` quantizes the cache to int8 + per-(B,h,t)
         # scale — ~2× smaller, decode quality drift bounded for short runs.
         cache = model.prepare_decode_chunked(
             context_ids,
@@ -134,13 +134,13 @@ def generate(
 ) -> str:
     """Autoregressive sampling using KV-cache + single-token NMM step.
 
-    Sampling order: temperature -> top-k mask -> softmax -> multinomial (G173).
+    Sampling order: temperature -> top-k mask -> softmax -> multinomial.
     Temperature <= 0 collapses to argmax.
 
-    `tokenizer` is optional (G208); pass the same Tokenizer instance used
+    `tokenizer` is optional; pass the same Tokenizer instance used
     at training/eval time to avoid reproducibility drift.
 
-    Mode is captured-and-restored via try/finally (G161).
+    Mode is captured-and-restored via try/finally.
 
     max_new_tokens is capped to `block_size - prompt_len + 1` because the
     KV-cache decode path uses absolute positions for wpe and would go OOB
@@ -288,8 +288,8 @@ def _main():
 
     from config import TitansConfig
     from model.titans_gpt2 import TitansMAGGPT2
-    from train import load_checkpoint
-    from scripts.nmm_state_io import (
+    from cli.train import load_checkpoint
+    from model.state_io import (
         StateConfigMismatch, load_nmm_state, save_nmm_state,
     )
 
@@ -322,7 +322,7 @@ def _main():
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--int8-kv-cache", action="store_true",
                         help="Quantize the attention KV cache to int8 + fp16 scale "
-                             "(G279). ~2x cache memory savings, small decode drift.")
+                             ". ~2x cache memory savings, small decode drift.")
     parser.add_argument(
         "--nmm-state-file",
         type=str,
@@ -395,7 +395,7 @@ def _main():
             raise SystemExit(
                 f"Checkpoint {args.checkpoint} lacks a 'config' key. "
                 f"Cannot rebuild the model architecture; pass a checkpoint "
-                f"saved by `save_checkpoint` from train.py."
+                f"saved by `save_checkpoint` from cli.train.py."
             )
         # save_checkpoint stores config as dataclasses.asdict(config). Use
         # `TitansConfig.from_dict` so removed-field migrations are honored —
@@ -412,7 +412,7 @@ def _main():
             raise SystemExit(
                 f"Checkpoint {args.checkpoint} has neither 'state_dict' nor "
                 f"'model' keys. Pass a checkpoint saved by save_checkpoint "
-                f"from train.py."
+                f"from cli.train.py."
             )
         model.load_state_dict(_unwrap(state))
         model.eval()

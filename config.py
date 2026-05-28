@@ -97,7 +97,7 @@ class TitansConfig:
     # stream); not exposed here.
     persistent_prefix_mode: str = "model_wide"
 
-    # Memory-saving knobs (G256). Defaults preserve the original
+    # Memory-saving knobs. Defaults preserve the original
     # fp32 / no-checkpoint behavior; flip when you hit OOM training the
     # NMM with realistic chunk sizes.
     #
@@ -105,7 +105,7 @@ class TitansConfig:
     #   the per-step update buffers in `_forward_chunk_sequential`. Use
     #   "bf16" to roughly halve per-step state retention (~2x larger
     #   feasible chunk_size on a fixed VRAM budget). NS5 still casts in/out
-    #   of fp32 internally (G226 — bf16 NS5 drifts to spectral norm 0.7-1.4
+    #   of fp32 internally (bf16 NS5 drifts to spectral norm 0.7-1.4
     #   instead of ~1), so this is safe-by-construction; the only drift
     #   risk is the per-step M_t = (1-a)*M_{t-1} + S_t update rounding in
     #   bf16. Measure loss curves before relying on it for full training.
@@ -113,7 +113,7 @@ class TitansConfig:
     #   the validator in `__post_init__`).
     nmm_state_dtype: str = "fp32"
 
-    # nmm_layer_indices (G261): if not None, NMM is wired only on the
+    # nmm_layer_indices: if not None, NMM is wired only on the
     # listed transformer blocks; other blocks are plain GPT-2 blocks
     # (attn + MLP only, no persistent prefix, no MAG gate). Cuts NMM-
     # related memory/time roughly proportionally — at n_layer=12 with
@@ -123,7 +123,7 @@ class TitansConfig:
     # train at all" because of VRAM. None = all blocks have NMM (default).
     nmm_layer_indices: Optional[list] = None
 
-    # nmm_block_size (G266): chunk-as-update aggregation for the NMM inner
+    # nmm_block_size: chunk-as-update aggregation for the NMM inner
     # loop. When >1, the per-token sequential recurrence is REPLACED by a
     # blockwise recurrence: every `nmm_block_size` consecutive tokens
     # produce ONE memory update instead of `nmm_block_size` separate
@@ -155,7 +155,7 @@ class TitansConfig:
     # cpu-offload paths all compose.
     nmm_block_size: int = 1
 
-    # nmm_detach_state_between_blocks (G268 — lucidrains' `detach_mem_state`):
+    # nmm_detach_state_between_blocks (lucidrains' `detach_mem_state`):
     # when True AND `nmm_block_size > 1`, the blockwise path detaches (M, S)
     # at the START of each block. Backward graph spans ONE block instead of
     # the full chunk — peak transient memory drops ~proportional to (T /
@@ -184,7 +184,7 @@ class TitansConfig:
     # mechanisms via grad_checkpoint / segment boundaries).
     nmm_detach_state_between_blocks: bool = False
 
-    # nmm_lookahead_value (G269 — lucidrains' `store_with_lookahead_value`):
+    # nmm_lookahead_value (lucidrains' `store_with_lookahead_value`):
     # when True, the NMM's inner reconstruction loss uses v_{t+1} as the
     # target for token t (predictive) instead of v_t (reconstructive).
     # The inner gradient becomes ∇ℓ(M; k_t, v_{t+1}), so the memory learns
@@ -208,7 +208,7 @@ class TitansConfig:
     # NMM knobs.
     nmm_lookahead_value: bool = False
 
-    # nmm_per_param_lr_modulation (G270 — lucidrains'
+    # nmm_per_param_lr_modulation (lucidrains'
     # `per_parameter_lr_modulation`): when True, the data-dependent
     # learning rate θ_t becomes per-state-key instead of a single scalar.
     # `W_theta` projects x_t to K independent scalars (one per recurrent
@@ -228,7 +228,7 @@ class TitansConfig:
     # per-key W_theta (independently learned per head).
     nmm_per_param_lr_modulation: bool = False
 
-    # nmm_per_head_learned_params (G271 — lucidrains'
+    # nmm_per_head_learned_params (lucidrains'
     # `per_head_learned_parameters`): when False AND `nmm_n_heads > 1`,
     # the MemoryMLP weights are SHARED across heads instead of replicated.
     # Per-head recurrent state is still independent (each head threads its
@@ -245,7 +245,7 @@ class TitansConfig:
     # share). Wired through `MultiHeadNMM.__init__`.
     nmm_per_head_learned_params: bool = True
 
-    # nmm_momentum_order (G272 — lucidrains' `momentum_order`): order of
+    # nmm_momentum_order (lucidrains' `momentum_order`): order of
     # the momentum recurrence on S. Default 1 = paper-strict
     # `S_t = η·S_{t-1} - θ·g_t`. With order N > 1, N nested momenta
     # are maintained, each decaying the next; the formula is recursive:
@@ -282,7 +282,7 @@ class TitansConfig:
     # Speed wins are large at gpt2_small (NS5 fp32 GEMMs are ~75% of
     # CUDA time at block_size=64): steps=4 ≈ -16% step time, steps=3 ≈
     # -33%. But the LR drift is the same scale that broke training
-    # under bf16 NS5 (G226), so do NOT lower this without a convergence
+    # under bf16 NS5, so do NOT lower this without a convergence
     # study on your own data. Sanity bounds: [1, 10].
     nmm_ns5_steps: int = 5
 
@@ -343,7 +343,7 @@ class TitansConfig:
     # `--nmm-use-cans`.
     nmm_use_cans: bool = False
 
-    # nmm_per_token_ns5 (G267): when True AND `nmm_block_size > 1`, the
+    # nmm_per_token_ns5: when True AND `nmm_block_size > 1`, the
     # blockwise path uses per-token NS5 + per-token θ weighting, matching
     # paper Eq 16's `Σ_t θ_t · NS5(∇_t)` exactly. Default False, which
     # uses v1's `θ_mean · NS5(Σ_t ∇_t)` simplification.
@@ -364,7 +364,7 @@ class TitansConfig:
     # θ_mean = θ_t and per-token NS5 = single NS5).
     nmm_per_token_ns5: bool = False
 
-    # nmm_softclamp_max (G265): when set to a float, applies tanh-based
+    # nmm_softclamp_max: when set to a float, applies tanh-based
     # soft norm clamping to the per-token surprise gradient BEFORE NS5.
     # Smooth analog of hard clip_grad_norm — never has zero gradient,
     # never has a discontinuous threshold. Off (None) by default since
@@ -375,7 +375,7 @@ class TitansConfig:
     # lucidrains/titans-pytorch default of ~5).
     nmm_softclamp_max: Optional[float] = None
 
-    # nmm_low_rank (G262): factor the MemoryMLP weights as A @ B with an
+    # nmm_low_rank: factor the MemoryMLP weights as A @ B with an
     # intermediate dim of `nmm_low_rank`. At gpt2_small d=768, default
     # expansion=4: full-rank state per layer is 3 × [4d, d] = ~28 MB bf16;
     # low-rank state per layer is 3 × ([4d, r] + [r, d]) = 3 × r × 5d.
@@ -464,15 +464,15 @@ class TitansConfig:
                 f"{self.nmm_n_heads * head_dim}, not {self.n_embd}."
             )
 
-        # Memory-saving knob validation (G256 / G257 / G275).
+        # Memory-saving knob validation.
         if self.nmm_state_dtype not in ("fp32", "bf16", "int8"):
             raise ValueError(
                 f"nmm_state_dtype must be 'fp32', 'bf16', or 'int8' (got "
                 f"{self.nmm_state_dtype!r}). fp16 is NOT supported — it "
                 f"needs loss scaling that this codebase doesn't wire. "
-                f"bf16 halves state memory vs fp32; int8 quarters it (G275)."
+                f"bf16 halves state memory vs fp32; int8 quarters it."
             )
-        # G275 int8 state: only the blockwise path supports it.
+        # int8 state: only the blockwise path supports it.
         if self.nmm_state_dtype == "int8" and self.nmm_block_size <= 1:
             raise ValueError(
                 "nmm_state_dtype='int8' requires nmm_block_size > 1. The "
@@ -544,7 +544,7 @@ class TitansConfig:
         # n_persistent=4) give 16 full blocks of 64 + 1 trailing block of 4,
         # which is fine.
         # nmm_momentum_order: must be a positive int. 1 = paper-default; >1
-        # enables higher-order momentum (G272).
+        # enables higher-order momentum.
         if not isinstance(self.nmm_momentum_order, int) or self.nmm_momentum_order < 1:
             raise ValueError(
                 f"nmm_momentum_order must be a positive int (got "
@@ -552,7 +552,7 @@ class TitansConfig:
                 f"first-order momentum; >1 stacks additional momentum levels."
             )
 
-        # nmm_detach_state_between_blocks only meaningful when blockwise (G268).
+        # nmm_detach_state_between_blocks only meaningful when blockwise.
         # Fail loud when set without blockwise — silent no-op would mislead
         # users into thinking they enabled truncated BPTT.
         if self.nmm_detach_state_between_blocks and self.nmm_block_size <= 1:

@@ -10,7 +10,7 @@ import torch
 
 from config import TitansConfig
 from model.titans_gpt2 import TitansMAGGPT2
-from train import (
+from cli.train import (
     BASE_LR_GPT2,
     BASE_LR_NMM,
     LATEST_CKPT_NAME,
@@ -73,7 +73,7 @@ def test_save_load_round_trip_preserves_config():
 
 
 def test_save_load_optimizer_state_populated_after_step():
-    """G153: after a real .step(), Adam moments exp_avg / exp_avg_sq exist."""
+    """after a real.step(), Adam moments exp_avg / exp_avg_sq exist."""
     cfg, model, opt = _tiny_setup()
     batch = _fake_batch(cfg)
     train_step(model, batch, None, opt, torch.device("cpu"))
@@ -88,7 +88,7 @@ def test_save_load_optimizer_state_populated_after_step():
 
 
 def test_load_works_under_weights_only_false():
-    """G168: torch.load(weights_only=True) (the PyTorch 2.6+ default) would
+    """torch.load(weights_only=True) (the PyTorch 2.6+ default) would
     reject our nested optimizer state on some version combos. load_checkpoint
     passes weights_only=False explicitly — verify it returns the dict."""
     cfg, model, opt = _tiny_setup()
@@ -100,11 +100,11 @@ def test_load_works_under_weights_only_false():
 
 
 # ---------------------------------------------------------------------------
-# G219 — HF-init checkpoint with no 'optimizer' key
+# HF-init checkpoint with no 'optimizer' key
 # ---------------------------------------------------------------------------
 
 def test_resume_with_no_optimizer_key_does_not_raise():
-    """G219: scripts/load_pretrained.py emits {state_dict, config, step}
+    """scripts/load_pretrained.py emits {state_dict, config, step}
     without 'optimizer'. The resume path must tolerate the missing key.
     Simulate the path: load checkpoint, build fresh optimizer, only call
     load_state_dict if the key is present."""
@@ -121,7 +121,7 @@ def test_resume_with_no_optimizer_key_does_not_raise():
             path,
         )
         ckpt = load_checkpoint(path, device=torch.device("cpu"))
-        # Caller-side pattern from G219:
+        # Caller-side pattern from
         cfg2 = TitansConfig(**ckpt["config"])
         model2 = TitansMAGGPT2(cfg2)
         model2.load_state_dict(ckpt["state_dict"])
@@ -133,11 +133,11 @@ def test_resume_with_no_optimizer_key_does_not_raise():
 
 
 # ---------------------------------------------------------------------------
-# G221 — resume sequence ends in train()
+# resume sequence ends in train()
 # ---------------------------------------------------------------------------
 
 def test_resume_ends_with_model_train_mode():
-    """G221: explicit model.train() at end of resume protects against any
+    """explicit model.train() at end of resume protects against any
     intervening eval-mode code (smoke perplexity, sample generation).
     The resume sequence is caller-owned, but verify the pattern works."""
     cfg, model, opt = _tiny_setup()
@@ -149,12 +149,12 @@ def test_resume_ends_with_model_train_mode():
         model2 = TitansMAGGPT2(cfg2)
         model2.load_state_dict(ckpt["state_dict"])
         model2.eval()  # simulate a smoke-test eval that came before final train()
-        model2.train()  # the G221 defensive call
+        model2.train()  # the defensive call
         assert model2.training
 
 
 # ---------------------------------------------------------------------------
-# G172 — compute_nmm_norm
+# compute_nmm_norm
 # ---------------------------------------------------------------------------
 
 def test_compute_nmm_norm_returns_None_when_states_is_None():
@@ -220,7 +220,7 @@ def test_run_training_continues_across_epochs_on_single_gpu():
     loader = _SmallLoader()
 
     # Snapshot optimizer step count to verify we actually advanced.
-    from train import run_training
+    from cli.train import run_training
     run_training(
         model=model, optimizer=optimizer, loader=loader,
         device=torch.device("cpu"),
@@ -271,7 +271,7 @@ def test_run_training_respects_start_step():
                 yield _fake_batch(cfg, B=1, T=4)
     loader = _Loader()
 
-    from train import run_training
+    from cli.train import run_training
     run_training(
         model=model, optimizer=optimizer, loader=loader,
         device=torch.device("cpu"),
@@ -304,7 +304,7 @@ def test_run_training_rejects_negative_start_step():
     )
     model = TitansMAGGPT2(cfg)
     optimizer = build_optimizer(model)
-    from train import run_training
+    from cli.train import run_training
     with pytest.raises(ValueError, match="start_step must be >= 0"):
         run_training(
             model=model, optimizer=optimizer, loader=iter([]),
@@ -329,7 +329,7 @@ def test_run_training_rejects_start_step_at_or_past_max_steps():
     )
     model = TitansMAGGPT2(cfg)
     optimizer = build_optimizer(model)
-    from train import run_training
+    from cli.train import run_training
     with pytest.raises(ValueError, match=r"start_step.*>=.*max_steps"):
         run_training(
             model=model, optimizer=optimizer, loader=iter([]),
@@ -370,7 +370,7 @@ def test_resume_round_trip_via_save_and_load(tmp_path):
             while True:
                 yield const_batch
 
-    from train import run_training, load_checkpoint
+    from cli.train import run_training, load_checkpoint
 
     # === Continuous run: max_steps=4, save_every=2 so we capture step 2 ===
     torch.manual_seed(0)
@@ -457,7 +457,7 @@ def test_run_training_handles_all_none_nmm_norms():
     loader = _OneShotLoader()
 
     # Import locally to avoid contaminating test_checkpoint's top-level imports.
-    from train import run_training
+    from cli.train import run_training
     # Single step must complete without raising. `show_progress=False` keeps
     # tqdm quiet under pytest capture.
     run_training(

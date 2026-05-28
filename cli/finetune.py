@@ -16,7 +16,7 @@ from data.dataloader import ParallelStreamLoader
 from data.tokenizer import Tokenizer
 from model.titans_gpt2 import TitansMAGGPT2
 from scripts.load_pretrained import load_pretrained
-from train import build_optimizer, run_training
+from cli.train import build_optimizer, run_training
 
 
 _FACTORY = {
@@ -58,12 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
              "Pass 0 or a negative value to disable pruning.",
     )
     parser.add_argument("--seed", type=int, default=42)
-    # Mirror train.py G277 / G278 so the consumer-GPU recipe documented in
+    # Mirror train.py / so the consumer-GPU recipe documented in
     # README.md actually works against finetune.py (not only train.py).
     parser.add_argument(
         "--compile-model",
         action="store_true",
-        help="Wrap the full model in torch.compile after construction (G277). "
+        help="Wrap the full model in torch.compile after construction. "
              "Traces the entire forward (embedding + N transformer blocks + LN "
              "+ LM head) into one Inductor graph per shape. Composes with "
              "nmm_compile_inner_loop (the inner compile is taken first; the "
@@ -74,7 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--optim8bit",
         action="store_true",
-        help="Use bitsandbytes' 8-bit AdamW for optimizer state (G278). Cuts "
+        help="Use bitsandbytes' 8-bit AdamW for optimizer state. Cuts "
              "optimizer memory ~4x (8-byte fp32 moments -> 2-byte 8-bit "
              "moments). Requires `bitsandbytes` package; install via "
              "`pip install bitsandbytes` (or `uv sync --extra optim8bit`). "
@@ -94,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
              "--grad-accum) remain user-controlled so you can extend a run, "
              "redirect saves, etc.",
     )
-    from scripts._nmm_cli import add_nmm_args
+    from cli.nmm_cli import add_nmm_args
     add_nmm_args(parser)
     return parser
 
@@ -102,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main():
     import sys
     from pathlib import Path
-    from scripts._nmm_cli import nmm_kwargs_from_args
+    from cli.nmm_cli import nmm_kwargs_from_args
     parser = build_parser()
     args = parser.parse_args()
 
@@ -118,7 +118,7 @@ def main():
     # warning); backend-only flags listed in train.RESUME_OVERRIDABLE_BACKEND_FLAGS
     # are applied. Shared with train.py so both entry points behave identically.
     if args.resume_from is not None:
-        from train import (
+        from cli.train import (
             apply_resume_overrides_and_warn,
             load_checkpoint,
             warn_training_arg_drift,
@@ -129,7 +129,7 @@ def main():
             raise SystemExit(
                 f"Checkpoint {args.resume_from} lacks a 'config' key; cannot "
                 f"reconstruct the model architecture. Use a checkpoint saved "
-                f"by save_checkpoint from train.py."
+                f"by save_checkpoint from cli.train.py."
             )
         config = TitansConfig.from_dict(ckpt["config"])
         apply_resume_overrides_and_warn(
@@ -141,7 +141,7 @@ def main():
         )
         model = TitansMAGGPT2(config).to(device)
         # Skip load_pretrained — the checkpoint already has trained weights.
-        # G277 — wrap with torch.compile BEFORE load_state_dict so the
+        # wrap with torch.compile BEFORE load_state_dict so the
         # `_orig_mod.` prefix is in place before we load (or alternatively,
         # use _unwrap on the saved dict). We do the latter — matches how
         # other consumers (eval_qa_recall, generate.py) handle this.
@@ -204,7 +204,7 @@ def main():
         model = TitansMAGGPT2(config).to(device)
         load_pretrained(model, config)
 
-        # G277 — full-forward torch.compile. Wrap AFTER load_pretrained (so
+        # full-forward torch.compile. Wrap AFTER load_pretrained (so
         # the compile sees post-pretrained-init weights, not the random init)
         # and BEFORE build_optimizer (so param groups are derived from the
         # unwrapped model's named_parameters() — _unwrap strips both

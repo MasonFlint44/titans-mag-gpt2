@@ -2,7 +2,7 @@ import pytest
 import torch
 
 
-# G280: match the training-time TF32 setting in `train.py::main`. Fp32
+# match the training-time TF32 setting in `train.py::main`. Fp32
 # matmuls use 10-bit mantissa inputs on tensor cores; accumulation stays
 # fp32. Affects NS5 and the analytical-grad LayerNorm internals — the
 # only places that explicitly force fp32 (everything else runs under

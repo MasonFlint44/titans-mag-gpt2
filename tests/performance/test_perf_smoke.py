@@ -21,9 +21,9 @@ import torch
 
 from config import TitansConfig
 from data.dataloader import ParallelStreamLoader
-from generate import generate
+from cli.generate import generate
 from model.titans_gpt2 import TitansMAGGPT2
-from train import build_optimizer, train_step
+from cli.train import build_optimizer, train_step
 
 pytestmark = pytest.mark.perf
 

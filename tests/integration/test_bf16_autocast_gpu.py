@@ -5,7 +5,7 @@ with 'expected BFloat16 but found Float' due to limited CPU op coverage —
 train_step defaults autocast_dtype=None there. On CUDA the path works;
 this test verifies (a) forward+backward+step doesn't crash, (b) loss
 trends down across a few steps, (c) param tensors remain fp32 (autocast
-forward only; G159 invariant).
+forward only invariant).
 """
 
 import pytest
@@ -14,7 +14,7 @@ import torch
 from config import TitansConfig
 from data.dataloader import ParallelStreamLoader
 from model.titans_gpt2 import TitansMAGGPT2
-from train import build_optimizer, run_training, train_step
+from cli.train import build_optimizer, run_training, train_step
 
 
 pytestmark = [pytest.mark.gpu, pytest.mark.slow]
@@ -54,7 +54,7 @@ def test_bf16_train_step_does_not_crash():
 
 
 def test_bf16_params_stay_fp32_after_step():
-    """G159: autocast wraps the forward only — model parameters must stay
+    """autocast wraps the forward only — model parameters must stay
     fp32 throughout. Otherwise AdamW updates round to zero on fp16-like dtypes."""
     cfg, model, opt = _tiny_setup()
     idx = torch.randint(0, cfg.vocab_size, (2, 4), device="cuda")
@@ -67,7 +67,7 @@ def test_bf16_params_stay_fp32_after_step():
     for name, p in model.named_parameters():
         assert p.dtype == torch.float32, (
             f"param {name} became {p.dtype} after bf16-autocast step — "
-            f"autocast leaked beyond forward (G159 violation)"
+            f"autocast leaked beyond forward (violation)"
         )
 
 

@@ -1,10 +1,10 @@
-"""G199 — structural: the save block in run_training has both the rank-0
+"""structural: the save block in run_training has both the rank-0
 guard and the dist.barrier() (so non-rank-0 ranks don't race past)."""
 
 import ast
 import inspect
 
-import train
+import cli.train as train
 
 
 def _function_source(fn):
@@ -18,7 +18,7 @@ def test_run_training_save_block_uses_rank0_guard_and_barrier():
     `is_distributed`).
 
     Accepts either `save_checkpoint` or `save_checkpoint_rotating`
-    (added in the rotation pass) — the G199 invariant is rank 0 owns
+    (added in the rotation pass) — the invariant is rank 0 owns
     the write, not the specific helper name.
     """
     src = _function_source(train.run_training)

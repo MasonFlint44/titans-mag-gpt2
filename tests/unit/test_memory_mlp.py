@@ -62,7 +62,7 @@ def test_layernorm_is_present_and_d_sized():
 
 
 # ---------------------------------------------------------------------------
-# out_scale init: zeros for finetune_mode=True, ones for False (G123)
+# out_scale init: zeros for finetune_mode=True, ones for False
 # ---------------------------------------------------------------------------
 
 def test_out_scale_init_zeros_in_finetune_mode():

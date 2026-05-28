@@ -69,7 +69,7 @@ def test_per_sample_grad_is_per_sample_not_summed():
 
 
 # ---------------------------------------------------------------------------
-# G160 — reduction switch matches spectral_norm flag
+# reduction switch matches spectral_norm flag
 # ---------------------------------------------------------------------------
 
 def test_reduction_switch_scales_gradient_by_inverse_d():

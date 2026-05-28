@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from config import TitansConfig
 from data.dataloader import ParallelStreamLoader
 from model.titans_gpt2 import TitansMAGGPT2
-from train import build_optimizer, run_training
+from cli.train import build_optimizer, run_training
 
 
 @pytest.mark.slow

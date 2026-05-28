@@ -1,6 +1,6 @@
 """Phase 7.4 — behavior parity: cached generate vs reset-and-replay reference.
 
-The full Option-B correctness check: argmax-decoded tokens from generate()
+The full Option-B correctness check: argmax-decoded tokens from cli.generate()
 should match the argmax of a model() call on the same prompt+generated
 sequence, at every position.
 
@@ -12,7 +12,7 @@ import torch
 
 from config import TitansConfig
 from data.tokenizer import Tokenizer
-from generate import generate
+from cli.generate import generate
 from model.titans_gpt2 import TitansMAGGPT2
 
 
@@ -106,7 +106,7 @@ def test_cached_decode_long_prompt_uses_full_context():
     assert len(a_ids) > cfg.block_size
     assert len(b_ids) > cfg.block_size
 
-    # Use the shared helper (G249) instead of inlining the chunked-warm-up
+    # Use the shared helper instead of inlining the chunked-warm-up
     # pipeline. This way the test verifies the SAME code path generate /
     # needle use in production — if they diverge, this test catches it.
     def _last_logits_for(ids_list):

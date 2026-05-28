@@ -1,4 +1,4 @@
-"""Tests for softclamp_grad_norm (G265 — lucidrains-style soft norm clamp).
+"""Tests for softclamp_grad_norm (lucidrains-style soft norm clamp).
 
 Validates: (a) no-op for small-norm inputs, (b) saturation for large-norm,
 (c) smoothness across the transition, (d) autograd traceability,

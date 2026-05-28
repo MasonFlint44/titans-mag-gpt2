@@ -35,7 +35,7 @@ def test_forward_chunk_at_finetune_init_returns_zero_y():
 # ---------------------------------------------------------------------------
 
 def test_forward_chunk_no_boundaries_does_not_build_init_M():
-    """G211 — init_M is lazy; with no boundary it should never be allocated.
+    """init_M is lazy; with no boundary it should never be allocated.
     Verify indirectly by counting calls to _build_init_M."""
     nmm = NeuralMemoryModule(n_embd=8, expansion=2, finetune_mode=False)
     calls = []
@@ -54,7 +54,7 @@ def test_forward_chunk_no_boundaries_does_not_build_init_M():
 
 
 def test_forward_chunk_builds_init_M_only_once_per_chunk_with_boundaries():
-    """G211 — multiple boundaries in one chunk should reuse the same init_M."""
+    """multiple boundaries in one chunk should reuse the same init_M."""
     nmm = NeuralMemoryModule(n_embd=8, expansion=2, finetune_mode=False)
     calls = []
     orig = nmm._build_init_M
@@ -116,7 +116,7 @@ def test_forward_chunk_resets_state_at_boundary():
 # ---------------------------------------------------------------------------
 
 def test_boundary_mask_cpu_precomputed_not_per_token_indexed():
-    """T11 / G202 — the per-position 'any boundary?' mask must be computed
+    """T11 / the per-position 'any boundary?' mask must be computed
     ONCE on CPU before the T-token loop, not via per-token GPU indexing
     inside the loop. A regression to `doc_boundaries[:, t].any()` inside
     the loop would create T implicit GPU->CPU syncs per chunk, killing
@@ -159,13 +159,13 @@ def test_boundary_mask_cpu_precomputed_not_per_token_indexed():
         f"`.cpu()` called {cpu_call_count['n']} times during forward_chunk "
         f"on T={T}-token input — expected ~1 (the per-position boundary "
         f"mask precomputation). A per-token GPU->CPU sync regression "
-        f"would push this toward T or higher (G202)."
+        f"would push this toward T or higher."
     )
 
 
 def test_boundary_precomputation_does_not_fire_for_none_boundaries():
     """No doc_boundaries -> no .cpu() call at all (the precomputation
-    branch is skipped entirely). Defends G202's lazy-when-None
+    branch is skipped entirely). 's lazy-when-None
     optimization."""
     nmm = NeuralMemoryModule(n_embd=8, expansion=2, finetune_mode=False)
     state = nmm.init_state(B=2, device=torch.device("cpu"))

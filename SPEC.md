@@ -3,11 +3,10 @@
 This document is the authoritative specification for what the code in this
 repository actually does. It is the single source of truth for the
 implementation; sister documents in [`docs/`](docs/) (`ARCHITECTURE.md`,
-`CONFIG_REFERENCE.md`, `RUNBOOK.md`, `GLOSSARY.md`, `PLAN.md`,
-`TEST_PLAN.md`) describe design
-rationale, knobs, operations, terminology, planning history, and tests
-respectively. Where any of those disagree with this file, this file is
-correct and the others should be updated.
+`CONFIG_REFERENCE.md`, `RUNBOOK.md`, `GLOSSARY.md`, `TEST_PLAN.md`) describe
+design rationale, knobs, operations, terminology, and tests respectively.
+Where any of those disagree with this file, this file is correct and the
+others should be updated.
 
 Paper reference: Sun et al., *Titans: Learning to Memorize at Test Time*
 (arXiv:2501.00663). All equation numbers below refer to that paper.
@@ -117,7 +116,7 @@ a stride-0 view; `.clone()` materializes normal strides so vmap with
 `(M, S, conv_buf)` is **never saved in model checkpoints**. It is
 per-sequence state, not model state; resume re-initializes from
 `memory_mlp.W*.weight`. Session-level state I/O via
-`scripts/nmm_state_io.py` DOES persist the full triple
+`model/state_io.py` DOES persist the full triple
 (`fingerprint` includes `nmm_conv_kernel` so a shape mismatch errors at
 load). The checkpoint contract is in §8.5.
 
@@ -252,7 +251,7 @@ forward for int8).
    the chunk-level buffers (k_hat, q_hat, v, θ, η, α) to `state_dtype`.
    Required so `per_sample_grad_fn`'s `functional_call` (used by the
    reference path) doesn't fail at the inner `F.linear` with "expected
-   Float but found BFloat16" when state is bf16 (G256). The analytical
+   Float but found BFloat16" when state is bf16. The analytical
    inner-grad path is dtype-agnostic.
 5. If any boundary fires anywhere in the chunk, build `init_M` eagerly
    so the inner loop sees a stable tensor.
@@ -310,7 +309,7 @@ a 16 GiB consumer card.
 
 `forward_chunk(x_chunk, state_in, doc_boundaries)` priority:
 
-1. **Blockwise** when `block_size > 1` (G266) — chunk-as-update path
+1. **Blockwise** when `block_size > 1` — chunk-as-update path
    with TC-engaged batched matmuls.
 2. **Sequential** otherwise — paper-strict per-token recurrence.
 
@@ -375,7 +374,7 @@ of Q against the full cached K, V, returns `(y, k_full, v_full)`. When
 persistent positions `[0, n_persistent)` and on the most recent
 `swa_window` real positions; -inf elsewhere. Without this branch, decode
 under a model trained with SWA would silently attend over the full
-history (G243-adjacent invariant).
+history (adjacent invariant).
 
 ---
 
@@ -524,7 +523,7 @@ asserts, which would let invalid configs ship silently in production.
 | `use_swa and swa_window < 1` | `ValueError` (empty window → softmax NaN) |
 | `nmm_n_heads < 1` | `ValueError` |
 | `n_embd % nmm_n_heads != 0` | `ValueError` |
-| `not finetune_mode and chunk_size < block_size` | `warnings.warn` — wpe rows beyond `chunk_size` will never train (G163) |
+| `not finetune_mode and chunk_size < block_size` | `warnings.warn` — wpe rows beyond `chunk_size` will never train |
 
 `CausalSelfAttention.__init__` re-checks `n_embd % n_head` as defense in
 depth.
@@ -564,10 +563,10 @@ All factories accept `**overrides` and merge via `**{**defaults,
 | `True` | `'sum'` | NS divides by Frobenius — sum is natural |
 | `False` | `'mean'` | Without NS, sum gives gradients ~d_model× too large → silent divergence |
 
-### 5.4 Paper-vs-lucidrains flags (G254 / G255)
+### 5.4 Paper-vs-lucidrains flags
 
 These flags expose deliberate paper/lucidrains divergences as runtime
-config. **Defaults prefer the paper** (G255 default flip).
+config. **Defaults prefer the paper** (default flip).
 
 | Field | Default | Paper-strict (default) | Flip / alternative |
 |---|---|---|---|
@@ -582,7 +581,7 @@ regardless of these flags, so HF parity at init is unaffected. With
 no-op prepend (empty `[0, d]` parameter), so parity also holds across
 modes when `N_p=0`.
 
-### 5.5 Memory-saving flags (G256 / G257 / G258 / G259)
+### 5.5 Memory-saving flags
 
 Optional knobs that trade compute / minor numerical drift for VRAM.
 **Disabled by default**; the original numerical and performance
@@ -590,9 +589,9 @@ properties are preserved unless you opt in.
 
 | Field | Default | What it does | Cost |
 |---|---|---|---|
-| `nmm_state_dtype` | `"fp32"` | Storage dtype of `(M, S)` and per-step buffers. `"bf16"` halves their footprint, `"int8"` (blockwise-only) quarters it. NS5 still casts to fp32 internally (G226 invariant preserved). | Minor accumulated rounding in the per-step `M_t = (1−α)M_{t-1} + S_t` update — measure loss curves before relying on it. |
+| `nmm_state_dtype` | `"fp32"` | Storage dtype of `(M, S)` and per-step buffers. `"bf16"` halves their footprint, `"int8"` (blockwise-only) quarters it. NS5 still casts to fp32 internally (invariant preserved). | Minor accumulated rounding in the per-step `M_t = (1−α)M_{t-1} + S_t` update — measure loss curves before relying on it. |
 
-### 5.6 Capacity-vs-memory knobs (G261, G262, G263)
+### 5.6 Capacity-vs-memory knobs
 
 These deliberately trade NMM capacity for VRAM/speed. **Together they
 are the unlock for T=1024 on a 16 GiB consumer card** — measured peak
@@ -605,7 +604,7 @@ drops from ~13 GiB (OOM) to **3.8 GiB** at B=1 T=1024 with
 | `nmm_layer_indices` | `None` | If a list, only listed transformer blocks have NMM; others are `PlainGPT2Block` (attn + MLP, no NMM, no MAG gate; in `persistent_prefix_mode="model_wide"` they still see the model-level persistent prefix and apply a block-structured mask — §4.3). Linear reduction of NMM cost. The per-block NMM state slot is `None` at plain-block positions; `detach_states`, `compute_nmm_norm`, and the decode path all tolerate. Decode-time: plain blocks contribute only a KV cache. | Fewer NMM blocks = less mid-stack memory branch. Paper applies NMM at every block; subset is a deliberate departure. Best paired with `nmm_low_rank` so the remaining NMM blocks are themselves cheap. |
 | `nmm_low_rank` | `None` | If an int `r`, factor each `MemoryMLP` weight as `[r, in] @ [out, r]`. Per-step state goes from `3 × 4d²` to `3 × r × 5d` (≈ `5r/(4d)` of full-rank). At `d=768, r=64`: ~10× smaller — the single biggest unlock for long-T training. The `MemoryMLP`'s recurrent state goes from 3 keys (W1, W_gate, W2) to 6 keys (W1_a, W1_b, …); the checkpoint plumbing handles this via `state_keys` discovery at NMM `__init__`. NS5 converges on the factored rectangles (no special-casing needed). | Lower expressiveness than full-rank — limits the rank of representations the meta-learned `M` can encode. r=64 at d=768 is well above typical informational rank for memory_mlp-style maps so the loss is usually modest, but measure loss curves vs full-rank baseline before committing. Validation: `r >= n_embd` rejected (factored form would be larger than full-rank). |
 
-### 5.7 Inner-loop speed knobs (G264, G264a)
+### 5.7 Inner-loop speed knobs
 
 Capacity knobs (§5.6) fit T=1024 in VRAM but the step time is dominated
 by the per-token Python-supervised inner loop: ~30K small ops per chunk
@@ -630,7 +629,7 @@ gradients match the reference within fp32 round-off; this is locked
 by `tests/unit/test_nmm_fused.py`. Adds **~5-15% on top of
 `compile_inner_loop`**.
 
-#### Blockwise (chunk-as-update) NMM (G266) — the answer to "use tensor cores at T=1024"
+#### Blockwise (chunk-as-update) NMM — the answer to "use tensor cores at T=1024"
 
 `nmm_block_size > 1` switches the per-token sequential recurrence to a
 blockwise recurrence: every `block_size` consecutive tokens produce
@@ -679,17 +678,17 @@ This is the recommended path for any T >= 256 training run on
 consumer hardware where the paper-strict per-token recurrence's
 ~12 tok/s isn't acceptable.
 
-#### Full-model torch.compile (G277), 8-bit AdamW (G278), int8 KV cache (G279) — train/decode perf knobs
+#### Full-model torch.compile, 8-bit AdamW, int8 KV cache — train/decode perf knobs
 
 These three are operational knobs (CLI flags / API arguments) rather than model-config fields:
 
-- **`--compile-model` (G277)** — wraps the full `TitansMAGGPT2` in `torch.compile(mode="default", dynamic=False)` after construction, before DDP. Composes with `nmm_compile_inner_loop` (inner compile runs first; outer traces around it). The `_unwrap` helper in `model/__init__.py` strips `_orig_mod.` for checkpoint portability. Expect 10-20% throughput on top of inner-loop compile alone.
+- **`--compile-model`** — wraps the full `TitansMAGGPT2` in `torch.compile(mode="default", dynamic=False)` after construction, before DDP. Composes with `nmm_compile_inner_loop` (inner compile runs first; outer traces around it). The `_unwrap` helper in `model/__init__.py` strips `_orig_mod.` for checkpoint portability. Expect 10-20% throughput on top of inner-loop compile alone.
 
-- **`--optim8bit` (G278)** — uses `bnb.optim.AdamW8bit` instead of `torch.optim.AdamW`. Same 4-group layout. Optimizer state (m, v moments) is 8-bit block-quantized; fp32 master weights unchanged. Requires `bitsandbytes` package (in the `optim8bit` optional dependency group). Memory: optimizer state drops ~4×.
+- **`--optim8bit`** — uses `bnb.optim.AdamW8bit` instead of `torch.optim.AdamW`. Same 4-group layout. Optimizer state (m, v moments) is 8-bit block-quantized; fp32 master weights unchanged. Requires `bitsandbytes` package (in the `optim8bit` optional dependency group). Memory: optimizer state drops ~4×.
 
-- **`int8_kv_cache` (G279)** — passed to `prepare_decode` / `prepare_decode_chunked` / `generate()`. Quantizes the attention KV cache to int8 + per-`(batch, head, token)` fp16 scale via the `KVCacheInt8` container. Dequantizes only at the SDPA call. Decode-time only — training-path attention always uses dense bf16. ~2× cache memory savings, <5% logit drift over short decode runs (locked by test).
+- **`int8_kv_cache`** — passed to `prepare_decode` / `prepare_decode_chunked` / `generate()`. Quantizes the attention KV cache to int8 + per-`(batch, head, token)` fp16 scale via the `KVCacheInt8` container. Dequantizes only at the SDPA call. Decode-time only — training-path attention always uses dense bf16. ~2× cache memory savings, <5% logit drift over short decode runs (locked by test).
 
-**KV-cache structure under int8** (G279):
+**KV-cache structure under int8**:
 
 `KVCacheInt8` is a class with `.int8`, `.scale` tensors and `.dense(dtype)`, `.append(new_fp)` methods. `isinstance(cache, KVCacheInt8)` branches the SDPA path in `forward_with_kv_cache`:
 
@@ -701,12 +700,12 @@ if isinstance(k_cache, KVCacheInt8):
 
 The plain (dense bf16) path is unchanged — existing tests/integrations don't break.
 
-#### Fused NS5 (G274) and int8 state (G275)
+#### Fused NS5 and int8 state
 
-- **`nmm_compile_ns5` (G274)** — wraps `newton_schulz5` in a module-level `torch.compile` singleton. Collapses 10 matmul launches + 10 elementwise op launches into one CUDA graph. No effect when `nmm_compile_inner_loop=True` (already traces NS5 transitively). Most useful for blockwise / per_token_ns5 / decode-time paths. First call pays 1-3 s warm-up.
-- **`nmm_state_dtype="int8"` (G275)** — third state-dtype option alongside `"fp32"` and `"bf16"`. Per-sample per-tensor symmetric int8 quantization (scale = max_abs / 127) of the recurrent (M, S) state; companion `_qs` fp16 scalar scale entries live in the same dict. Blockwise path dequantizes on entry, runs in fp32, requantizes on exit. Sequential / scan paths raise `NotImplementedError` (per-token quant/dequant would be both slow and noisy). Validation requires `nmm_block_size > 1`. Memory: roughly half of bf16 state, a quarter of fp32 state.
+- **`nmm_compile_ns5`** — wraps `newton_schulz5` in a module-level `torch.compile` singleton. Collapses 10 matmul launches + 10 elementwise op launches into one CUDA graph. No effect when `nmm_compile_inner_loop=True` (already traces NS5 transitively). Most useful for blockwise / per_token_ns5 / decode-time paths. First call pays 1-3 s warm-up.
+- **`nmm_state_dtype="int8"`** — third state-dtype option alongside `"fp32"` and `"bf16"`. Per-sample per-tensor symmetric int8 quantization (scale = max_abs / 127) of the recurrent (M, S) state; companion `_qs` fp16 scalar scale entries live in the same dict. Blockwise path dequantizes on entry, runs in fp32, requantizes on exit. Sequential / scan paths raise `NotImplementedError` (per-token quant/dequant would be both slow and noisy). Validation requires `nmm_block_size > 1`. Memory: roughly half of bf16 state, a quarter of fp32 state.
 
-**State-dict structure under int8** (G275):
+**State-dict structure under int8**:
 
 The state dicts gain `_qs` scale companion entries when `nmm_state_dtype="int8"`:
 
@@ -725,17 +724,17 @@ Dequantized: `M_fp32 = int8.float() * scale.float().view(B, 1, 1)`. Callers that
 
 Quantization noise enters once per block; over many blocks it accumulates. Validate loss curves on your data when training at long T.
 
-#### Truncated BPTT (G268), lookahead value (G269), per-param LR (G270), higher-order momentum (G272), shared-MemoryMLP (G271) — paper / lucidrains parity knobs
+#### Truncated BPTT, lookahead value, per-param LR, higher-order momentum, shared-MemoryMLP — paper / lucidrains parity knobs
 
 These five flags add ablation knobs from lucidrains' `titans-pytorch` and
 from paper-described optional refinements. Defaults are off; existing
 training recipes are unaffected.
 
-- **`nmm_detach_state_between_blocks` (G268)** — blockwise-path-only. Detaches `(M, S)` at every block boundary so the backward graph spans one block. Peak transient memory drops ~proportionally to `T / block_size`. Outer params still receive gradient via the block they appear in; only the cross-block recurrence link is cut. Requires `nmm_block_size > 1`.
-- **`nmm_lookahead_value` (G269)** — inner loss target shifts from `v_t` (reconstruction) to `v_{t+1}` (prediction). Last token of the chunk has θ zeroed (no future v within chunk). Applied chunk-level in both forward paths (blockwise, sequential) via `_apply_lookahead_v`.
-- **`nmm_per_param_lr_modulation` (G270)** — `W_theta` projects to K scalars instead of 1, one per state-key. Updates use per-key θ. K = 3 for full-rank, 6 for low-rank.
-- **`nmm_momentum_order` (G272)** — N-th order momentum. State S becomes a tuple of N dicts (when N > 1); recurrence is `S_k_t = η_k·S_k_{t-1} + S_{k-1}_t` with S_1's surprise term. `W_eta` projects to N scalars. M update reads S_N.
-- **`nmm_per_head_learned_params` (G271)** — multi-head NMM only. When False, all heads share the same `MemoryMLP` instance; per-head state (M, S) remains independent. Param count drops ~`n_heads×`. Rejected at `n_heads = 1`.
+- **`nmm_detach_state_between_blocks`** — blockwise-path-only. Detaches `(M, S)` at every block boundary so the backward graph spans one block. Peak transient memory drops ~proportionally to `T / block_size`. Outer params still receive gradient via the block they appear in; only the cross-block recurrence link is cut. Requires `nmm_block_size > 1`.
+- **`nmm_lookahead_value`** — inner loss target shifts from `v_t` (reconstruction) to `v_{t+1}` (prediction). Last token of the chunk has θ zeroed (no future v within chunk). Applied chunk-level in both forward paths (blockwise, sequential) via `_apply_lookahead_v`.
+- **`nmm_per_param_lr_modulation`** — `W_theta` projects to K scalars instead of 1, one per state-key. Updates use per-key θ. K = 3 for full-rank, 6 for low-rank.
+- **`nmm_momentum_order`** — N-th order momentum. State S becomes a tuple of N dicts (when N > 1); recurrence is `S_k_t = η_k·S_k_{t-1} + S_{k-1}_t` with S_1's surprise term. `W_eta` projects to N scalars. M update reads S_N.
+- **`nmm_per_head_learned_params`** — multi-head NMM only. When False, all heads share the same `MemoryMLP` instance; per-head state (M, S) remains independent. Param count drops ~`n_heads×`. Rejected at `n_heads = 1`.
 
 State-structure invariants for callers reading internal state:
 - Single-head, `momentum_order == 1`: `state = (M, S, conv_buf)` triple of dicts (§2.2).
@@ -766,7 +765,7 @@ Validation:
 | Field | Default | Notes |
 |---|---|---|
 | `use_swa` | `False` | Sliding Window Attention. **Off by default** for GPT-2 fine-tune (pretrained with full attn). |
-| `swa_window` | 256 | Field name is `swa_window`, NOT `window_size` (G126). |
+| `swa_window` | 256 | Field name is `swa_window`, NOT `window_size`. |
 | `finetune_mode` | `True` | Controls MAG gate variant + `out_scale` init + presence of `gamma_attn`. |
 
 ---
@@ -798,7 +797,7 @@ The conv buffer is part of `nmm_states[i][2]` (item 6 — no separate
 
 ### 6.1 `prepare_decode`
 
-1. **Eval-mode contract** (G243). Raises `RuntimeError` if `self.training`.
+1. **Eval-mode contract**. Raises `RuntimeError` if `self.training`.
    In train mode with dropout > 0, `forward_with_kv_cache` skips
    resid_dropout / SDPA dropout while the warm-up block forward applies
    both. The two paths' attention outputs would diverge silently and break
@@ -825,8 +824,8 @@ prompt; for multi-head states the check digs into `first_layer[0][0]`.
 ### 6.2 `prepare_decode_chunked`
 
 Encapsulates the chunked-warm-up + tail-`prepare_decode` pipeline so
-`generate.py`, `eval.needle_in_haystack`, and behavior tests don't each
-re-implement it (G249).
+`generate.py`, `evaluation.needle_in_haystack`, and behavior tests don't each
+re-implement it.
 
 - `prompt_len ≤ block_size`: equivalent to `prepare_decode(prompt_idx)`.
 - `prompt_len > block_size`: chunks the prefix through `forward()` in
@@ -840,7 +839,7 @@ Same eval-mode contract as `prepare_decode`.
 
 ### 6.3 `forward_step`
 
-1. Eval-mode contract (G243).
+1. Eval-mode contract.
 2. Reject `cache["position"] >= block_size` (wpe OOB).
 3. Embed `wte(token_id) + wpe([position])` → `[B, 1, d]`. No persistent
    prepend at decode-step time — the prefix is already in each block's
@@ -854,9 +853,9 @@ Same eval-mode contract as `prepare_decode`.
 ### 6.4 `generate(prompt, max_new_tokens, temperature, top_k, tokenizer)`
 
 Wraps the cache pipeline (`generate.py`). Sampling order is
-**temperature → top-k mask → softmax → multinomial** (G173). `temperature
+**temperature → top-k mask → softmax → multinomial**. `temperature
 ≤ 0` collapses to argmax. Mode is captured-and-restored via `try/finally`
-(G161).
+.
 
 `max_new_tokens` is capped against block_size:
 
@@ -935,7 +934,7 @@ prefix capacity.
 len(list(model.parameters()))` so no param is missing or double-counted.
 
 AdamW betas are `(0.9, 0.95)` — **not** PyTorch default `(0.9, 0.999)`
-(G153). `eps=1e-8`.
+. `eps=1e-8`.
 
 ### 8.2 LR schedule (`apply_lr`)
 
@@ -944,14 +943,14 @@ Linear warmup to peak over `warmup_steps`, then cosine decay to
 
 `warmup_steps` and `max_steps` are **required positional args** (no
 defaults) so callers cannot silently inherit a 1k/100k schedule on a
-200-step overfit (G175). `max_steps <= warmup_steps` raises `ValueError`
-(G197).
+200-step overfit. `max_steps <= warmup_steps` raises `ValueError`
+.
 
 `base_lrs` MUST come from code-level constants (use
 `base_lrs_from_constants()`), never from
 `optimizer.param_groups[i]['lr']` after `load_state_dict` — that captures
 the mid-cosine deflated value and compounds the deflation every resume
-(G162).
+.
 
 ### 8.3 TBPTT step (`train_step` / `run_training`)
 
@@ -968,11 +967,11 @@ Per accumulation cycle (every `accum_steps` micro-batches):
 
 1. `apply_lr(...)`.
 2. `grad_norm = clip_grad_norm_(model.parameters(), GRAD_CLIP=1.0)`.
-   Always run **outside autocast in fp32** (G159); clip inside bf16
+   Always run **outside autocast in fp32**; clip inside bf16
    computes the norm in low precision and defeats clipping.
 3. If `torch.isfinite(grad_norm)`: `optimizer.step()`.
    Else: **NaN-skip** — `optimizer.zero_grad(set_to_none=True)` and reset
-   `nmm_states = None` (G158/G213/G217). Returning the existing state
+   `nmm_states = None`. Returning the existing state
    would propagate a NaN-tainted M through the next forward and livelock
    until the next document boundary.
 4. `optimizer.zero_grad(set_to_none=True)`.
@@ -982,21 +981,21 @@ Per accumulation cycle (every `accum_steps` micro-batches):
 - `is_distributed=True`: caller wraps `model` with `DDP`. All but the last
   micro-batch in an accumulation cycle run inside `model.no_sync()` to
   suppress per-microbatch all-reduce; the last micro-batch triggers the
-  all-reduce (G200).
+  all-reduce.
 - **Partial-cycle guard** (`is_partial_cycle(batch, accum_i)`): when
   `batch is None and accum_i > 0`, the loader exhausted mid-cycle. Under
   DDP, the per-rank `.grad` buffers were never AllReduce'd; stepping
   would diverge ranks permanently. Discard the cycle's accumulated grads
   (`optimizer.zero_grad`), reset `nmm_states = None`, and return. Single-
-  GPU treats partial as complete (G214/G222).
+  GPU treats partial as complete.
 - **Checkpoint barrier**: rank 0 owns the write; all ranks `dist.barrier()`
   afterwards so non-rank-0 doesn't race into the next iteration while
-  rank 0 is still flushing to disk (G199).
+  rank 0 is still flushing to disk.
 - **NCCL teardown**: `dist.destroy_process_group()` in the entry-point
-  script's `try/finally` (G225/G227).
+  script's `try/finally`.
 - **Per-rank seed**: all ranks build identical params from the seed, then
   re-seed `seed + rank` after model construction so dropout masks diverge
-  (G204).
+.
 
 ### 8.5 Checkpoints
 
@@ -1013,18 +1012,18 @@ torch.save({
 
 - `_unwrap(model)` strips `torch.compile` (`_orig_mod`) and `DDP/FSDP`
   (`module`) prefixes so the saved state_dict is portable across
-  wrapping choices on resume (G184/G186/G195).
+  wrapping choices on resume.
 - `config` is **required** (not optional). `finetune_mode` controls block
   topology (`gamma_attn` presence, `out_scale` init); resume needs it to
   rebuild the same structure.
 - **NMM `(M, S, conv_buf)` states are intentionally NOT saved in model
   checkpoints.** They are per-sequence accumulators; resume re-initializes
   via `nmm.init_state(B, device)`. Session-level state persistence (for
-  multi-turn generation) goes through `scripts/nmm_state_io.py` instead
+  multi-turn generation) goes through `model/state_io.py` instead
   (§6 / module docstring).
 
 `load_checkpoint(path, device)`: `torch.load(path,
-weights_only=False)` (G168 — PyTorch 2.6+ flipped the default; our nested
+weights_only=False)` (PyTorch 2.6+ flipped the default; our nested
 optimizer state would be rejected at `weights_only=True`). Caller rebuilds
 the model from `ckpt["config"]`, then `model.load_state_dict`, then
 optimizer construct + (optional) `optimizer.load_state_dict`.
@@ -1044,7 +1043,7 @@ continuity to preserve).
 A naive `DataLoader(shuffle=False, batch_size=B)` does NOT give this
 property: it would collate chunks [0..B-1] into batch 0, [B..2B-1] into
 batch 1, ..., and the carried `nmm_states[i]` would jump over B-1 chunks
-between batches — silent cross-document state corruption (G151).
+between batches — silent cross-document state corruption.
 
 ---
 
@@ -1116,7 +1115,7 @@ block_size` enforces.
    cycle and ends training rather than risking rank divergence.
 8. **Decode parity.** `prepare_decode` / `forward_step` produce the same
    logits as a single full `forward(prompt + [token])` to within float
-   precision; preserved by the eval-mode contract (G243).
+   precision; preserved by the eval-mode contract.
 9. **Long-prompt decode is bounded.** `prepare_decode_chunked` caps
    `forward_step` calls to `block_size − P + 1` (short prompt) or 1
    (long prompt — wpe OOB otherwise).
@@ -1134,31 +1133,30 @@ titans-mag-gpt2/
 ├── LICENSE                  MIT.
 ├── docs/
 │   ├── ARCHITECTURE.md          Design decisions, equations, block diagram.
-│   ├── PLAN.md                  Phase-by-phase implementation guide.
 │   ├── CONFIG_REFERENCE.md      Every config knob with range / defaults.
 │   ├── TEST_PLAN.md             Unit / integration / parity / DDP test plan.
 │   ├── RUNBOOK.md               What to do when training breaks.
 │   ├── GLOSSARY.md              TITANS terminology.
 │   ├── EXPERIMENTS.md           Ablation plan and success criteria.
-│   ├── GAP_HISTORY.md           Audit log (background reading).
-│   ├── ROADMAP.md               Phase-by-phase delivery plan.
-│   └── IMPLEMENTATION_PROMPT.md One-shot bootstrap prompt for fresh agents.
+│   └── archive/                 Historical bootstrap plans + audit log.
 ├── config.py                TitansConfig dataclass + factories.
+├── evaluation.py            Perplexity + needle-in-haystack.
 ├── model/
-│   ├── __init__.py          _unwrap helper.
+│   ├── __init__.py          Package exports.
 │   ├── nmm.py               NeuralMemoryModule, MultiHeadNMM, NS5, helpers.
 │   ├── block.py             TitansMAGBlock, CausalSelfAttention, GPT2MLP.
-│   └── titans_gpt2.py       TitansMAGGPT2 + decode pipeline.
+│   ├── titans_gpt2.py       TitansMAGGPT2 + decode pipeline.
+│   └── state_io.py          NMM state save/load (persistent sessions).
 ├── data/
 │   ├── tokenizer.py         tiktoken wrapper.
 │   ├── dataset.py           Document stream helpers.
 │   └── dataloader.py        ParallelStreamLoader.
-├── scripts/
-│   ├── load_pretrained.py   HF GPT-2 weight loader (Conv1D → Linear transpose).
-│   └── finetune.py          Fine-tune entry point.
-├── train.py                 build_optimizer, train_step, run_training, schedule, ckpts.
-├── generate.py              Cached autoregressive sampling.
-├── eval.py                  Perplexity + needle-in-haystack.
+├── cli/
+│   ├── train.py             build_optimizer, train_step, run_training, ckpts.
+│   ├── generate.py          Cached autoregressive sampling.
+│   ├── finetune.py          Single-GPU finetune entry point.
+│   └── nmm_cli.py           Shared --nmm-* argparse helpers.
+├── scripts/                 Experiment scripts (corpus prep, eval, benchmarks).
 ├── tests/                   See docs/TEST_PLAN.md.
 └── diagrams/                Mermaid diagrams.
 ```

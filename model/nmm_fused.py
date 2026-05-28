@@ -3,7 +3,7 @@
 The reference path in `nmm.py` uses `vmap(grad(inner_loss))` which pays
 ~10 ms of Python / autograd-graph-construction overhead per token. At
 T=1024 over 12 NMM layers that's ~12 000 calls per chunk — the
-dominant cost in TITANS-MAG training (G264 — see SPEC §5.7).
+dominant cost in TITANS-MAG training (see SPEC §5.7).
 
 This module computes the per-token gradient of the inner MSE loss
 w.r.t. each `MemoryMLP` recurrent weight in closed form. Every
@@ -368,7 +368,7 @@ def analytical_inner_grad(
 
 
 # ---------------------------------------------------------------------------
-# Chunk-aggregate analytical gradient (G266) — sums per-token gradients into
+# Chunk-aggregate analytical gradient — sums per-token gradients into
 # one weight gradient per chunk via batched matmuls. The per-token math is
 # unchanged from `analytical_inner_grad`; the difference is that all T tokens
 # share M_block_start and contribute additively to one update gradient.
@@ -431,7 +431,7 @@ def _memory_mlp_backward_fullrank_chunk(
 
     When `theta_per_token` is provided: returns `Σ_t θ_t · ∇_t` — each
     per-token gradient gets weighted by its own θ_t before being summed
-    into the chunk aggregate. This is the G267 paper-faithful refinement
+    into the chunk aggregate. This is the paper-faithful refinement
     (matches paper Eq 16's `Σ_i θ_i ∇ℓ(M_0; x_i)` term without needing to
     materialise per-token gradient tensors). NO extra memory cost vs the
     plain aggregate path — θ is folded into the existing einsum.
@@ -505,7 +505,7 @@ def _memory_mlp_backward_lowrank_chunk(
     """Low-rank chunk-aggregate backward — returns dict of gradients in
     canonical sorted-low-rank order. When `theta_per_token` is provided,
     each per-token gradient gets weighted by θ_t before being summed
-    (paper Eq 16, G267). No extra memory vs the plain aggregate path."""
+    (paper Eq 16). No extra memory vs the plain aggregate path."""
     pre1 = interm["pre1"]; preg = interm["preg"]
     silu1 = interm["silu1"]; sigg = interm["sigg"]; a = interm["a"]
     t1 = interm["t1"]; tg = interm["tg"]; t2 = interm["t2"]
@@ -563,7 +563,7 @@ def analytical_chunk_grad(
     to summing `analytical_inner_grad` per-token.
 
     When `theta_per_token` is provided: returns `Σ_t θ_t · grad(loss_t)` —
-    the paper-faithful (G267) per-token weighted aggregation. Used by the
+    the paper-faithful per-token weighted aggregation. Used by the
     blockwise path to match paper Eq 16's `Σ_i θ_i ∇ℓ(M_0; x_i)` structure
     while keeping memory cost identical to the plain aggregate (θ is folded
     into the existing einsum, no per-token gradient tensors materialised).
@@ -631,7 +631,7 @@ def analytical_chunk_grad(
 
 
 # ---------------------------------------------------------------------------
-# Per-token analytical gradient over a chunk (G267, paper Eq 16 refinement)
+# Per-token analytical gradient over a chunk (, paper Eq 16 refinement)
 # Returns gradients with the per-TOKEN dim retained — caller can apply NS5
 # and per-token theta WEIGHTING before summing, matching the paper's chunked
 # formulation `Σ_i θ_i NS5(∇ℓ(M_0; x_i))` rather than our v1 blockwise

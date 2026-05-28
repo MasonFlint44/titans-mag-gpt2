@@ -63,7 +63,7 @@ def test_tied_weights_lm_head_is_wte_T():
 
 
 # ---------------------------------------------------------------------------
-# G155 — GPT-2 init scales
+# GPT-2 init scales
 # ---------------------------------------------------------------------------
 
 def test_wte_init_std_is_002_not_default_1():
@@ -113,7 +113,7 @@ def test_attn_qkv_projections_use_unscaled_std():
 
 
 # ---------------------------------------------------------------------------
-# G203 — NMM-internal modules skipped by IDENTITY, not name
+# NMM-internal modules skipped by IDENTITY, not name
 # ---------------------------------------------------------------------------
 
 def test_nmm_internal_inits_preserved_after_apply_gpt2_init():
@@ -129,7 +129,7 @@ def test_nmm_internal_inits_preserved_after_apply_gpt2_init():
     # If _apply_gpt2_init had overwritten with N(0, 0.02), std would be ~0.02.
     assert abs(actual - expected_xavier_std) / expected_xavier_std < 0.10, (
         f"NMM memory_mlp.W1 std={actual:.4f}; expected Xavier ~{expected_xavier_std:.4f}. "
-        f"_apply_gpt2_init may have stomped on it (G203)."
+        f"_apply_gpt2_init may have stomped on it."
     )
 
 
@@ -161,7 +161,7 @@ def test_persistent_mem_init_scale_not_clobbered():
 
 
 def test_renaming_self_nmm_does_not_break_id_skip_pattern():
-    """G203 directly: an id-based skip must work for ANY module that IS a
+    """directly: an id-based skip must work for ANY module that IS a
     NeuralMemoryModule, regardless of attribute name. Verify by manually
     constructing the skip set the same way _apply_gpt2_init does."""
     cfg = _tiny_cfg()
@@ -179,7 +179,7 @@ def test_renaming_self_nmm_does_not_break_id_skip_pattern():
 
 
 def test_apply_gpt2_init_uses_relative_import():
-    """G224 — source must contain `from .nmm import NeuralMemoryModule`.
+    """source must contain `from.nmm import NeuralMemoryModule`.
     Absolute `from model.nmm` would break under any top-level package rename."""
     import ast
     import inspect
@@ -196,7 +196,7 @@ def test_apply_gpt2_init_uses_relative_import():
     assert any(
         imp.module == "nmm" and any(a.name == "NeuralMemoryModule" for a in imp.names)
         for imp in relative_imports
-    ), "Expected `from .nmm import NeuralMemoryModule` (G224)"
+), "Expected `from.nmm import NeuralMemoryModule`"
     # Belt-and-suspenders: no absolute import of the same symbol.
     absolute_imports = [
         node
@@ -205,7 +205,7 @@ def test_apply_gpt2_init_uses_relative_import():
     ]
     for imp in absolute_imports:
         assert imp.module != "model.nmm", (
-            "Absolute `from model.nmm import ...` defeats G224 — use relative."
+            "Absolute `from model.nmm import ...` defeats use relative."
         )
 
 

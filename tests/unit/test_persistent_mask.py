@@ -58,7 +58,7 @@ def test_real_to_real_block_is_upper_triangular_causal():
 
 
 def test_swa_banded_mask_attends_only_to_window():
-    """G136: with use_swa=True, real token i attends to real j in (i-W, i]."""
+    """with use_swa=True, real token i attends to real j in (i-W, i]."""
     W = 3
     block = _tiny_block(N_p=2, T=8, use_swa=True, swa_window=W)
     mask = block._aug_mask(T=8)

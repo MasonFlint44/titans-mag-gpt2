@@ -35,7 +35,7 @@ def test_encode_corpus_appends_eot_between_and_after_docs():
 
 
 def test_encode_corpus_literal_endoftext_is_BPE_not_special_id():
-    """G152 — literal <|endoftext|> in source text must encode as BPE characters,
+    """literal <|endoftext|> in source text must encode as BPE characters,
     NOT as the special EOT id 50256. Otherwise document boundaries get fabricated
     inside user content."""
     tok = Tokenizer()
@@ -59,11 +59,11 @@ def test_encode_corpus_single_empty_doc_is_just_eot():
 
 
 # ---------------------------------------------------------------------------
-# G210 — warn when a file handle is passed directly
+# warn when a file handle is passed directly
 # ---------------------------------------------------------------------------
 
 def test_encode_corpus_warns_on_file_handle():
-    """G210: iterating a file yields lines, not documents. Without the warning,
+    """iterating a file yields lines, not documents. Without the warning,
     `with open(path) as f: tok.encode_corpus(f)` silently inserts an EOT
     after every line, firing reset_state per line and killing the NMM's
     long-range memory with no signal."""
@@ -105,7 +105,7 @@ def test_encode_corpus_does_not_warn_on_generator_of_strings():
 # ---------------------------------------------------------------------------
 
 def test_encode_corpus_whole_file_pattern_produces_one_document(tmp_path):
-    """The G210 warning recommends `encode_corpus([f.read()])` as the
+    """The warning recommends `encode_corpus([f.read()])` as the
     correct whole-file-as-one-document pattern. The negative test
     `test_encode_corpus_warns_on_file_handle` covers the WRONG case;
     this is the POSITIVE invariant: when wrapped in a list around

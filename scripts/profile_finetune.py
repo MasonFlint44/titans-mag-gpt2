@@ -37,7 +37,7 @@ from data.dataloader import ParallelStreamLoader
 from data.tokenizer import Tokenizer
 from model.titans_gpt2 import TitansMAGGPT2
 from scripts.load_pretrained import load_pretrained
-from train import build_optimizer
+from cli.train import build_optimizer
 
 
 # Same recipe as docs/QA_RECALL_PLAN.md / docs/RUNBOOK.md consumer-GPU defaults.
@@ -56,7 +56,7 @@ def main() -> None:
     p.add_argument(
         "--data", type=Path, required=True,
         help="Path to the training corpus (same file you'd pass to "
-             "scripts/finetune.py).",
+             "cli/finetune.py).",
     )
     p.add_argument(
         "--out", type=Path, default=Path("profiles/titans"),
@@ -151,8 +151,8 @@ def main() -> None:
     # each optimizer-step boundary. We don't need save logic, LR scheduling,
     # or checkpoint rotation for the profile — just the hot path.
     import torch.nn.functional as F
-    from train import GRAD_CLIP, BASE_LR_GPT2, BASE_LR_NMM, apply_lr
-    from train import base_lrs_from_constants
+    from cli.train import GRAD_CLIP, BASE_LR_GPT2, BASE_LR_NMM, apply_lr
+    from cli.train import base_lrs_from_constants
 
     base_lrs = base_lrs_from_constants()
     model.train()

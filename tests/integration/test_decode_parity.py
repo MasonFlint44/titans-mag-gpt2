@@ -80,9 +80,9 @@ def test_cached_decode_matches_full_forward_one_step():
     fixed next token. Compare against a full forward on [prompt, next_token]
     — logits at position P must match within fp32 noise.
 
-    Tolerance is the G234 scaled form: max(1e-4, 5e-3 * |ref|_max). The
+    Tolerance is the scaled form: max(1e-4, 5e-3 * |ref|_max). The
     untrained tiny-model NMM produces small-magnitude logits (~0.25), and
-    per-token NMM updates compound ~5e-5 of conv-kernel-shape drift (G230
+    per-token NMM updates compound ~5e-5 of conv-kernel-shape drift (
     family) across n_layer blocks → ~5e-4 absolute diff per token, which
     is ~2e-3 relative. The finetune_mode=True test (NMM zeroed) confirms
     the diff is from the NMM path, not the attention path."""
@@ -123,7 +123,7 @@ def test_cached_decode_matches_full_forward_multi_step():
 
 
 def test_cached_decode_matches_full_forward_multi_step_batched():
-    """G241 — same multi-step parity but at B=2 (batched decode). Every
+    """same multi-step parity but at B=2 (batched decode). Every
     other cached-decode correctness test runs at B=1; this is the only
     test that would catch a regression in batched paths (per-sample vmap
     inside step_with_conv, batched KV cache concat, batched conv buffer
@@ -162,7 +162,7 @@ def _check_multi_step_parity(cfg, model, prompt, decoded, P, N):
         cached_logits = torch.cat(per_step_logits, dim=1)  # [B, N, V]
         ref_window = ref_logits[:, P - 1:P - 1 + N, :]  # [B, N, V]
 
-    # G234-style scaled tolerance. The relative bound (1e-2 = 1%) absorbs
+    #-style scaled tolerance. The relative bound (1e-2 = 1%) absorbs
     # fp32 reduction-order noise that compounds per-sample inside the
     # NMM's per-token update loop; at B=2 the per-sample paths produce
     # slightly different rounding than the B=1 case (~3x larger absolute
@@ -177,7 +177,7 @@ def _check_multi_step_parity(cfg, model, prompt, decoded, P, N):
 
 
 def test_cached_decode_matches_full_forward_with_swa():
-    """G238 — at use_swa=True, the cached decode path must apply the same
+    """at use_swa=True, the cached decode path must apply the same
     banded mask as the warm-up `_aug_mask`. Without the SWA-aware mask in
     forward_with_kv_cache, the new token would silently attend to the
     full real history and produce different logits than the reference
@@ -205,7 +205,7 @@ def test_cached_decode_matches_full_forward_with_swa():
         cache = model.prepare_decode(prompt)
         step_logits, _ = model.forward_step(next_tok, cache)
 
-    # Same G234 scaled tolerance as the non-SWA multi-step test.
+    # Same scaled tolerance as the non-SWA multi-step test.
     ref_max = ref_step.abs().max().item()
     tol = max(1e-4, 1e-2 * ref_max)
     diff = (step_logits - ref_step).abs().max().item()
@@ -249,7 +249,7 @@ def test_forward_step_rejects_position_past_block_size():
 
 
 def test_prepare_decode_rejects_wrong_length_initial_nmm_states():
-    """G240 — if a caller passes initial_nmm_states with the wrong number of
+    """if a caller passes initial_nmm_states with the wrong number of
     layers, prepare_decode must fail loudly here, not deep inside the first
     forward_step. The unvalidated `zip(self.blocks, nmm_states)` would
     silently truncate; the resulting partial cache then IndexErrors in
@@ -264,7 +264,7 @@ def test_prepare_decode_rejects_wrong_length_initial_nmm_states():
 
 
 def test_prepare_decode_rejects_wrong_batch_dim_initial_nmm_states():
-    """G244 — state built for B=1 passed to a prompt of B=2 must fail at
+    """state built for B=1 passed to a prompt of B=2 must fail at
     prepare_decode, not silently produce a shape-mismatch deep in the NMM."""
     cfg, model = _tiny_model()
     prompt = torch.randint(0, cfg.vocab_size, (2, 4))  # B=2
@@ -275,7 +275,7 @@ def test_prepare_decode_rejects_wrong_batch_dim_initial_nmm_states():
 
 
 def test_prepare_decode_rejects_train_mode():
-    """G243 — train mode + dropout would silently break the decode-vs-full-forward
+    """train mode + dropout would silently break the decode-vs-full-forward
     parity invariant because init_decode_cache and block.forward apply different
     dropout patterns. Fail loudly so direct callers don't ship the bug."""
     cfg, model = _tiny_model()
@@ -286,7 +286,7 @@ def test_prepare_decode_rejects_train_mode():
 
 
 def test_prepare_decode_chunked_short_prompt_matches_prepare_decode():
-    """G249 — for short prompts (P <= block_size) the chunked helper must
+    """for short prompts (P <= block_size) the chunked helper must
     behave identically to a plain prepare_decode."""
     torch.manual_seed(0)
     cfg, model = _tiny_model()
@@ -303,7 +303,7 @@ def test_prepare_decode_chunked_short_prompt_matches_prepare_decode():
 
 
 def test_prepare_decode_chunked_long_prompt_threads_nmm_state_across_prefix():
-    """G249 — long-prompt path runs the prefix through forward() so the NMM
+    """long-prompt path runs the prefix through forward() so the NMM
     sees every token, then prepare_decode on the tail. Two prompts that
     differ only in their prefix must produce different last_logits."""
     torch.manual_seed(0)
@@ -337,7 +337,7 @@ def test_prepare_decode_chunked_long_prompt_threads_nmm_state_across_prefix():
 
 
 def test_prepare_decode_chunked_rejects_train_mode():
-    """G249 — same eval-mode contract as prepare_decode (G243). Asserting
+    """same eval-mode contract as prepare_decode. Asserting
     here means the chunked-warm-up loop doesn't run its dropout-different
     forward path before the inner prepare_decode would have rejected the
     whole thing."""
@@ -349,7 +349,7 @@ def test_prepare_decode_chunked_rejects_train_mode():
 
 
 def test_forward_step_rejects_train_mode():
-    """G243 — symmetric guard on forward_step. A caller could call
+    """symmetric guard on forward_step. A caller could call
     prepare_decode in eval, then flip the model to train and forward_step;
     the silent divergence would still bite."""
     cfg, model = _tiny_model()
@@ -412,7 +412,7 @@ def test_model_wide_with_plain_blocks_and_swa_decode_parity():
         cache = model.prepare_decode(prompt)
         step_logits, _ = model.forward_step(next_tok, cache)
 
-    # Same scaled tolerance as the SWA test above (G234).
+    # Same scaled tolerance as the SWA test above.
     ref_max = ref_step.abs().max().item()
     tol = max(1e-4, 1e-2 * ref_max)
     diff = (step_logits - ref_step).abs().max().item()

@@ -1,12 +1,11 @@
 # Config Reference — `TitansConfig`
 
 Every knob on `TitansConfig` with its type, valid range, default, and what
-happens at the boundary. Source of truth: `config.py`. Detailed rationale per
-field in `PLAN.md` §0.2.
+happens at the boundary. Source of truth: `config.py`.
 
 > All validation is in `__post_init__` using `raise ValueError`, **not** `assert`
-> (G190, G220, G223 — `python -O` strips asserts). Invalid configs fail at
-> construction, not at first forward.
+> (`python -O` strips asserts). Invalid configs fail at construction, not at
+> first forward.
 
 ## Quick start
 
@@ -30,7 +29,7 @@ footgun if you pass dims as fixed kwargs alongside `**overrides`).
 | Field | Type | Default (small) | Range | Notes |
 |---|---|---|---|---|
 | `n_layer` | `int` | 12 | ≥ 1 | Number of transformer blocks |
-| `n_head` | `int` | 12 | ≥ 1, must divide `n_embd` | `n_embd % n_head != 0` → `ValueError` (G223) |
+| `n_head` | `int` | 12 | ≥ 1, must divide `n_embd` | `n_embd % n_head != 0` → `ValueError` |
 | `n_embd` | `int` | 768 | ≥ 1, multiple of `n_head` | Model dim (`d_model`) |
 | `block_size` | `int` | 1024 | ≥ 1 | Position embedding table size; max attention context |
 | `vocab_size` | `int` | 50257 | matches tokenizer | GPT-2 BPE |
@@ -45,7 +44,7 @@ Factory presets:
 | `gpt2_large()` | 36 | 20 | 1280 |
 | `gpt2_xl()` | 48 | 25 | 1600 |
 
-HF model path is derived from `n_embd` in `load_pretrained` (G216) — passing
+HF model path is derived from `n_embd` in `load_pretrained` — passing
 `n_embd=1024` automatically pulls `openai-community/gpt2-medium`.
 
 ---
@@ -57,12 +56,12 @@ HF model path is derived from `n_embd` in `load_pretrained` (G216) — passing
 | `nmm_depth` | `int` | 2 | `== 2` | `L_M` in the paper. Only L_M=2 (single SwiGLU block) is implemented; other values raise `ValueError` at config construction. Wiring up L_M > 2 requires generalizing the analytical-gradient + Triton kernels; the paper's ablations show only marginal gains beyond 2. |
 | `nmm_expansion` | `int` | 4 | ≥ 1 | Hidden dim multiplier (`hidden = expansion · n_embd`). `=1` halves state memory but reduces capacity |
 | `nmm_conv_kernel` | `int` | 4 | ≥ 1 | Depthwise conv kernel size in Q/K/V projections (§4.4 of paper). `=1` disables temporal mixing |
-| `nmm_spectral_norm` | `bool` | `True` | — | Newton-Schulz 5-step on inner gradient. **Toggling this requires also changing inner-loss reduction** (G160 — see below) |
+| `nmm_spectral_norm` | `bool` | `True` | — | Newton-Schulz 5-step on inner gradient. **Toggling this requires also changing inner-loss reduction** (see below) |
 | `nmm_n_persistent` | `int` | 4 | ≥ 0 | Number of learned persistent tokens prepended per block. `=0` disables them |
-| `chunk_size` | `int` | 512 | 1 ≤ x ≤ `block_size` | TBPTT chunk length. `> block_size` → `ValueError` (would OOB `wpe`). From-scratch users should set `chunk_size = block_size` to avoid the G163 untrained-`wpe`-rows warning. |
-| `nmm_n_heads` | `int` | 1 | ≥ 1, must divide `n_embd` | NUMBER of parallel NMM heads. Default `1` = single-head (current behavior). `>1` instantiates `MultiHeadNMM` wrapping N parallel `NeuralMemoryModule`s on `head_dim = n_embd // n_heads`. NOT in the paper proper — this is a lucidrains enhancement exposed for ablation (G254). When `>1`, the per-layer NMM state becomes a list of per-head `(M, S)` tuples; `detach_states` / `compute_nmm_norm` handle this recursively. |
+| `chunk_size` | `int` | 512 | 1 ≤ x ≤ `block_size` | TBPTT chunk length. `> block_size` → `ValueError` (would OOB `wpe`). From-scratch users should set `chunk_size = block_size` to avoid the untrained-`wpe`-rows warning. |
+| `nmm_n_heads` | `int` | 1 | ≥ 1, must divide `n_embd` | NUMBER of parallel NMM heads. Default `1` = single-head (current behavior). `>1` instantiates `MultiHeadNMM` wrapping N parallel `NeuralMemoryModule`s on `head_dim = n_embd // n_heads`. NOT in the paper proper — this is a lucidrains enhancement exposed for ablation. When `>1`, the per-layer NMM state becomes a list of per-head `(M, S)` tuples; `detach_states` / `compute_nmm_norm` handle this recursively. |
 
-## Memory-saving knobs (G256 / G257)
+## Memory-saving knobs
 
 Reach for these when training OOMs on the per-token NMM graph (the
 typical failure mode at `chunk_size >= 64` on consumer GPUs).
@@ -71,9 +70,9 @@ properties are preserved.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `nmm_state_dtype` | `str` | `"fp32"` | Storage dtype for the recurrent `(M, S)` and per-step update buffers. `"bf16"` roughly halves per-step state retention; `"int8"` (blockwise path only) quarters it. NS5 still casts to fp32 internally (G226), so the spectral-norm fixed point is preserved. The drift risk for bf16 is the per-step `M_t = (1-α)·M_{t-1} + S_t` rounding — measure loss curves before relying on it. Valid: `"fp32"`, `"bf16"`, `"int8"`. `fp16` is rejected (would need loss scaling). |
+| `nmm_state_dtype` | `str` | `"fp32"` | Storage dtype for the recurrent `(M, S)` and per-step update buffers. `"bf16"` roughly halves per-step state retention; `"int8"` (blockwise path only) quarters it. NS5 still casts to fp32 internally, so the spectral-norm fixed point is preserved. The drift risk for bf16 is the per-step `M_t = (1-α)·M_{t-1} + S_t` rounding — measure loss curves before relying on it. Valid: `"fp32"`, `"bf16"`, `"int8"`. `fp16` is rejected (would need loss scaling). |
 
-## Capacity-vs-memory knobs (G261, G262, G263)
+## Capacity-vs-memory knobs
 
 These trade NMM capacity for VRAM/speed. Together they're the **big
 unlock** for T=1024 on consumer hardware — at gpt2_small d=768 default
@@ -124,10 +123,10 @@ TitansConfig.gpt2_small(
 )
 ```
 
-### CLI flags (`train.py` / `scripts/finetune.py`)
+### CLI flags (`train.py` / `cli/finetune.py`)
 
 The NMM perf/memory knobs are also exposed as `--nmm-*` CLI flags on both
-training entry points (registered via `scripts/_nmm_cli.py::add_nmm_args`).
+training entry points (registered via `cli/nmm_cli.py::add_nmm_args`).
 Omit a flag to keep the factory default; only the flags you set get
 passed to `TitansConfig`. Quick reference:
 
@@ -189,7 +188,7 @@ polar decomposition" sections below for the gram-NS5-vs-CANS choice.
    full-rank MemoryMLP overflows 15.5 GiB. Tradeoff: outer NMM params learn
    from 64-token windows, not full 1024-token windows.
 3. `--nmm-state-dtype bf16` — half-precision recurrent state. Composes
-   with NS5 fp32 invariant (G226).
+   with NS5 fp32 invariant.
 4. `--compile-model` — full-model `torch.compile`. ~13% speedup + ~1.2 GiB
    memory savings (fused kernels). 1-3 min warm-up on first step.
 5. `--optim8bit` — 8-bit AdamW from `bitsandbytes`. ~1.2 GiB optimizer
@@ -291,7 +290,7 @@ Measured on RTX 5070 Ti at the recommended recipe:
 | 3 | 0.74 s | 1.49× | ~0.20 |
 
 The same magnitude of spectral-norm drift broke training under bf16 NS5
-(G226), so don't drop below 5 without verifying convergence on your data.
+, so don't drop below 5 without verifying convergence on your data.
 For short fine-tunes where eval loss can be sanity-checked, lowering to 4
 is a safe-feeling experiment. For long pre-training, stay at 5.
 
@@ -360,7 +359,7 @@ TitansConfig.gpt2_small(
 
 ---
 
-## Inner-loop speed knobs (G264, G264a)
+## Inner-loop speed knobs
 
 Capacity knobs above (`low_rank`, `layer_indices`, etc.) fit T=1024 but
 the step time is dominated by the **Python-supervised per-token inner
@@ -389,19 +388,19 @@ similar throughput at this scale. The algorithmic answer for serious
 training throughput is **`nmm_block_size > 1`** (blockwise path),
 which batches matmuls across tokens to engage TC.
 
-### Blockwise NMM (G266, G267) — chunk-as-update for tensor-core engagement
+### Blockwise NMM — chunk-as-update for tensor-core engagement
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `nmm_block_size` | `int` | `1` | Chunk-as-update aggregation. At `1` (default), the inner loop is paper-strict per-token. At `>1`, every `nmm_block_size` consecutive tokens produce ONE memory update via batched matmul. **TC engages at `block_size >= 16`** — every forward matmul (pre1, preg, y, retrieval) becomes a `[B, H, D] @ [B, D, block_size] → [B, H, block_size]` GEMM where the `block_size` is the N dim. Gradient accumulation across the block is a single `einsum("bth,btd->bhd", d_pre1, k)` — also TC-eligible. Trailing block may be smaller than `block_size`; math handles it (just runs without TC on that one block). |
-| `nmm_per_token_ns5` | `bool` | `False` | G267 paper-faithful refinement. When `True` + `block_size > 1`, the blockwise update applies NS5 PER TOKEN and weights by per-token θ before summing — matching paper Eq 16's `Σ_t θ_t · NS5(∇_t)` exactly. The default (`False`) uses v1's `θ_mean · NS5(Σ_t ∇_t)` simplification. **Note**: a tempting "cheap" approach — folding θ into the pre-NS5 aggregation — does NOT work because NS5 normalises the Frobenius norm, cancelling any positive scalar applied before it. Real per-token θ weighting requires per-token NS5, which materialises per-token gradient tensors of shape `[B, block, H, D]` per key. **Cost**: ~5-10× slower than `per_token_ns5=False` and significantly higher peak memory; at gpt2_small T=1024 with `block_size=64` it OOMs at 16 GiB. Use only when paper-strict per-token θ matters and your config has the memory budget (small T or rented compute) — reach for `nmm_low_rank` if memory is tight. |
+| `nmm_per_token_ns5` | `bool` | `False` | paper-faithful refinement. When `True` + `block_size > 1`, the blockwise update applies NS5 PER TOKEN and weights by per-token θ before summing — matching paper Eq 16's `Σ_t θ_t · NS5(∇_t)` exactly. The default (`False`) uses v1's `θ_mean · NS5(Σ_t ∇_t)` simplification. **Note**: a tempting "cheap" approach — folding θ into the pre-NS5 aggregation — does NOT work because NS5 normalises the Frobenius norm, cancelling any positive scalar applied before it. Real per-token θ weighting requires per-token NS5, which materialises per-token gradient tensors of shape `[B, block, H, D]` per key. **Cost**: ~5-10× slower than `per_token_ns5=False` and significantly higher peak memory; at gpt2_small T=1024 with `block_size=64` it OOMs at 16 GiB. Use only when paper-strict per-token θ matters and your config has the memory budget (small T or rented compute) — reach for `nmm_low_rank` if memory is tight. |
 
 **Approximation cost at `block_size > 1`**:
 - All tokens within a block share the block-start M for surprise gradient AND retrieval. Paper's per-token M_{t-1} resolution becomes per-block M_{block-1}.
 - One theta/eta/alpha per block (mean over the block's tokens) instead of per-token.
 - At `block_size = 1`, math is identical to the sequential path (locked by tests).
 
-**Measured impact for `per_token_ns5=True`** (G267, paper-faithful):
+**Measured impact for `per_token_ns5=True`** (, paper-faithful):
 
 | Config | Step time | tok/s | Peak VRAM |
 |---|---|---|---|
@@ -445,7 +444,7 @@ TitansConfig.gpt2_small(
 
 At `nmm_block_size=64`, a 50k-step training run goes from **~7 weeks (sequential)** to **~31 hours**. At `nmm_block_size=128`, ~14 hours. This is the breakthrough that makes real training on a consumer card viable.
 
-### Full-model `torch.compile` (G277)
+### Full-model `torch.compile`
 
 CLI flag (not a config field — runtime concern): `--compile-model`.
 
@@ -458,9 +457,9 @@ Wraps the full `TitansMAGGPT2` in `torch.compile(mode="default", dynamic=False)`
 - DDP is applied AFTER compile (model = DDP(torch.compile(model))).
 - Dropout, gradient checkpointing, autocast all compose normally.
 
-**G282 — graph-break suppression**: the NMM's `bool(doc_boundaries.any())` scalar read at `_forward_chunk_blockwise` / `_forward_chunk_sequential` would otherwise split the compiled forward at every NMM block boundary (dynamo can't trace `.item()` / `bool(tensor)` without help). `train.py` sets `torch._dynamo.config.capture_scalar_outputs = True` at module import to include the scalar sync in the captured graph instead. The Python-level downstream branch (`if any_boundary: ...`) causes mild specialization, but our SQuAD-style training has `doc_boundaries.any() == False` for the overwhelming majority of chunks, so dynamo caches the False-branch graph and reuses it. Without G282, you'd see `W ... Graph break from 'Tensor.item()'` in the log at first step and lose ~2-5% steady-state throughput.
+**graph-break suppression**: the NMM's `bool(doc_boundaries.any())` scalar read at `_forward_chunk_blockwise` / `_forward_chunk_sequential` would otherwise split the compiled forward at every NMM block boundary (dynamo can't trace `.item()` / `bool(tensor)` without help). `train.py` sets `torch._dynamo.config.capture_scalar_outputs = True` at module import to include the scalar sync in the captured graph instead. The Python-level downstream branch (`if any_boundary: ...`) causes mild specialization, but our SQuAD-style training has `doc_boundaries.any() == False` for the overwhelming majority of chunks, so dynamo caches the False-branch graph and reuses it. Without, you'd see `W ... Graph break from 'Tensor.item()'` in the log at first step and lose ~2-5% steady-state throughput.
 
-### 8-bit AdamW (G278)
+### 8-bit AdamW
 
 CLI flag: `--optim8bit`. Requires `bitsandbytes` installed (`pip install bitsandbytes` or use the `optim8bit` optional dependency group in `pyproject.toml`).
 
@@ -470,7 +469,7 @@ Switches the optimizer from `torch.optim.AdamW` to `bnb.optim.AdamW8bit`. The 4-
 
 **Quality drift**: bitsandbytes' own benchmarks show <1% loss-curve drift vs fp32 AdamW at standard transformer training. We have NOT empirically validated this for TITANS' inner-loop training dynamics; the NMM's per-token surprise gradient has different magnitude statistics than standard transformer gradients. Treat as a memory-savings option; measure loss curves on your own data before relying on it for long runs.
 
-### Int8 KV cache for decode (G279)
+### Int8 KV cache for decode
 
 API-level option (not a config field — decode-time concern): `int8_kv_cache=True` argument to `prepare_decode`, `prepare_decode_chunked`, and the `generate()` function.
 
@@ -486,13 +485,13 @@ For long-context generation (e.g., 8K tokens cached across 12 layers), this is ~
 
 **Composability**: dense (bf16) and int8 caches go through the same `forward_with_kv_cache` path; `isinstance(cache, KVCacheInt8)` branches the append + dequant logic. Plain GPT-2 blocks (no NMM) support it too.
 
-### Int8 state (G275)
+### Int8 state
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `nmm_state_dtype="int8"` | `str` | `"fp32"` | Third option alongside `"fp32"` and `"bf16"`. State dicts carry `key` (int8 tensor) plus `key_qs` (fp16 per-sample scale) companion entries. Per-sample, per-tensor symmetric quantization (scale = max_abs / 127). Dequantize on chunk entry, run blockwise math in fp32, requantize on chunk exit. **Blockwise path only** — sequential, scan v2, `step()`, `step_with_conv()` all raise `NotImplementedError` (those paths update state per-token; dequantize/requantize on every step would be both slow and noisy). Validation requires `nmm_block_size > 1`. Memory savings: ~2× smaller than bf16 for the state value tensors (the `_qs` scale companions are negligible). Quantization noise enters once per block and accumulates over many blocks — validate loss curves on your data when training at long T. |
 
-### Truncated BPTT — detach state between blocks (G268)
+### Truncated BPTT — detach state between blocks
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -500,19 +499,19 @@ For long-context generation (e.g., 8K tokens cached across 12 layers), this is ~
 
 **When to enable**: training contexts longer than what one chunk can hold — e.g., 4K context split into 4 chunks of 1024. Without detach, backward through 4 chunks accumulates the full 4× per-chunk graph. With detach, only one chunk's worth of state is alive at a time. At single-chunk training (T = chunk_size = block_size) the effect is bounded by the number of blocks in a chunk.
 
-### Lookahead value (G269)
+### Lookahead value
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `nmm_lookahead_value` | `bool` | `False` | When `True`, NMM's inner reconstruction loss uses `v_{t+1}` as the target for token `t` instead of `v_t` (predictive instead of reconstructive). The last token has no `v_{t+1}` within the chunk; its surprise contribution is dropped (M update is `(1-α)·M_{t-1}` decay only). Affects all three forward paths (blockwise, sequential, scan v2). Lucidrains' `store_with_lookahead_value` flag. Use when your downstream task benefits from a next-token-prediction-style inner loss instead of key→value reconstruction. |
 
-### Per-parameter LR modulation (G270)
+### Per-parameter LR modulation
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `nmm_per_param_lr_modulation` | `bool` | `False` | When `True`, `W_theta`'s output expands from 1 scalar per token to K scalars (one per state-key — 3 for full-rank, 6 for low-rank). Each weight matrix's update uses its OWN data-dependent θ. Tiny parameter overhead (~hundreds extra params at gpt2_small); meaningful expressivity gain when different state keys have different gradient scales. Affects all paths except scan v1 / scan v2 (those raise `NotImplementedError`). Lucidrains' `per_parameter_lr_modulation`. |
 
-### Higher-order momentum (G272)
+### Higher-order momentum
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -520,13 +519,13 @@ For long-context generation (e.g., 8K tokens cached across 12 layers), this is ~
 
 **State structure changes**: at `nmm_momentum_order > 1`, the per-layer NMM state's S field becomes a `tuple` of N dicts (one per momentum level) instead of a single dict. `init_state`, `reset_state`, `detach_states` all handle both shapes transparently — but callers reading state internals should branch on `isinstance(S, tuple)`.
 
-### Per-head shared MemoryMLP (G271)
+### Per-head shared MemoryMLP
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `nmm_per_head_learned_params` | `bool` | `True` | When `False` AND `nmm_n_heads > 1`, every head's `MemoryMLP` recurrent weights point at the SAME `nn.Module` instance; parameter count for the inner weights drops by ~n_heads×. Per-head (M, S) recurrent state remains independent at runtime; LayerNorm / out_scale / Q/K/V projections / update-param Linears remain head-private. Validation: rejected at `n_heads = 1` (nothing to share). Lucidrains' `per_head_learned_parameters`. |
 
-### Soft norm clamping (G265)
+### Soft norm clamping
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -551,7 +550,7 @@ TitansConfig.gpt2_small(
 # CLI for the documented consumer-GPU recipe (README.md, RUNBOOK.md).
 ```
 
-**G160 — `nmm_spectral_norm` and inner-loss reduction are linked:**
+**`nmm_spectral_norm` and inner-loss reduction are linked:**
 
 | `nmm_spectral_norm` | Inner-loss reduction | Why |
 |---|---|---|
@@ -569,7 +568,7 @@ If you flip the flag, the reduction must flip too. This is handled inside `Neura
 | `use_swa` | `bool` | `False` | — | Sliding Window Attention. Recommended **off** for GPT-2 fine-tune (pretrained with full attn); **on** for from-scratch long-context experiments |
 | `swa_window` | `int` | 256 | ≥ 1 if `use_swa=True` | `use_swa=True and swa_window < 1` → `ValueError` (softmax NaN at step 0) |
 
-Note: field is `swa_window`, **not** `window_size` (G126).
+Note: field is `swa_window`, **not** `window_size`.
 
 ---
 
@@ -579,10 +578,10 @@ Note: field is `swa_window`, **not** `window_size` (G126).
 |---|---|---|---|
 | `finetune_mode` | `bool` | `True` | Selects the MAG gate formula and `out_scale` init (see below) |
 
-## Paper-vs-lucidrains flags (G254)
+## Paper-vs-lucidrains flags
 
 These flags expose two deliberate paper/lucidrains divergences as runtime
-config. **Defaults prefer paper-strict** (G254 default-flip). Flip to
+config. **Defaults prefer paper-strict** (default-flip). Flip to
 `False` for lucidrains-flavored ablations.
 
 | Field | Type | Default | Notes |
@@ -609,7 +608,7 @@ config. **Defaults prefer paper-strict** (G254 default-flip). Flip to
 
 ## Optimizer and training (constructed outside `TitansConfig`)
 
-These are passed to `train.py` / `apply_lr` directly, not stored on the config object. **Critical: `base_lrs` must be sourced from code-level constants, not from `optimizer.param_groups[i]['lr']`** (G162 — each resume cycle silently compounds LR deflation otherwise).
+These are passed to `train.py` / `apply_lr` directly, not stored on the config object. **Critical: `base_lrs` must be sourced from code-level constants, not from `optimizer.param_groups[i]['lr']`** (each resume cycle silently compounds LR deflation otherwise).
 
 | Constant | Default | Notes |
 |---|---|---|
@@ -617,10 +616,10 @@ These are passed to `train.py` / `apply_lr` directly, not stored on the config o
 | `BASE_LR_NMM` | `9e-4` | LR for `nmm_decay` / `nmm_no_decay` groups (3× GPT-2 per paper) |
 | `WEIGHT_DECAY` | `0.1` | Applied only to `_decay` groups |
 | `BETAS` | `(0.9, 0.95)` | AdamW betas |
-| `WARMUP_STEPS` | `2000` (recommended for production) | Thread explicitly into `apply_lr` — no module-level constant in `train.py`; `apply_lr` requires it positional (G175). CLI defaults are smaller for quick local runs: `train.py --warmup-steps` defaults to `1000`, `scripts/finetune.py --warmup-steps` defaults to `500`. For real training runs override with `--warmup-steps 2000`. |
-| `MAX_STEPS` | run-specific | Thread explicitly into `apply_lr` (G175) |
+| `WARMUP_STEPS` | `2000` (recommended for production) | Thread explicitly into `apply_lr` — no module-level constant in `train.py`; `apply_lr` requires it positional. CLI defaults are smaller for quick local runs: `train.py --warmup-steps` defaults to `1000`, `cli/finetune.py --warmup-steps` defaults to `500`. For real training runs override with `--warmup-steps 2000`. |
+| `MAX_STEPS` | run-specific | Thread explicitly into `apply_lr` |
 | `LR_MIN_RATIO` | `0.1` | Cosine schedule floor as fraction of peak |
-| `GRAD_CLIP` | `1.0` | Applied in fp32 even under bf16 autocast (G159) |
+| `GRAD_CLIP` | `1.0` | Applied in fp32 even under bf16 autocast |
 
 ### Param-group routing rules
 
@@ -665,17 +664,16 @@ NMM state is **not saved in checkpoints** — it's per-sequence, not model state
 |---|---|---|
 | `chunk_size > block_size` | `ValueError` at config build | Would OOB the wpe table |
 | `chunk_size < block_size` (from-scratch) | `warnings.warn` | wpe rows beyond `chunk_size` never trained → long-context generation degrades silently |
-| `n_embd % n_head != 0` | `ValueError` at config build (G223) | Plus the same check in `CausalSelfAttention.__init__` (G220, defense in depth) |
+| `n_embd % n_head != 0` | `ValueError` at config build | Plus the same check in `CausalSelfAttention.__init__` (, defense in depth) |
 | `use_swa=True and swa_window < 1` | `ValueError` | Empty window → softmax over zero entries → NaN |
 | `nmm_n_persistent < 0` | `ValueError` | Negative tensor dim |
 | `nmm_expansion < 1` | `ValueError` | Empty hidden layer |
-| `python -O` flag at runtime | **Validation still fires** | We use `raise ValueError`, not `assert` — see G190/G220/G223 |
+| `python -O` flag at runtime | **Validation still fires** | We use `raise ValueError`, not `assert` — see//|
 
 ---
 
 ## Cross-references
 
-- Full implementation per phase: `ROADMAP.md` §0.2, `PLAN.md` §0.2
-- Why these specific safeguards: `GAP_HISTORY.md` (search for the G-numbers above)
 - What to do when training fails despite valid config: `RUNBOOK.md`
 - Test coverage for validation: `TEST_PLAN.md` §4 (Phase 0 unit tests)
+- Historical implementation notes: `archive/PLAN.md`, `archive/GAP_HISTORY.md`

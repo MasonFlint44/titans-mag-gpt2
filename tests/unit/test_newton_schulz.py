@@ -31,7 +31,7 @@ def test_spectral_norm_bound_for_any_shape(shape):
     # (a+b+c = 0.701, not 1). For random inputs the 5-step iteration
     # converges to a basin near sigma ~ 1.0-1.20 — bounded, not exact.
     # The bound is what we need for inner-loop stability; "approximately 1"
-    # in docs/PLAN.md / the diagram refers to this loose basin. See G230.
+    # in docs/archive/PLAN.md / the diagram refers to this loose basin. See.
     assert 0.80 < s < 1.25, f"shape={shape}: out of post-NS5 basin, got {s}"
 
 
@@ -45,7 +45,7 @@ def test_spectral_norm_bound_with_batch_dim():
 
 
 # ---------------------------------------------------------------------------
-# Transpose-tall guard (G198)
+# Transpose-tall guard
 # ---------------------------------------------------------------------------
 
 def test_transpose_guard_tall_matrix_W1_shape():
@@ -74,7 +74,7 @@ def test_transpose_guard_preserves_output_shape():
 
 
 # ---------------------------------------------------------------------------
-# Theta-cancellation property (paper §3.2 / docs/PLAN.md §1.5)
+# Theta-cancellation property (paper §3.2 / docs/archive/PLAN.md §1.5)
 # ---------------------------------------------------------------------------
 
 def test_pre_scaling_is_cancelled_by_NS():
@@ -99,11 +99,11 @@ def test_output_dtype_matches_input_dtype(dtype):
 
 
 # ---------------------------------------------------------------------------
-# G226 — internal matmuls run in fp32 under ambient bf16 autocast
+# internal matmuls run in fp32 under ambient bf16 autocast
 # ---------------------------------------------------------------------------
 
 def test_internal_matmul_runs_fp32_under_bf16_autocast():
-    """Direct G226 defence: instrument __matmul__ and verify every NS matmul
+    """Direct defence: instrument __matmul__ and verify every NS matmul
     output is fp32 even with the parent autocast enabled in bf16.
     """
     seen_dtypes: list[torch.dtype] = []
@@ -131,7 +131,7 @@ def test_internal_matmul_runs_fp32_under_bf16_autocast():
 
 
 def test_spectral_norm_bound_holds_under_bf16_autocast():
-    """Behavioural twin of the matmul-dtype check: with G226 in place, the
+    """Behavioural twin of the matmul-dtype check: with in place, the
     NS output's spectral norm should be ~1 even when called from within a
     bf16 autocast region. Without the autocast-disable wrap, the iteration
     would run in bf16 and the spectral norm would spread to [0.7, 1.4].
@@ -140,9 +140,9 @@ def test_spectral_norm_bound_holds_under_bf16_autocast():
     with torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16):
         G_ns = newton_schulz5(G)
     s = _spectral_norm(G_ns)
-    # Without G226 the iteration would run in bf16 and spread to [0.7, 1.4];
-    # with G226 it stays in the fp32 NS5 basin (~0.80-1.25).
-    assert 0.80 < s < 1.25, f"out of post-NS5 basin (G226 broken?), got {s}"
+    # Without the iteration would run in bf16 and spread to [0.7, 1.4];
+    # with it stays in the fp32 NS5 basin (~0.80-1.25).
+    assert 0.80 < s < 1.25, f"out of post-NS5 basin (broken?), got {s}"
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +255,7 @@ def test_cans_output_dtype_matches_input_dtype(dtype):
 
 
 def test_cans_internal_matmul_runs_fp32_under_bf16_autocast():
-    """G226 defence: CANS must keep its iteration in fp32 even under an
+    """defence: CANS must keep its iteration in fp32 even under an
     ambient bf16 autocast. CANS-3 does 3 iterations × 2 matmuls = 6 inside
     matmuls (plus the F-norm has no matmul)."""
     seen_dtypes: list[torch.dtype] = []

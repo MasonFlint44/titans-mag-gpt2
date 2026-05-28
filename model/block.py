@@ -52,7 +52,7 @@ def _build_aug_mask(
     return mask
 
 
-# G279 — int8 KV cache (decode-time only).
+# int8 KV cache (decode-time only).
 #
 # Each cached K or V tensor at a transformer block has shape
 # [B, n_head, T_seen, head_dim]. Per-head, per-token symmetric int8
@@ -97,7 +97,7 @@ def _dequantize_int8_kv(q: torch.Tensor, scale: torch.Tensor, dtype=torch.bfloat
 
 
 class KVCacheInt8:
-    """G279 — quantized container for one (K or V) decode-time cache.
+    """quantized container for one (K or V) decode-time cache.
 
     The class wraps `(int8_tensor, scale_tensor)` and exposes:
       - `dense(dtype)`: full dequantized tensor, ready for SDPA.
@@ -234,7 +234,7 @@ class CausalSelfAttention(nn.Module):
         k_new = self.k_proj(x_new).view(B, 1, n, d).transpose(1, 2)
         v_new = self.v_proj(x_new).view(B, 1, n, d).transpose(1, 2)
 
-        # G279 — int8 KV cache branch: append new K, V in int8 form; dequant
+        # int8 KV cache branch: append new K, V in int8 form; dequant
         # to bf16 for SDPA. The returned cache stays in int8 form to keep
         # the memory footprint small across decode steps.
         if isinstance(k_cache, KVCacheInt8):
@@ -303,7 +303,7 @@ class PlainGPT2Block(nn.Module):
     prefix, no MAG gate.
 
     Used when `config.nmm_layer_indices` is set and the current block's
-    position is NOT in that list (G261). Same forward signature as
+    position is NOT in that list. Same forward signature as
     `TitansMAGBlock` so the model's per-block loop is uniform:
         x, state = block(x, state, doc_boundaries)
     State is passed through unchanged (None for plain blocks); the
@@ -389,7 +389,7 @@ class PlainGPT2Block(nn.Module):
         state involvement. Signature mirrors `TitansMAGBlock.init_decode_cache`
         so the model's per-block decode loop is uniform.
 
-        `int8_kv_cache=True` returns `KVCacheInt8` containers (G279) for
+        `int8_kv_cache=True` returns `KVCacheInt8` containers for
         the K and V caches; the rest of the block API is dtype-agnostic.
         """
         B, T, _ = x_prompt.shape

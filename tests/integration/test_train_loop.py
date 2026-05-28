@@ -7,7 +7,7 @@ from config import TitansConfig
 from data.dataloader import ParallelStreamLoader
 from data.tokenizer import Tokenizer
 from model.titans_gpt2 import TitansMAGGPT2
-from train import (
+from cli.train import (
     build_optimizer,
     is_partial_cycle,
     load_checkpoint,
@@ -18,7 +18,7 @@ from train import (
 
 
 # ---------------------------------------------------------------------------
-# G222 — partial-cycle skip condition (pure function)
+# partial-cycle skip condition (pure function)
 # ---------------------------------------------------------------------------
 
 def test_is_partial_cycle_at_cycle_start():
@@ -42,7 +42,7 @@ def test_is_partial_cycle_with_batch_present_is_never_partial():
 
 
 def test_is_partial_cycle_at_K_minus_one():
-    """G222 case: StopIteration at accum_i=K-1 (last iter). Naive check
+    """case: StopIteration at accum_i=K-1 (last iter). Naive check
     `accum_i < K-1` would return False here (silent off-by-one); correct
     check returns True."""
     # For K=4, accum_i=3 with batch=None is partial.
@@ -98,7 +98,7 @@ def test_run_training_with_grad_accum_single_gpu():
 
 def test_run_training_restarts_loader_on_exhaustion_to_reach_max_steps():
     """The naive single-iter(loader) outside the while loop silently early-stops
-    when max_steps > batches-per-epoch on a small corpus. docs/PLAN.md §4.5 wraps
+    when max_steps > batches-per-epoch on a small corpus. docs/archive/PLAN.md §4.5 wraps
     in `for epoch in range(N_EPOCHS):` — verify run_training does the equivalent
     by restarting the iterator on StopIteration."""
     cfg = TitansConfig(
@@ -250,7 +250,7 @@ def test_resume_matches_uninterrupted_training_in_param_space(tmp_path):
 def test_resume_advances_params_and_loads_optimizer_state(tmp_path):
     """Structural complement to the equivalence test: after a save/load
     cycle, the LOADED optimizer must actually carry forward its momentum
-    (G134 / G153 / G168 round-trip already covers this at the state_dict
+    (/ / round-trip already covers this at the state_dict
     level; this is the BEHAVIOR check that resume actually uses the
     loaded state)."""
     cfg = _resume_setup()
@@ -326,7 +326,7 @@ def test_resume_after_nan_skip_does_not_crash(tmp_path):
     # Inject NaN: patch the model to corrupt loss. We do this by hooking the
     # tokens with an out-of-range index — but our model would crash, not return
     # NaN. Instead, monkey-patch clip_grad_norm_ to return inf to trigger the
-    # G158 NaN-skip path.
+    # NaN-skip path.
     import torch.nn as nn
     real_clip = nn.utils.clip_grad_norm_
 

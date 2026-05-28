@@ -202,7 +202,7 @@ def evaluate_one(
     handle long prompts via chunked warm-up.
 
     Mode is captured-and-restored by the surrounding `evaluate` driver via
-    try/finally (G161 pattern).
+    try/finally (pattern).
     """
     prompt_text, prompt_len, actual_distance = build_qa_prompt(
         target, distractor_pool, distance, tokenizer, rng,
@@ -355,17 +355,17 @@ def _load_model(checkpoint_path: Path, device: torch.device):
     """
     from model.titans_gpt2 import TitansMAGGPT2
     from model import _unwrap
-    from train import load_checkpoint
+    from cli.train import load_checkpoint
 
     ckpt = load_checkpoint(checkpoint_path, device=device)
     if "config" not in ckpt:
         raise SystemExit(
             f"Checkpoint {checkpoint_path} lacks a 'config' key. "
-            f"Pass a checkpoint saved by `save_checkpoint` from train.py."
+            f"Pass a checkpoint saved by `save_checkpoint` from cli.train.py."
         )
     config = TitansConfig.from_dict(ckpt["config"])
     model = TitansMAGGPT2(config).to(device)
-    # train.py stores under "state_dict" (G184/G186/G195 path); generate.py
+    # train.py stores under "state_dict" (//path); generate.py
     # used "model" in an earlier draft — accept either for forward compat.
     state = ckpt.get("state_dict", ckpt.get("model"))
     if state is None:

@@ -2,7 +2,7 @@
 
 CPU parity tests (test_hf_logit_parity.py) run at (B=1, T=4) because the
 NMM forward at gpt2_small dims is ~250ms per token-per-layer on CPU
-(G231). On GPU the same forward is milliseconds, so we can exercise
+. On GPU the same forward is milliseconds, so we can exercise
 realistic batch and sequence shapes.
 
 Same invariant as the CPU tests: with N_p=0 and out_scale=0, our model's

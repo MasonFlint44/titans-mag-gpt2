@@ -37,7 +37,7 @@ def test_drops_trailing_remainder():
 
 
 # ---------------------------------------------------------------------------
-# Position-i continuity (G151) — the defining property
+# Position-i continuity — the defining property
 # ---------------------------------------------------------------------------
 
 def test_position_i_streams_are_contiguous_across_batches():
@@ -114,7 +114,7 @@ def test_no_boundary_when_no_eot_in_segment():
 
 
 # ---------------------------------------------------------------------------
-# DDP sharding (G191)
+# DDP sharding
 # ---------------------------------------------------------------------------
 
 def test_ddp_rank_partition_gives_disjoint_segments():
@@ -139,7 +139,7 @@ def test_ddp_rank_partition_gives_disjoint_segments():
 
 
 def test_ddp_each_rank_has_same_num_chunks():
-    """G191 requirement for synchronous DDP: every rank's loader yields the
+    """requirement for synchronous DDP: every rank's loader yields the
     same number of batches (otherwise hang at the all-reduce barrier)."""
     stream = torch.arange(1000, dtype=torch.long)
     counts = []

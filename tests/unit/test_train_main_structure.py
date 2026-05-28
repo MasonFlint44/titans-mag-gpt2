@@ -1,17 +1,17 @@
-"""G225 / G227 — structural checks on train.py:main() body.
+"""structural checks on train.py:main() body.
 
-G225: training loop must be wrapped in try/finally with destroy_process_group
+training loop must be wrapped in try/finally with destroy_process_group
 in the finally clause.
 
-G227: the try body must use CONSISTENT 4-space indentation step (not the
-2-2-4 pattern that the minimal-edit G225 fix originally produced).
+the try body must use CONSISTENT 4-space indentation step (not the
+2-2-4 pattern that the minimal-edit fix originally produced).
 """
 
 import ast
 import inspect
 import re
 
-import train
+import cli.train as train
 
 
 def _main_source() -> str:
@@ -19,7 +19,7 @@ def _main_source() -> str:
 
 
 # ---------------------------------------------------------------------------
-# G225 — try/finally with destroy_process_group
+# try/finally with destroy_process_group
 # ---------------------------------------------------------------------------
 
 def test_main_wraps_training_in_try_finally():
@@ -31,7 +31,7 @@ def test_main_wraps_training_in_try_finally():
 
     # At least one try must have a non-empty finalbody (the finally clause).
     has_finally = any(t.finalbody for t in try_nodes)
-    assert has_finally, "train.main() has no finally clause (G225)"
+    assert has_finally, "train.main() has no finally clause"
 
 
 def test_destroy_process_group_called_in_finally():
@@ -48,18 +48,18 @@ def test_destroy_process_group_called_in_finally():
                     and child.func.attr == "destroy_process_group"
                 ):
                     return
-    raise AssertionError("destroy_process_group not found in try/finally (G225)")
+    raise AssertionError("destroy_process_group not found in try/finally")
 
 
 # ---------------------------------------------------------------------------
-# G227 — consistent 4-space indentation throughout the try body
+# consistent 4-space indentation throughout the try body
 # ---------------------------------------------------------------------------
 
 def test_try_body_uses_consistent_4_space_indentation():
     """Walk the lines INSIDE the try body of train.main() and verify the
     minimum-indent step between nesting levels is exactly 4 spaces (not 2).
 
-    The original G225 minimal edit produced 2-2-4 spacing which parses but
+    The original minimal edit produced 2-2-4 spacing which parses but
     is a copy-paste hazard and a PEP-8 violation.
     """
     src = _main_source()
@@ -106,7 +106,7 @@ def test_try_body_uses_consistent_4_space_indentation():
 
 
 # ---------------------------------------------------------------------------
-# T7 — DDP setup/cleanup structural assertions (G201, G204 via AST)
+# T7 — DDP setup/cleanup structural assertions (via AST)
 # ---------------------------------------------------------------------------
 
 def _find_call_lines(tree, callable_name):
@@ -124,7 +124,7 @@ def _find_call_lines(tree, callable_name):
 
 
 def test_init_process_group_called_before_ddp_wrap():
-    """G201 — `init_process_group()` must run BEFORE the model is wrapped
+    """`init_process_group()` must run BEFORE the model is wrapped
     in DDP. Otherwise DDP construction has no communicator and fails.
 
     AST check: the earliest `init_process_group` line precedes the earliest
@@ -147,12 +147,12 @@ def test_init_process_group_called_before_ddp_wrap():
 
     assert min(init_lines) < min(ddp_lines), (
         f"init_process_group line {min(init_lines)} comes AFTER DDP() line "
-        f"{min(ddp_lines)} — DDP construction has no communicator (G201)."
+        f"{min(ddp_lines)} — DDP construction has no communicator."
     )
 
 
 def test_model_to_device_called_before_ddp_wrap():
-    """G201 — model.to(device) must run BEFORE DDP(model, ...). DDP needs
+    """model.to(device) must run BEFORE DDP(model, ...). DDP needs
     the model on the right device to bind its communicator correctly.
 
     AST check: there's a `.to(...)` call on `model` before any `DDP(` call.
@@ -180,12 +180,12 @@ def test_model_to_device_called_before_ddp_wrap():
     assert ddp_lines, "train.main() does not call DDP()"
     assert min(to_call_lines) < min(ddp_lines), (
         f".to() line {min(to_call_lines)} comes AFTER DDP() line "
-        f"{min(ddp_lines)} (G201)."
+        f"{min(ddp_lines)}."
     )
 
 
 def test_ddp_wrap_before_optimizer_construction():
-    """G201 — optimizer.params should come from the DDP-wrapped model so
+    """optimizer.params should come from the DDP-wrapped model so
     `model.no_sync()` and DDP's gradient hooks fire on the same param set
     the optimizer steps. Build order: model → .to() → DDP(model) →
     build_optimizer(model).
@@ -208,12 +208,12 @@ def test_ddp_wrap_before_optimizer_construction():
     assert min(ddp_lines) < min(build_opt_lines), (
         f"DDP() at line {min(ddp_lines)} runs AFTER build_optimizer() at "
         f"line {min(build_opt_lines)} — optimizer would hold pre-wrap "
-        f"params (G201)."
+        f"params."
     )
 
 
 def test_per_rank_seed_set_after_model_construction():
-    """G204 — per-rank seed (`args.seed + rank`) must be applied AFTER
+    """per-rank seed (`args.seed + rank`) must be applied AFTER
     model construction. If applied before, all ranks build the model with
     the same seed but ALSO get the same dropout masks during training,
     silently shrinking the effective batch to single-rank.
@@ -251,13 +251,13 @@ def test_per_rank_seed_set_after_model_construction():
     assert last_seed > model_line, (
         f"last manual_seed at line {last_seed} comes BEFORE model "
         f"construction at line {model_line} — per-rank divergence "
-        f"(G204) won't fire."
+        f" won't fire."
     )
 
 
 def test_init_destroy_process_group_pair_present():
-    """G201 — `init_process_group` and `destroy_process_group` must both
-    appear in train.main(). G225's try/finally test covers that destroy
+    """`init_process_group` and `destroy_process_group` must both
+    appear in train.main().'s try/finally test covers that destroy
     is in the finally clause; this test asserts the basic pair exists at
     all (catches a future refactor that drops one without removing the other).
     """
@@ -265,12 +265,12 @@ def test_init_destroy_process_group_pair_present():
     tree = ast.parse(src.strip())
     init_lines = _find_call_lines(tree, "init_process_group")
     destroy_lines = _find_call_lines(tree, "destroy_process_group")
-    assert init_lines, "init_process_group not found in train.main() (G201)"
-    assert destroy_lines, "destroy_process_group not found in train.main() (G201)"
+    assert init_lines, "init_process_group not found in train.main()"
+    assert destroy_lines, "destroy_process_group not found in train.main()"
 
 
 # ---------------------------------------------------------------------------
-# G282 — capture_scalar_outputs set at module import
+# capture_scalar_outputs set at module import
 # ---------------------------------------------------------------------------
 
 def test_train_sets_dynamo_capture_scalar_outputs_on_import():
@@ -290,7 +290,7 @@ def test_train_sets_dynamo_capture_scalar_outputs_on_import():
     assert torch._dynamo.config.capture_scalar_outputs is True, (
         "train.py must set torch._dynamo.config.capture_scalar_outputs = True "
         "at module import to suppress the NMM graph break under "
-        "--compile-model. See G282 in train.py."
+        "--compile-model. See in train.py."
     )
 
 
@@ -306,7 +306,7 @@ def test_train_sets_capture_scalar_outputs_before_run_training():
         r"torch\._dynamo\.config\.capture_scalar_outputs\s*=\s*True"
     )
     match = assignment_re.search(src)
-    assert match, "capture_scalar_outputs assignment missing from train.py"
+    assert match, "capture_scalar_outputs assignment missing from cli.train.py"
     # Find the position of the first `def ` after the import block.
     first_def = re.search(r"^def ", src, re.MULTILINE)
     assert first_def, "train.py has no top-level def — file structure changed"

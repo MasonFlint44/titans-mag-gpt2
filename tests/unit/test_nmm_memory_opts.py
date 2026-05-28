@@ -1,10 +1,10 @@
-"""G256 — nmm_state_dtype memory-saving option.
+"""nmm_state_dtype memory-saving option.
 
 - `nmm_state_dtype="bf16"`: (M, S) and per-step update buffers stored in
   bf16 instead of fp32 (~2x smaller). NS5 still casts to fp32 internally
-  (the bf16-NS5-spectral-norm-drift hazard documented in G226).
+  (the bf16-NS5-spectral-norm-drift hazard documented in).
 - `nmm_state_dtype="int8"`: int8 + per-sample fp16 scale (~4x smaller),
-  blockwise path only (G275).
+  blockwise path only.
 
 The contract these tests pin down:
   (a) dtype choice is honored end-to-end (state, output, retrieval).
@@ -128,7 +128,7 @@ def test_bf16_state_output_finite_and_similar_magnitude_to_fp32(seed=0):
 
 
 # ---------------------------------------------------------------------------
-# nmm_expansion=1 (G263) — paper ablation: smallest viable NMM size.
+# nmm_expansion=1 — paper ablation: smallest viable NMM size.
 # ---------------------------------------------------------------------------
 
 
@@ -200,7 +200,7 @@ def test_expansion_1_trains_end_to_end():
 
 
 # ---------------------------------------------------------------------------
-# nmm_layer_indices (G261) — subset-of-layers
+# nmm_layer_indices — subset-of-layers
 # ---------------------------------------------------------------------------
 
 
@@ -274,7 +274,7 @@ def test_layer_indices_detach_states_tolerates_None_entries():
 
 
 def test_layer_indices_compute_nmm_norm_returns_None_for_plain_blocks():
-    from train import compute_nmm_norm
+    from cli.train import compute_nmm_norm
     cfg = TitansConfig(
         n_layer=3, n_head=2, n_embd=8, vocab_size=16,
         block_size=16, chunk_size=8, dropout=0.0,
@@ -391,7 +391,7 @@ def test_layer_indices_decode_path_works_with_mixed_blocks():
 
 
 # ---------------------------------------------------------------------------
-# nmm_low_rank (G262) — factored MemoryMLP for smaller per-step state
+# nmm_low_rank — factored MemoryMLP for smaller per-step state
 # ---------------------------------------------------------------------------
 
 
