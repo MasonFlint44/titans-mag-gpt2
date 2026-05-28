@@ -295,18 +295,22 @@ python -m cli.finetune --data corpus.txt \
     --nmm-state-dtype bf16 \
     --nmm-detach-state-between-blocks \
     --nmm-use-gram-ns5 \
-    --freeze-backbone \
+    --freeze-embeddings \
     --nmm-gate-ramp-steps 100 \
     --nmm-gate-ramp-target 0.1 \
     --compile-model \
     --optim8bit
 ```
 
-`--freeze-backbone` + `--nmm-gate-ramp-*` follow the TPTT recipe for
-memory injection: concentrate the gradient on the NMM, force the gate
-open on a schedule. Drop both for full fine-tune behavior (gradient is
-then split across the full ~125M backbone params and the NMM is left
-to slowly self-bootstrap via LM loss alone).
+`--freeze-embeddings` + `--nmm-gate-ramp-*` follow a TPTT-style recipe
+for memory injection: preserve the input/output representations (wte,
+wpe, ln_f) so the limited fine-tune data doesn't distort them, force
+the memory gate open on a schedule, and let the transformer blocks
+(attention + MLP) train so they can adapt to attend to NMM-modulated
+tokens. There's also `--freeze-backbone` for a more aggressive freeze,
+but empirically it's too aggressive (short-distance accuracy collapses
+because attention can't compensate for the injected NMM signal). Drop
+the flags entirely for the original full-fine-tune behavior.
 
 Measured on RTX 5070 Ti without `--nmm-use-gram-ns5`: ~1.11 s/step,
 8.5 GiB peak. The `--nmm-use-gram-ns5` flag swaps NS5 for the

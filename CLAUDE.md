@@ -70,46 +70,53 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python -m cli.finetune \
     --nmm-state-dtype bf16 \
     --nmm-detach-state-between-blocks \
     --nmm-use-gram-ns5 \
-    --freeze-backbone \
+    --freeze-embeddings \
     --nmm-gate-ramp-steps 100 \
     --nmm-gate-ramp-target 0.1 \
     --compile-model --optim8bit
 ```
 
-The TPTT-inspired flags
-([fabienfrfr/tptt](https://github.com/fabienfrfr/tptt)) at the bottom
-are the difference from a plain LM fine-tune:
+The training-regime flags at the bottom — `--freeze-embeddings` and
+`--nmm-gate-ramp-*` — were added after a needle-in-haystack diagnostic
+showed that vanilla fine-tuning produces a too-weak NMM signal
+(~0.45 logits of needle-dependence past block_size, ~100× too small
+to flip top-1 predictions). They're inspired by TPTT
+([fabienfrfr/tptt](https://github.com/fabienfrfr/tptt)).
 
-- `--freeze-backbone` — freeze every param outside the memory pathway
-  (anything not matching one of `cli.train.FREEZE_BACKBONE_KEEP_TRAINABLE_SUBSTRINGS`
-  = `("nmm", "gamma", "out_scale", "persistent")`). Halves the trainable
-  parameter count at gpt2_small (251M → 128M). The backbone's pretrained
-  representations are preserved exactly; the NMM has a stable target to
-  integrate with instead of chasing a moving backbone.
+### `--freeze-embeddings`
 
-- `--nmm-gate-ramp-steps N` + `--nmm-gate-ramp-target X` — during the
-  first N training steps, hold every per-block `out_scale` to a linear
-  ramp from `~0 → X`, with `requires_grad=False` so the optimizer doesn't
-  fight the schedule. At step N, the optimizer takes over. Forces the
-  memory gate open on a fixed schedule rather than relying on LM loss
-  alone to slowly open it (TPTT's LiZACallback pattern).
+Freezes only the input/output representation params: `wte`, `wpe`,
+`ln_f`. Transformer blocks (attention, MLP, block LayerNorms) stay
+trainable so they can adapt to the NMM-augmented residual stream —
+specifically, so attention learns to attend to NMM-modulated tokens.
 
-Why these matter: without them, the LM-loss gradient is diluted across
-~125M backbone params and the NMM's `out_scale` is left to passively
-self-bootstrap from 0. A diagnostic run on needle-in-haystack found
-this produced only ~0.45 logits of needle-dependence past block_size
-— ~100× too weak to overcome the LM prior. The TPTT recipe is the
-recommended way to give the memory mechanism a chance to actually
-learn cross-chunk recall.
+There's also a `--freeze-backbone` flag (mutually exclusive with this
+one) that freezes everything except the memory pathway. **Don't use it.**
+A diagnostic run showed it's too aggressive: with attention frozen, the
+model can't compensate for the NMM signal being injected into the
+residual stream, and short-distance recall collapses to near-zero. The
+flag is preserved for completeness but the help text discourages it.
 
-The argparse defaults leave both flags OFF (`--freeze-backbone` not
-set, `--nmm-gate-ramp-steps=0`) so legacy scripts that didn't pass
-them get full-fine-tune behavior unchanged. The canonical recipe
-above is the new recommendation.
+### `--nmm-gate-ramp-steps N` + `--nmm-gate-ramp-target X`
+
+During the first N steps, hold every per-block `out_scale` to a linear
+ramp `0 → X`, with `requires_grad=False` so the optimizer doesn't fight
+the schedule. At step N, the optimizer takes over. Forces the memory
+gate open on a fixed schedule instead of relying on LM loss alone to
+slowly discover that the NMM is worth using.
+
+### Defaults
+
+The argparse defaults leave both freeze flags OFF and
+`--nmm-gate-ramp-steps=0` so legacy scripts that didn't pass them get
+full-fine-tune-with-passive-gate behavior unchanged. The canonical
+recipe above is the new recommendation; the previous full-fine-tune
+recipe is still supported but doesn't appear to learn cross-chunk
+recall well.
 
 For multi-GPU from-scratch runs on a bigger box you'll want to bump
 `--batch-size`, drop `--grad-accum`, raise `--max-steps`, and probably
-drop `--freeze-backbone` (more data + more capacity makes the
+drop the freeze flags (more data + more capacity makes the
 gradient-dilution concern less acute).
 
 ## Resume flow gotchas

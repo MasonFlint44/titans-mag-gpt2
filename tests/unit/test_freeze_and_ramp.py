@@ -21,9 +21,11 @@ import torch
 from config import TitansConfig
 from model.titans_gpt2 import TitansMAGGPT2
 from cli.train import (
+    EMBEDDING_SUBSTRINGS,
     FREEZE_BACKBONE_KEEP_TRAINABLE_SUBSTRINGS,
     collect_out_scale_params,
     freeze_backbone,
+    freeze_embeddings_only,
     gate_ramp_value,
 )
 
@@ -121,6 +123,87 @@ def test_freeze_backbone_keeps_out_scale_trainable():
                 f"then have no parameter to release back to the optimizer"
             )
     assert found_out_scale, "no out_scale params found in model — fixture broken"
+
+
+# ---------------------------------------------------------------------------
+# freeze_embeddings_only
+# ---------------------------------------------------------------------------
+
+def test_freeze_embeddings_only_freezes_wte_wpe_ln_f():
+    """The whole point of the softer freeze: ONLY the input/output
+    representation params are immobilized. Transformer blocks stay free
+    to adapt to the NMM-augmented residual stream."""
+    model = _tiny_model()
+    freeze_embeddings_only(model)
+    for name, p in model.named_parameters():
+        if any(s in name for s in EMBEDDING_SUBSTRINGS):
+            assert not p.requires_grad, (
+                f"embedding param {name!r} stayed trainable — "
+                f"freeze_embeddings_only must freeze wte/wpe/ln_f"
+            )
+
+
+def test_freeze_embeddings_only_keeps_transformer_blocks_trainable():
+    """Attention + MLP MUST remain trainable so they can learn to attend
+    to NMM-modulated tokens. If this regresses, the softer freeze
+    degenerates to the catastrophic full-freeze behavior."""
+    model = _tiny_model()
+    freeze_embeddings_only(model)
+    found_attn = False
+    found_mlp = False
+    for name, p in model.named_parameters():
+        if ".attn." in name and "ln_f" not in name:
+            found_attn = True
+            assert p.requires_grad, (
+                f"attention param {name!r} got frozen — defeats the point "
+                f"of the embedding-only freeze"
+            )
+        if ".mlp." in name:
+            found_mlp = True
+            assert p.requires_grad, (
+                f"MLP param {name!r} got frozen — defeats the point of "
+                f"the embedding-only freeze"
+            )
+    assert found_attn, "no attention params found in model — fixture broken"
+    assert found_mlp, "no MLP params found in model — fixture broken"
+
+
+def test_freeze_embeddings_only_keeps_memory_path_trainable():
+    """Memory path stays trainable under the softer freeze, same as
+    under --freeze-backbone."""
+    model = _tiny_model()
+    freeze_embeddings_only(model)
+    for name, p in model.named_parameters():
+        if any(s in name for s in FREEZE_BACKBONE_KEEP_TRAINABLE_SUBSTRINGS):
+            assert p.requires_grad, (
+                f"memory-path param {name!r} got frozen — must stay "
+                f"trainable for the NMM to learn"
+            )
+
+
+def test_freeze_embeddings_only_keeps_more_trainable_than_freeze_backbone():
+    """Sanity check the relationship between the two freeze modes:
+    embedding-only freeze MUST leave strictly more params trainable than
+    full backbone freeze. If they produce the same count, one of the
+    helpers is wrong."""
+    model_a = _tiny_model()
+    model_b = _tiny_model()
+    _, n_train_emb = freeze_embeddings_only(model_a)
+    _, n_train_full = freeze_backbone(model_b)
+    assert n_train_emb > n_train_full, (
+        f"freeze_embeddings_only left {n_train_emb} trainable, "
+        f"freeze_backbone left {n_train_full}; softer freeze should "
+        f"leave strictly more trainable"
+    )
+
+
+def test_freeze_embeddings_only_returns_partition_counts():
+    """Returned (frozen, trainable) counts sum to the total parameter
+    tensor count — no double-counting or omissions."""
+    model = _tiny_model()
+    total = sum(1 for _ in model.parameters())
+    n_frozen, n_train = freeze_embeddings_only(model)
+    assert n_frozen + n_train == total
 
 
 # ---------------------------------------------------------------------------

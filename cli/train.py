@@ -145,6 +145,46 @@ def freeze_backbone(model: nn.Module) -> tuple[int, int]:
     return frozen, trainable
 
 
+# Substrings identifying the input/output representation layer — the
+# pieces that define the model's vocabulary and absolute-position
+# semantics. Freezing these is conservative (they're data-hungry to
+# fine-tune well, and small training corpora can distort them) while
+# keeping the transformer blocks free to adapt their attention/MLP
+# weights for the NMM-augmented residual stream.
+EMBEDDING_SUBSTRINGS = ("wte", "wpe", "ln_f")
+
+
+def _is_embedding_param(name: str) -> bool:
+    return any(s in name for s in EMBEDDING_SUBSTRINGS)
+
+
+def freeze_embeddings_only(model: nn.Module) -> tuple[int, int]:
+    """Softer freeze than `freeze_backbone`: only the input/output
+    representation params (`wte`, `wpe`, `ln_f`) are frozen. Transformer
+    blocks (attention + MLP + block LayerNorms) stay trainable so they
+    can adapt to the NMM-augmented residual stream — specifically, so
+    attention can LEARN to attend to NMM-modulated tokens, which a
+    fully frozen backbone cannot.
+
+    Use this when full `--freeze-backbone` is too restrictive (it broke
+    short-distance recall in our needle-in-haystack run because attention
+    couldn't compensate for the injected NMM signal) but full fine-tune
+    leaves the gradient signal too diluted.
+
+    Memory-path params stay trainable regardless (they're not embeddings).
+    Returns (frozen_count, trainable_count)."""
+    frozen = 0
+    trainable = 0
+    for name, p in model.named_parameters():
+        if _is_embedding_param(name):
+            p.requires_grad = False
+            frozen += 1
+        else:
+            p.requires_grad = True
+            trainable += 1
+    return frozen, trainable
+
+
 def collect_out_scale_params(model: nn.Module) -> list:
     """Return every `out_scale` Parameter in the model (one per NMM block,
     typically). The gate-ramp schedule writes into these tensors directly

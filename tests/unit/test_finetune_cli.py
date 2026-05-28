@@ -219,3 +219,36 @@ def test_freeze_backbone_and_gate_ramp_compose_in_recipe():
     assert args.nmm_gate_ramp_steps == 100
     assert args.nmm_gate_ramp_target == pytest.approx(0.1)
     assert args.nmm_use_gram_ns5 is True
+
+
+def test_freeze_embeddings_flag_exists_and_defaults_false():
+    """The softer freeze must be opt-in — default keeps the existing
+    full-fine-tune behavior so legacy recipes are unchanged."""
+    args = _parse()
+    assert args.freeze_embeddings is False
+
+
+def test_freeze_embeddings_round_trip():
+    args = _parse("--freeze-embeddings")
+    assert args.freeze_embeddings is True
+    assert args.freeze_backbone is False  # mutex with freeze-backbone
+
+
+def test_freeze_backbone_and_freeze_embeddings_are_mutually_exclusive():
+    """Passing both freeze modes is contradictory and the parser should
+    reject it loudly rather than silently picking one."""
+    with pytest.raises(SystemExit):
+        _parse("--freeze-backbone", "--freeze-embeddings")
+
+
+def test_freeze_embeddings_composes_with_gate_ramp():
+    """The intended recommended recipe: --freeze-embeddings +
+    --nmm-gate-ramp-*. Verify they parse together."""
+    args = _parse(
+        "--freeze-embeddings",
+        "--nmm-gate-ramp-steps", "100",
+        "--nmm-gate-ramp-target", "0.1",
+    )
+    assert args.freeze_embeddings is True
+    assert args.freeze_backbone is False
+    assert args.nmm_gate_ramp_steps == 100

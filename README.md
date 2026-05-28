@@ -86,7 +86,7 @@ uv run python -m cli.finetune \
     --nmm-state-dtype bf16 \
     --nmm-detach-state-between-blocks \
     --nmm-use-gram-ns5 \
-    --freeze-backbone \
+    --freeze-embeddings \
     --nmm-gate-ramp-steps 100 \
     --nmm-gate-ramp-target 0.1 \
     --compile-model \
@@ -95,19 +95,24 @@ uv run python -m cli.finetune \
 ```
 
 This loads pretrained `openai-community/gpt2`, splices in the NMM with
-`out_scale=0` (so initial logits exactly match HF), freezes the backbone
-so the gradient concentrates on the new memory mechanism, ramps the
-memory gate open over the first 100 steps, and then trains. At step 0
-perplexity should equal vanilla GPT-2; from there it decreases as the
-memory contribution ramps up.
+`out_scale=0` (so initial logits exactly match HF), freezes the input/
+output embeddings (`wte`, `wpe`, `ln_f`) so the gradient concentrates on
+the parts that need to adapt to the new memory pathway, ramps the memory
+gate open over the first 100 steps, and then trains. Transformer blocks
+(attention, MLP) stay trainable so they can learn to attend to NMM-
+modulated tokens. At step 0 perplexity should equal vanilla GPT-2; from
+there it decreases as the memory contribution ramps up.
 
-The `--freeze-backbone` and `--nmm-gate-ramp-*` flags follow the
-TPTT-style ([fabienfrfr/tptt](https://github.com/fabienfrfr/tptt))
-recipe for injecting a new memory mechanism into a pretrained
-Transformer: hold the backbone steady so the NMM has a stable target,
-and force the memory gate open on a schedule instead of waiting for
-LM loss alone to slowly open it. Drop both flags for the original
-full-fine-tune-with-passive-gate behavior.
+The `--freeze-embeddings` and `--nmm-gate-ramp-*` flags follow a TPTT-
+style ([fabienfrfr/tptt](https://github.com/fabienfrfr/tptt)) recipe
+for injecting a new memory mechanism into a pretrained Transformer:
+preserve the input/output representation space, force the memory gate
+open on a schedule instead of waiting for LM loss alone to slowly open
+it. (There's also a `--freeze-backbone` flag for the more aggressive
+freeze, but empirically it's too aggressive — attention can't adapt
+and short-distance accuracy collapses. Prefer `--freeze-embeddings`.)
+Drop the flags entirely for the original full-fine-tune-with-passive-
+gate behavior.
 
 The `--nmm-use-gram-ns5` flag swaps stock NS5 for the Gram-iteration
 variant (Tri Dao et al., POLAR_EXPRESS coefficients + reset at iter 2).

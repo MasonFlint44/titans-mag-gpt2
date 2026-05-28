@@ -32,6 +32,31 @@ def build_finetune_config(size: str, **overrides):
     return _FACTORY[size](finetune_mode=True, **overrides)
 
 
+def _apply_freeze_flag(model, args) -> None:
+    """Dispatch on the mutually-exclusive --freeze-backbone /
+    --freeze-embeddings flags. No-op if neither is set (full fine-tune).
+    Must be called BEFORE `build_optimizer` so the optimizer's
+    param-group walk picks up the requires_grad state."""
+    import sys
+    if args.freeze_backbone:
+        from cli.train import freeze_backbone
+        n_frozen, n_train = freeze_backbone(model)
+        print(
+            f"[finetune] --freeze-backbone: froze {n_frozen} params, "
+            f"left {n_train} memory-path params trainable.",
+            file=sys.stderr,
+        )
+    elif args.freeze_embeddings:
+        from cli.train import freeze_embeddings_only
+        n_frozen, n_train = freeze_embeddings_only(model)
+        print(
+            f"[finetune] --freeze-embeddings: froze {n_frozen} embedding "
+            f"params (wte/wpe/ln_f), left {n_train} transformer-block + "
+            f"memory-path params trainable.",
+            file=sys.stderr,
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the finetune CLI parser. Extracted from main() so tests
     can inspect flags + defaults without invoking the training loop."""
@@ -94,7 +119,8 @@ def build_parser() -> argparse.ArgumentParser:
              "--grad-accum) remain user-controlled so you can extend a run, "
              "redirect saves, etc.",
     )
-    parser.add_argument(
+    freeze_group = parser.add_mutually_exclusive_group()
+    freeze_group.add_argument(
         "--freeze-backbone",
         action="store_true",
         help="Freeze backbone params (everything outside the NMM, MAG gate, "
@@ -102,7 +128,20 @@ def build_parser() -> argparse.ArgumentParser:
              "gradient on the memory mechanism — without this, the gradient "
              "is split across ~125M backbone params and the NMM doesn't "
              "receive a strong enough signal to learn cross-chunk recall. "
-             "Inspired by TPTT's LoRA-only training regime.",
+             "Inspired by TPTT's LoRA-only training regime. WARNING: empirically "
+             "this is too aggressive — attention can't adapt to the injected "
+             "NMM signal and short-distance accuracy collapses. Prefer "
+             "--freeze-embeddings for a softer freeze.",
+    )
+    freeze_group.add_argument(
+        "--freeze-embeddings",
+        action="store_true",
+        help="Freeze only the input/output representation params (wte, wpe, "
+             "ln_f). Transformer blocks (attention, MLP, block LayerNorms) "
+             "stay trainable so they can adapt to the NMM-augmented residual "
+             "stream — specifically so attention can learn to attend to "
+             "NMM-modulated tokens. Softer than --freeze-backbone. Mutually "
+             "exclusive with --freeze-backbone.",
     )
     parser.add_argument(
         "--nmm-gate-ramp-steps",
@@ -191,14 +230,7 @@ def main():
             _unwrap(model).load_state_dict(_unwrap(state))
         else:
             model.load_state_dict(_unwrap(state))
-        if args.freeze_backbone:
-            from cli.train import freeze_backbone
-            n_frozen, n_train = freeze_backbone(model)
-            print(
-                f"[finetune] --freeze-backbone: froze {n_frozen} params, "
-                f"left {n_train} memory-path params trainable.",
-                file=sys.stderr,
-            )
+        _apply_freeze_flag(model, args)
         optimizer = build_optimizer(model, use_8bit=args.optim8bit)
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
@@ -250,14 +282,7 @@ def main():
         if args.compile_model:
             model = torch.compile(model, mode="default", dynamic=False)
 
-        if args.freeze_backbone:
-            from cli.train import freeze_backbone
-            n_frozen, n_train = freeze_backbone(model)
-            print(
-                f"[finetune] --freeze-backbone: froze {n_frozen} params, "
-                f"left {n_train} memory-path params trainable.",
-                file=sys.stderr,
-            )
+        _apply_freeze_flag(model, args)
 
         optimizer = build_optimizer(model, use_8bit=args.optim8bit)
         start_step = 0
