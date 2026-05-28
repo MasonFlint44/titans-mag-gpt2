@@ -298,13 +298,12 @@ python -m cli.finetune --data corpus.txt \
     --freeze-embeddings \
     --nmm-gate-ramp-steps 100 \
     --nmm-gate-ramp-target 0.1 \
-    --nmm-aux-loss-weight 0.5 \
     --compile-model \
     --optim8bit
 ```
 
-The three training-regime flags at the bottom address things found in
-needle-in-haystack diagnostics:
+The two training-regime flags address things found in needle-in-
+haystack diagnostics:
 
 - `--freeze-embeddings`: TPTT-style freeze of `wte`, `wpe`, `ln_f` so
   the limited fine-tune data doesn't distort the input/output
@@ -315,13 +314,15 @@ needle-in-haystack diagnostics:
   for the injected NMM signal.)
 - `--nmm-gate-ramp-*`: forces the memory gate open on a schedule
   instead of waiting for LM loss alone to slowly open it.
-- `--nmm-aux-loss-weight`: explicitly trains the NMM's `y_mem` output
-  to predict next tokens (CE against the same labels as `lm_loss`).
-  Added after diagnostics showed the surprise-driven NMM otherwise
-  produces input-dependent noise rather than retrievable structure at
-  our scale — `y_mem` at the answer position had cosine alignment ≈ 0
-  with the correct-answer embedding. The aux loss pressures
-  `k_proj`/`q_proj` to align.
+
+The `--nmm-aux-loss-weight α` flag (direct supervision on `y_mem`)
+exists but is **NOT** in the default recipe. It was tested at α=0.5 on
+the needle corpus; the result was that short-distance accuracy
+saturated but long-distance recall stayed at chance, and the
+diff-under-swap magnitude at long distance actually _decreased_ — the
+calibrated optimizer correctly suppressed noisy `y_mem` rather than
+manufacturing signal that wasn't there. Preserved as a diagnostic
+tool. See `CLAUDE.md` for the detailed analysis.
 
 Drop the flags entirely for the original full-fine-tune behavior.
 

@@ -73,21 +73,21 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python -m cli.finetune \
     --freeze-embeddings \
     --nmm-gate-ramp-steps 100 \
     --nmm-gate-ramp-target 0.1 \
-    --nmm-aux-loss-weight 0.5 \
     --compile-model --optim8bit
 ```
 
-The training-regime flags at the bottom — `--freeze-embeddings`,
-`--nmm-gate-ramp-*`, and `--nmm-aux-loss-weight` — were added after
-needle-in-haystack diagnostics showed two things: (1) vanilla fine-
-tuning produces a too-weak NMM signal (~0.45 logits of needle-dependence
-past block_size, ~100× too small to flip top-1 predictions), and (2)
-the NMM's `y_mem` at the answer position is *uncorrelated* with the
-correct answer token even at long distance — meaning the surprise-
-driven update rule isn't shaping M into a retrievable structure when
-trained on LM loss alone. The first two flags are inspired by TPTT
-([fabienfrfr/tptt](https://github.com/fabienfrfr/tptt)); the aux loss
-is our diagnostic-directed addition.
+The training-regime flags at the bottom — `--freeze-embeddings` and
+`--nmm-gate-ramp-*` — were added after needle-in-haystack diagnostics
+showed that vanilla fine-tuning produces a too-weak NMM signal
+(~0.45 logits of needle-dependence past block_size, ~100× too small to
+flip top-1 predictions). They're inspired by TPTT
+([fabienfrfr/tptt](https://github.com/fabienfrfr/tptt)).
+
+There's also a `--nmm-aux-loss-weight` flag that adds direct
+supervision on `y_mem`. It's preserved as a diagnostic tool (defaults
+to 0.0, disabled) but is **NOT** in the default recipe — see the flag
+description below for what it tested and why it doesn't help at our
+scale.
 
 ### `--freeze-embeddings`
 
@@ -111,7 +111,7 @@ the schedule. At step N, the optimizer takes over. Forces the memory
 gate open on a fixed schedule instead of relying on LM loss alone to
 slowly discover that the NMM is worth using.
 
-### `--nmm-aux-loss-weight α`
+### `--nmm-aux-loss-weight α` (diagnostic-only, not in default recipe)
 
 When `α > 0`, install a hook on the **last NMM block's `forward_chunk`**
 that captures its raw (pre-gate) `y_mem` each step. After the main
@@ -126,18 +126,39 @@ Implementation helpers in `cli.train`:
 The capture **must be installed before `torch.compile`** so the patched
 method is part of the traced graph; `cli/finetune.py`'s
 `_install_aux_capture_if_enabled` does this at the right point in both
-the resume and fresh paths. Default `α = 0.0` (disabled — main LM loss
-only).
+the resume and fresh paths. Default `α = 0.0` (disabled).
 
-Motivation: needle-in-haystack diagnostics showed `y_mem` at the
-answer position has cosine alignment ≈ 0 with the correct-answer
-embedding at long distance. The NMM's `k_proj` and `q_proj` aren't
-aligned and M ends up holding input-dependent noise rather than
-retrievable structure. Direct supervision on `y_mem` (CE against the
-next token) is the most surgical intervention the diagnostic supports:
-it pressures the NMM read pathway to produce outputs that correctly
-predict tokens, forcing k/q alignment and shaping the update rule that
-writes into M.
+**Why this flag exists and why it's not in the default recipe:**
+
+Needle-in-haystack diagnostics showed `y_mem` at the answer position
+has cosine alignment ≈ 0 with the correct-answer embedding at long
+distance — the NMM's `k_proj` and `q_proj` aren't aligned and M ends
+up holding input-dependent noise rather than retrievable structure.
+This flag was added to test whether direct supervision could fix that:
+by training `y_mem` to predict next tokens, we hoped to pressure the
+NMM read pathway into producing outputs that correctly predict the
+answer.
+
+When we tested with `α=0.5` for 1000 steps on the needle corpus, the
+result was instructive:
+
+- Short-distance accuracy saturated at 100% (vs ~99% without aux loss)
+- Long-distance accuracy stayed at chance (~4%)
+- **The diff-under-swap magnitude at long distance _decreased_** (from
+  ~2 logits to ~0.4) and `y_mem` alignment stayed at noise floor
+
+The interpretation: the optimizer, given direct supervision and no
+retrievable structure to extract from M, correctly chose to *suppress*
+input-dependent noise at long-distance positions rather than
+manufacture signal. This is the right behavior for a calibrated
+predictor — but it means the aux loss can't actually create
+retrievable structure that the surprise-driven update rule isn't
+already producing. The result indicates the failure is structural to
+the update rule + scale + pretrained-backbone combination, not
+something more training signal can fix.
+
+The flag stays in the codebase as a diagnostic tool for future
+experiments (e.g., if testing a different memory update rule).
 
 ### Defaults
 
