@@ -94,6 +94,35 @@ def build_parser() -> argparse.ArgumentParser:
              "--grad-accum) remain user-controlled so you can extend a run, "
              "redirect saves, etc.",
     )
+    parser.add_argument(
+        "--freeze-backbone",
+        action="store_true",
+        help="Freeze backbone params (everything outside the NMM, MAG gate, "
+             "out_scale, and persistent_mem). Concentrates the fine-tune "
+             "gradient on the memory mechanism — without this, the gradient "
+             "is split across ~125M backbone params and the NMM doesn't "
+             "receive a strong enough signal to learn cross-chunk recall. "
+             "Inspired by TPTT's LoRA-only training regime.",
+    )
+    parser.add_argument(
+        "--nmm-gate-ramp-steps",
+        type=int,
+        default=0,
+        help="If > 0, linearly ramp the per-block `out_scale` (memory-gate "
+             "magnitude) from ~0 to --nmm-gate-ramp-target over this many "
+             "training steps, holding `out_scale.requires_grad=False` during "
+             "the ramp. After the ramp, optimizer takes over. TPTT-inspired "
+             "(LiZACallback). Default 0 disables ramping.",
+    )
+    parser.add_argument(
+        "--nmm-gate-ramp-target",
+        type=float,
+        default=0.1,
+        help="Target value `out_scale` is held to at the END of the gate "
+             "ramp. After the ramp, optimizer is free to adjust. Default 0.1, "
+             "close to the empirical std observed when the optimizer alone "
+             "controls out_scale.",
+    )
     from cli.nmm_cli import add_nmm_args
     add_nmm_args(parser)
     return parser
@@ -162,6 +191,14 @@ def main():
             _unwrap(model).load_state_dict(_unwrap(state))
         else:
             model.load_state_dict(_unwrap(state))
+        if args.freeze_backbone:
+            from cli.train import freeze_backbone
+            n_frozen, n_train = freeze_backbone(model)
+            print(
+                f"[finetune] --freeze-backbone: froze {n_frozen} params, "
+                f"left {n_train} memory-path params trainable.",
+                file=sys.stderr,
+            )
         optimizer = build_optimizer(model, use_8bit=args.optim8bit)
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
@@ -213,6 +250,15 @@ def main():
         if args.compile_model:
             model = torch.compile(model, mode="default", dynamic=False)
 
+        if args.freeze_backbone:
+            from cli.train import freeze_backbone
+            n_frozen, n_train = freeze_backbone(model)
+            print(
+                f"[finetune] --freeze-backbone: froze {n_frozen} params, "
+                f"left {n_train} memory-path params trainable.",
+                file=sys.stderr,
+            )
+
         optimizer = build_optimizer(model, use_8bit=args.optim8bit)
         start_step = 0
 
@@ -252,6 +298,8 @@ def main():
         autocast_dtype=autocast_dtype,
         start_step=start_step,
         batch_size=args.batch_size,
+        gate_ramp_steps=args.nmm_gate_ramp_steps,
+        gate_ramp_target=args.nmm_gate_ramp_target,
     )
 
 

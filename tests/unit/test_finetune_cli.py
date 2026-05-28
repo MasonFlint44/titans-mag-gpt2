@@ -161,3 +161,61 @@ def test_config_size_label_handles_custom_dims():
         nmm_expansion=2, nmm_n_persistent=2,
     )
     assert config_size_label(custom) == "custom"
+
+
+# ---------------------------------------------------------------------------
+# TPTT-inspired training-regime flags: --freeze-backbone, --nmm-gate-ramp-*
+# ---------------------------------------------------------------------------
+
+def test_freeze_backbone_flag_exists_and_defaults_false():
+    """Default must be False so existing recipes (full fine-tune) are
+    unchanged. Opt-in only — flipping the default would silently change
+    every downstream user's training behavior."""
+    args = _parse()
+    assert args.freeze_backbone is False
+
+
+def test_freeze_backbone_round_trip():
+    args = _parse("--freeze-backbone")
+    assert args.freeze_backbone is True
+
+
+def test_nmm_gate_ramp_steps_defaults_to_zero():
+    """Default 0 means no ramping — preserves prior training behavior for
+    recipes that don't pass the flag."""
+    args = _parse()
+    assert args.nmm_gate_ramp_steps == 0
+
+
+def test_nmm_gate_ramp_target_defaults_to_small_positive():
+    """Default target should be small (~0.1) — close to what the optimizer
+    empirically finds when out_scale is free. A large default would over-
+    open the memory gate and degrade short-distance attention performance."""
+    args = _parse()
+    assert 0.0 < args.nmm_gate_ramp_target <= 0.5
+
+
+def test_nmm_gate_ramp_flags_round_trip():
+    args = _parse(
+        "--nmm-gate-ramp-steps", "100",
+        "--nmm-gate-ramp-target", "0.2",
+    )
+    assert args.nmm_gate_ramp_steps == 100
+    assert args.nmm_gate_ramp_target == pytest.approx(0.2)
+
+
+def test_freeze_backbone_and_gate_ramp_compose_in_recipe():
+    """The intended use case is to set BOTH flags together (TPTT-style:
+    freeze backbone + ramp gate). Verify they parse without conflict."""
+    args = _parse(
+        "--freeze-backbone",
+        "--nmm-gate-ramp-steps", "100",
+        "--nmm-gate-ramp-target", "0.1",
+        "--nmm-use-gram-ns5",
+        "--compile-model",
+        "--optim8bit",
+    )
+    assert args.freeze_backbone is True
+    assert args.nmm_gate_ramp_steps == 100
+    assert args.nmm_gate_ramp_target == pytest.approx(0.1)
+    assert args.nmm_use_gram_ns5 is True

@@ -289,15 +289,24 @@ The same knobs are exposed as `--nmm-*` flags on `train.py` and
 **consumer-GPU default** (full-rank, 16 GiB VRAM, T=1024) is:
 
 ```bash
-python -m train --data corpus.txt \
+python -m cli.finetune --data corpus.txt \
     --chunk-size 1024 --batch-size 1 --grad-accum 16 \
     --nmm-block-size 64 \
     --nmm-state-dtype bf16 \
     --nmm-detach-state-between-blocks \
     --nmm-use-gram-ns5 \
+    --freeze-backbone \
+    --nmm-gate-ramp-steps 100 \
+    --nmm-gate-ramp-target 0.1 \
     --compile-model \
     --optim8bit
 ```
+
+`--freeze-backbone` + `--nmm-gate-ramp-*` follow the TPTT recipe for
+memory injection: concentrate the gradient on the NMM, force the gate
+open on a schedule. Drop both for full fine-tune behavior (gradient is
+then split across the full ~125M backbone params and the NMM is left
+to slowly self-bootstrap via LM loss alone).
 
 Measured on RTX 5070 Ti without `--nmm-use-gram-ns5`: ~1.11 s/step,
 8.5 GiB peak. The `--nmm-use-gram-ns5` flag swaps NS5 for the

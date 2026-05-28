@@ -96,12 +96,90 @@ NO_DECAY_SUBSTRINGS = ("bias", "ln", "norm", "out_scale", "gamma", "persistent")
 NMM_SUBSTRINGS = ("nmm",)
 
 
+# Memory-path substrings used by `--freeze-backbone`. ANY param whose name
+# contains one of these is left trainable; everything else is frozen.
+# Wider than NMM_SUBSTRINGS because under freeze we want to train every
+# component that participates in the memory pathway:
+#   nmm        -- NMM internals + ln_nmm
+#   gamma      -- MAG gate scalars (gamma_mem, gamma_attn)
+#   out_scale  -- block-level NMM output scaling
+#   persistent -- persistent_mem prefix (both model_wide and per_block modes)
+# TPTT-inspired (https://github.com/fabienfrfr/tptt): freezing the backbone
+# concentrates the fine-tune gradient on the new memory mechanism. Without
+# this, gradient is split across ~125M backbone params and the memory path
+# starves.
+FREEZE_BACKBONE_KEEP_TRAINABLE_SUBSTRINGS = (
+    "nmm", "gamma", "out_scale", "persistent",
+)
+
+
 def _is_no_decay(name: str) -> bool:
     return any(nd in name for nd in NO_DECAY_SUBSTRINGS)
 
 
 def _is_nmm(name: str) -> bool:
     return any(k in name for k in NMM_SUBSTRINGS)
+
+
+def _is_memory_path_param(name: str) -> bool:
+    return any(k in name for k in FREEZE_BACKBONE_KEEP_TRAINABLE_SUBSTRINGS)
+
+
+def freeze_backbone(model: nn.Module) -> tuple[int, int]:
+    """Set `requires_grad=False` on every backbone param. Memory-path
+    params (`nmm`, `gamma`, `out_scale`, `persistent`) stay trainable.
+
+    Call BEFORE `build_optimizer` — the optimizer's param-group walk
+    skips `requires_grad=False` tensors automatically.
+
+    Returns (frozen_count, trainable_count) for a sanity log line."""
+    frozen = 0
+    trainable = 0
+    for name, p in model.named_parameters():
+        if _is_memory_path_param(name):
+            p.requires_grad = True
+            trainable += 1
+        else:
+            p.requires_grad = False
+            frozen += 1
+    return frozen, trainable
+
+
+def collect_out_scale_params(model: nn.Module) -> list:
+    """Return every `out_scale` Parameter in the model (one per NMM block,
+    typically). The gate-ramp schedule writes into these tensors directly
+    each step during the ramp phase, so we cache the list once instead of
+    walking `named_parameters()` per step."""
+    out = []
+    for name, p in model.named_parameters():
+        if "out_scale" in name:
+            out.append(p)
+    return out
+
+
+def gate_ramp_value(step: int, ramp_steps: int, target: float) -> float:
+    """Linear ramp schedule value at training `step`. The schedule reaches
+    `target` exactly at `step == ramp_steps - 1` (the LAST in-ramp step),
+    so the model has been trained at the full target value for at least
+    one optimizer cycle before requires_grad is re-enabled at
+    `step == ramp_steps`.
+
+    For step >= ramp_steps the function returns `target` for completeness,
+    but in practice callers stop overwriting out_scale at that point and
+    let the optimizer take over.
+
+    Raises ValueError if `ramp_steps <= 0` — caller should guard with
+    `if ramp_steps > 0` before invoking.
+    """
+    if ramp_steps <= 0:
+        raise ValueError(
+            f"ramp_steps must be > 0 (got {ramp_steps}); guard the call site "
+            f"with `if ramp_steps > 0`."
+        )
+    if step >= ramp_steps:
+        return target
+    fraction = (step + 1) / ramp_steps
+    return target * fraction
 
 
 def build_optimizer(
@@ -662,6 +740,8 @@ def run_training(
     show_progress: bool = True,
     start_step: int = 0,
     batch_size: int | None = None,
+    gate_ramp_steps: int = 0,
+    gate_ramp_target: float = 0.0,
 ) -> None:
     """Top-level training loop covering both Phase 4.4 (fine-tune) and 4.5
     (from-scratch). One optimizer.step per accumulation cycle of `accum_steps`
@@ -769,8 +849,54 @@ def run_training(
     tokens_since_last_step = 0
     step_t0 = time.perf_counter()
     last_lr_mul = 0.0
+
+    # Gate-ramp setup: cache the out_scale params once, freeze them during
+    # the ramp so the optimizer doesn't fight the schedule, and re-enable
+    # gradients exactly at step==gate_ramp_steps. Inspired by TPTT's
+    # LiZACallback (initial_weight → final_weight over transition_step
+    # steps): forcing the memory gate open on a fixed schedule prevents
+    # the model from passively leaving the NMM contribution near zero
+    # during early fine-tuning, where the LM-loss signal alone is too
+    # diffuse to open it.
+    out_scale_params = (
+        collect_out_scale_params(model) if gate_ramp_steps > 0 else []
+    )
+    if out_scale_params and rank == 0:
+        print(
+            f"[run_training] gate ramping: {len(out_scale_params)} out_scale "
+            f"params will be held to a linear schedule "
+            f"0 -> {gate_ramp_target} over the first {gate_ramp_steps} steps, "
+            f"then released to the optimizer.",
+            file=sys.stderr,
+        )
+    if out_scale_params:
+        for p in out_scale_params:
+            p.requires_grad = False
+
     try:
         while step < max_steps:
+            # Gate-ramp: hold out_scale to the schedule during the ramp.
+            # `gate_ramp_value` returns target * (step+1)/ramp_steps so the
+            # LAST in-ramp step (step == ramp_steps - 1) sees the full
+            # target value. At step == gate_ramp_steps we hand control
+            # back to the optimizer.
+            if out_scale_params:
+                if step < gate_ramp_steps:
+                    target_val = gate_ramp_value(
+                        step, gate_ramp_steps, gate_ramp_target,
+                    )
+                    for p in out_scale_params:
+                        p.data.fill_(target_val)
+                elif step == gate_ramp_steps:
+                    # Ramp just ended — let the optimizer take over.
+                    for p in out_scale_params:
+                        p.requires_grad = True
+                    if rank == 0:
+                        tqdm.write(
+                            f"[run_training] gate ramp complete at step "
+                            f"{step}; out_scale params released to optimizer."
+                        )
+
             cycle_ran_any_microbatch = False
             cycle_completed = True
 

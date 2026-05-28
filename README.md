@@ -77,7 +77,7 @@ The recommended recipe for a 16 GiB consumer card (RTX 5070 Ti / 4080 /
 3090 class), T=1024, full-rank MemoryMLP, 12 NMM layers:
 
 ```bash
-uv run python cli/finetune.py \
+uv run python -m cli.finetune \
     --size small \
     --data /path/to/corpus.txt \
     --chunk-size 1024 \
@@ -86,15 +86,28 @@ uv run python cli/finetune.py \
     --nmm-state-dtype bf16 \
     --nmm-detach-state-between-blocks \
     --nmm-use-gram-ns5 \
+    --freeze-backbone \
+    --nmm-gate-ramp-steps 100 \
+    --nmm-gate-ramp-target 0.1 \
     --compile-model \
     --optim8bit \
     --max-steps 5000
 ```
 
 This loads pretrained `openai-community/gpt2`, splices in the NMM with
-`out_scale=0` (so initial logits exactly match HF), and starts training.
-At step 0 perplexity should equal vanilla GPT-2; from there it decreases
-as the memory contribution ramps up.
+`out_scale=0` (so initial logits exactly match HF), freezes the backbone
+so the gradient concentrates on the new memory mechanism, ramps the
+memory gate open over the first 100 steps, and then trains. At step 0
+perplexity should equal vanilla GPT-2; from there it decreases as the
+memory contribution ramps up.
+
+The `--freeze-backbone` and `--nmm-gate-ramp-*` flags follow the
+TPTT-style ([fabienfrfr/tptt](https://github.com/fabienfrfr/tptt))
+recipe for injecting a new memory mechanism into a pretrained
+Transformer: hold the backbone steady so the NMM has a stable target,
+and force the memory gate open on a schedule instead of waiting for
+LM loss alone to slowly open it. Drop both flags for the original
+full-fine-tune-with-passive-gate behavior.
 
 The `--nmm-use-gram-ns5` flag swaps stock NS5 for the Gram-iteration
 variant (Tri Dao et al., POLAR_EXPRESS coefficients + reset at iter 2).

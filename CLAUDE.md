@@ -61,23 +61,56 @@ Pytest markers: `slow`, `gpu`, `slow_gpu`, `ddp`, `compile`, `perf`. See
 
 `cli/finetune.py` and `cli/train.py` share defaults that fit a 16 GiB card:
 `--chunk-size 1024 --batch-size 1 --grad-accum 16 --max-steps 5000
---warmup-steps 500`. The full canonical command also passes a few `--nmm-*`
-backend toggles and `--compile-model --optim8bit`:
+--warmup-steps 500`. The full canonical command:
 
 ```bash
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python cli/finetune.py \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python -m cli.finetune \
     --size small --data corpus.txt \
     --nmm-block-size 64 \
     --nmm-state-dtype bf16 \
     --nmm-detach-state-between-blocks \
     --nmm-use-gram-ns5 \
+    --freeze-backbone \
+    --nmm-gate-ramp-steps 100 \
+    --nmm-gate-ramp-target 0.1 \
     --compile-model --optim8bit
 ```
 
+The TPTT-inspired flags
+([fabienfrfr/tptt](https://github.com/fabienfrfr/tptt)) at the bottom
+are the difference from a plain LM fine-tune:
+
+- `--freeze-backbone` — freeze every param outside the memory pathway
+  (anything not matching one of `cli.train.FREEZE_BACKBONE_KEEP_TRAINABLE_SUBSTRINGS`
+  = `("nmm", "gamma", "out_scale", "persistent")`). Halves the trainable
+  parameter count at gpt2_small (251M → 128M). The backbone's pretrained
+  representations are preserved exactly; the NMM has a stable target to
+  integrate with instead of chasing a moving backbone.
+
+- `--nmm-gate-ramp-steps N` + `--nmm-gate-ramp-target X` — during the
+  first N training steps, hold every per-block `out_scale` to a linear
+  ramp from `~0 → X`, with `requires_grad=False` so the optimizer doesn't
+  fight the schedule. At step N, the optimizer takes over. Forces the
+  memory gate open on a fixed schedule rather than relying on LM loss
+  alone to slowly open it (TPTT's LiZACallback pattern).
+
+Why these matter: without them, the LM-loss gradient is diluted across
+~125M backbone params and the NMM's `out_scale` is left to passively
+self-bootstrap from 0. A diagnostic run on needle-in-haystack found
+this produced only ~0.45 logits of needle-dependence past block_size
+— ~100× too weak to overcome the LM prior. The TPTT recipe is the
+recommended way to give the memory mechanism a chance to actually
+learn cross-chunk recall.
+
+The argparse defaults leave both flags OFF (`--freeze-backbone` not
+set, `--nmm-gate-ramp-steps=0`) so legacy scripts that didn't pass
+them get full-fine-tune behavior unchanged. The canonical recipe
+above is the new recommendation.
+
 For multi-GPU from-scratch runs on a bigger box you'll want to bump
-`--batch-size`, drop `--grad-accum`, and raise `--max-steps`. The shared
-defaults are sized for the consumer-GPU path; the bigger-box path is an
-override.
+`--batch-size`, drop `--grad-accum`, raise `--max-steps`, and probably
+drop `--freeze-backbone` (more data + more capacity makes the
+gradient-dilution concern less acute).
 
 ## Resume flow gotchas
 
