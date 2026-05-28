@@ -604,10 +604,13 @@ def cans_stationary(
 #      of extra per-layer activation memory at full recipe scale,
 #      blowing past 16 GiB VRAM.
 #   3. The kernel-backed path requires Hopper/Blackwell GPU + CUDA 12.9+
-#      + quack-kernels + nvidia-cutlass-dsl. At our batch=1 NMM shapes
-#      the quack kernels are slower than cuBLAS anyway (per the benchmark
-#      in scripts/benchmark_ns5.py), so the dependency wasn't paying its
-#      way. Dropping it removes the optional dep entirely.
+#      + quack-kernels + nvidia-cutlass-dsl. We benchmarked it again at
+#      gpt2_small NMM shapes — head-to-head quack vs torch.baddbmm is
+#      within 5% per op, and the autograd.Function wrappers we'd need
+#      (quack's ops are forward-only) push the full pipeline 25–50%
+#      *slower* than the torch baseline. cuBLAS on consumer Blackwell
+#      is just very good at 768×3072. See `docs/notes/quack-ns5-
+#      investigation.md` for the full benchmark and reasoning.
 #
 # Algorithm: maintain a small n×n Gram matrix R = X X^T and accumulate
 # a polynomial Q over five iterations of POLAR_EXPRESS coefficients,
