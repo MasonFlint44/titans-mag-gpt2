@@ -1,50 +1,53 @@
-"""DeltaProduct fast-weight memory — TPTT-aligned formulation.
+"""DeltaProduct fast-weight memory — TPTT formulation.
 
 Replaces the NMM's surprise-driven inner-loop gradient update with the
 explicit delta rule (Yang et al., NeurIPS 2024 / arxiv 2406.06484) of
 order N (Siems et al., ICLR 2025 / arxiv 2502.10297). The specific
-projection / gating / normalization conventions follow TPTT (Furfaro
-2025, arxiv 2506.17671), which is the published recipe for adapting
-*pretrained* transformers — exactly our setting.
+projection / gating / normalization / order-N-expansion conventions
+follow TPTT (Furfaro 2025, arxiv 2506.17671), which is the published
+recipe for adapting *pretrained* transformers.
 
-TPTT-specific design (see model/delta_product.py for the original
-formulation, since-deleted):
+TPTT-specific design (see TPTT Section 3.1 for the equations):
 
-  Projections (from TPTT eq. 4):
-    q_normed = L2_normalize(SiLU(q_raw))     — per-head, per-token
+  Projections (TPTT eq. 4):
+    q_normed = L2_normalize(SiLU(q_raw))
     k_normed = L2_normalize(SiLU(k_raw))
-    v_scaled = v_raw / sqrt(head_dim)        — just attention-scaling
+    v_scaled = v_raw / sqrt(head_dim)
 
-  β gating (from TPTT eq. 5, default `beta_gate="k"`):
-    β = sigmoid(CausalAvgPool_3(k_raw))      — vector, per-component
+  β gating (TPTT eq. 5, default `beta_gate="k"`):
+    β = sigmoid(CausalAvgPool_3(k_raw))   — vector, per-component
+    pool kernel = [1/3, 1/3, 1/3], fixed (not learnable)
 
-    CausalAvgPool is a fixed-weight kernel-3 moving average — NOT
-    learnable. β is computed from the RAW K projection (before
-    SiLU+L2) so the gating sees the un-normalized signal.
+  Order-N expansion (VirtualTokenExpander, "dt" / derivative trick):
+    deriv_kernel[k] = (-1)^k · C(n-1, k), normalized by sum of abs
+    For each (q, k, v, β):
+      virtual[s, k] = x_padded[s + (n-1-k)] · deriv_kernel[n-1-k]
+    Reshaped to virtual sequence: T·N writes per chunk.
 
-  Per-token update with vector β:
-    M ← M + (β⊙v) k^T − M (β⊙k) k^T
+  Per-token update with vector β (virtual sequence):
+    M ← M + (β⊙v − M·(β⊙k)) · kᵀ      — un-gated k on the right
 
-  Output (from TPTT eq. 6):
-    y_out = RMSNorm(y_raw) · out_proj   — manual RMSNorm + Linear
+  Read: at virtual position N·t + N−1 (last sub-step of real token t),
+    using virtual_q at that position. The output for real token t is
+    y[t] = virtual_q_last_substep[t] · M.
 
-  We additionally keep a per-channel `out_scale` gain after `out_proj`
-  to preserve the gate-ramp logic in cli/train.py and the finetune-mode
-  "y = 0 at step 0" invariant.
+  Output (TPTT eq. 6):
+    y_out = RMSNorm(y_raw) · out_proj(bias=True) · out_scale
 
-Math derivation for the chunkwise WY solve with vector β:
+  out_proj has a learnable bias (matches TPTT default). out_scale is
+  our addition — preserves cli/train.py's gate-ramp logic and the
+  finetune-mode "y = 0 at step 0" invariant.
 
-  u_t = (β_t ⊙ v_t) − M_{t-1} (β_t ⊙ k_t)
-  G[t, j] = (β_t ⊙ k_t) · k_j        for j < t
-  R[t]    = (β_t ⊙ v_t) − M_in (β_t ⊙ k_t)
-  (I + G) U = R                       (unit-lower-tri solve)
-  M_out = M_in + Uᵀ K                 (K = un-gated keys)
-  y[t]  = M_in q_t + Σ_{s ≤ (t+1)N − 1} (q_t · k_s) u_s
-
-Multi-head fusion: `n_heads > 1` runs all heads in parallel via batched
-einsum projections + WY solve with batch dim = B·n_heads.
-
-State: a 1-tuple `(M,)` with `M ∈ R^(B, n_heads, head_dim, head_dim)`.
+State: 3-tuple `(M, k_raw_buf, qkvb_buf)`:
+  - `M`: [B, n_heads, head_dim, head_dim] — recurrent state, TPTT-style
+    1e-6 fill at init (numerical stability for un-linear activation).
+  - `k_raw_buf`: [B, 2, n_heads, head_dim] — last 2 raw K projections,
+    threaded across forward_chunk calls so the CausalAvgPool sees
+    continuous context.
+  - `qkvb_buf`: tuple of (q, k, v, β) each [B, n-1, n_heads, head_dim] —
+    last (n-1) post-projection tensors, threaded so the
+    VirtualTokenExpander sees continuous context across chunks. None at
+    order=1 (no expansion = no continuity buffer needed).
 
 Interface mirrors `NeuralMemoryModule` so `TitansMAGBlock` can pick
 between the two via `config.memory_type` without other changes:
@@ -93,24 +96,60 @@ def _chunkwise_aux_tensors(device, T: int, N: int, dtype):
 def _causal_avg_pool_3(x: torch.Tensor) -> torch.Tensor:
     """Causal 3-token moving average along the T (dim=1) axis.
 
-    Replicate-pads the leading 2 positions (so the boundary entries
-    see their own value rather than zeros). Matches TPTT's
-    `CausalAvgPool1d` semantics (kernel size 3, fixed weights
-    [1/3, 1/3, 1/3], replicate padding). Implemented as direct shifts +
-    broadcast-add to avoid a Conv1d kernel launch (which would be
-    pointless for a fixed average).
-
-    Args:
-        x: [B, T, ...] — input tensor; T is the time axis.
-
-    Returns:
-        Tensor of the same shape: `y[t] = (x[t] + x[t-1] + x[t-2]) / 3`
-        with `x[t-k]` replicated to `x[0]` for any `t-k < 0`.
+    Replicate-pads the leading 2 positions. Matches TPTT's
+    `CausalAvgPool1d` semantics (kernel size 3, weights [1/3, 1/3, 1/3],
+    fixed/not-learnable, replicate padding).
     """
-    # x[:, 0] replicated as the first two "past" positions.
     first = x[:, :1]
     x_pad = torch.cat([first, first, x], dim=1)  # [B, T+2, ...]
     return (x_pad[:, :-2] + x_pad[:, 1:-1] + x_pad[:, 2:]) / 3.0
+
+
+def _virtual_token_expand(
+    x: torch.Tensor, n: int, kernel: torch.Tensor,
+) -> torch.Tensor:
+    """TPTT's `VirtualTokenExpander` for the "dt" (derivative) trick.
+
+    Args:
+        x: [B, T, H, hd] — post-projection tensor.
+        n: expansion order (the same as `order`).
+        kernel: [n] — pre-normalized binomial-coefficient derivative
+            kernel: `deriv[k] = (-1)^k · C(n-1, k) / sum(|coeffs|)`.
+
+    Returns:
+        Tensor of shape [B, T, n, H, hd]. For each real position s and
+        sub-step k:
+            virtual[s, k] = x_padded[s + (n-1-k)] · kernel[n-1-k]
+        where `x_padded` is `x` prepended with (n-1) zeros for the
+        unfold-from-left padding TPTT uses internally.
+
+    Notes:
+        - The implementation mirrors TPTT's `VirtualTokenExpander._apply_derivative_conv`
+          and the subsequent `flip(-1).permute(0, 1, 2, 4, 3)` exactly,
+          modulo the input being head-split [B, T, H, hd] in our layout
+          vs TPTT's [B, H, T, hd]. We unfold along dim=1.
+        - For n=1, kernel = [1.0] and the expansion is the identity
+          (input wrapped as [B, T, 1, H, hd]) — short-circuit at the
+          call site for clarity.
+    """
+    B, T, H, hd = x.shape
+    # Internal padding: prepend (n-1) zeros along T for unfold.
+    if n > 1:
+        pad = torch.zeros(B, n - 1, H, hd, device=x.device, dtype=x.dtype)
+        x_padded = torch.cat([pad, x], dim=1)  # [B, T+n-1, H, hd]
+    else:
+        x_padded = x
+    # Unfold along T with size=n step=1: result [B, T, H, hd, n].
+    windows = x_padded.unfold(dimension=1, size=n, step=1)
+    # Multiply by kernel (broadcast over B, T, H, hd; index by k).
+    conv_out = windows * kernel.view(1, 1, 1, 1, n).to(x.dtype)
+    # Flip the last (kernel-index) dim so the natural order (k=0 →
+    # current token, k=n-1 → oldest token) is reversed: TPTT's
+    # convention has k=n-1 as the oldest. The flip + permute produces
+    # the layout [B, T, n, H, hd] with sub-step indexed by dim=2.
+    conv_out = conv_out.flip(-1)
+    out = conv_out.permute(0, 1, 4, 2, 3)  # [B, T, n, H, hd]
+    return out
 
 
 class DeltaProductMemory(nn.Module):
@@ -130,12 +169,10 @@ class DeltaProductMemory(nn.Module):
             y_mem = 0 at step 0 and the pretrained backbone's residual is
             preserved exactly until the gate ramp / optimizer takes over.
         block_size: forward-path selector. `block_size=1` runs the
-            sequential per-token recurrence (reference correctness path,
-            slow but bit-exact; useful as a baseline and as the decode
-            path). `block_size>1` routes through the closed-form
-            chunkwise WY parallel path (training-time speed path, bit-
-            equivalent to sequential, one triangular solve per document
-            segment).
+            sequential per-token recurrence (reference correctness path).
+            `block_size>1` routes through the closed-form chunkwise WY
+            parallel path (training-time speed path, bit-equivalent to
+            sequential, one triangular solve per document segment).
     """
 
     def __init__(
@@ -167,176 +204,189 @@ class DeltaProductMemory(nn.Module):
         self.order = int(order)
         self.block_size = int(block_size)
         self.finetune_mode = bool(finetune_mode)
-        # V scaling factor (1/√head_dim) per TPTT's `prepare_attention_input`.
         self._v_scale = 1.0 / math.sqrt(self.head_dim)
 
         H, hd = self.n_heads, self.head_dim
 
-        # Stacked per-head projection weights. One Q (read query, single
-        # projection — the read happens after all N writes), N K and N V
-        # for the N delta sub-steps. β is NOT learnable in TPTT — it's
-        # computed from K_raw via fixed CausalAvgPool + sigmoid.
+        # SINGLE Q, K, V projections (TPTT design — N virtual tokens
+        # come from the VirtualTokenExpander, not N independent learned
+        # projections). β is computed from K_raw via fixed CausalAvgPool.
         self.q_proj_weight = nn.Parameter(torch.empty(H, hd, hd))
-        self.k_proj_weights = nn.ParameterList(
-            [nn.Parameter(torch.empty(H, hd, hd)) for _ in range(order)]
-        )
-        self.v_proj_weights = nn.ParameterList(
-            [nn.Parameter(torch.empty(H, hd, hd)) for _ in range(order)]
-        )
+        self.k_proj_weight = nn.Parameter(torch.empty(H, hd, hd))
+        self.v_proj_weight = nn.Parameter(torch.empty(H, hd, hd))
 
-        # Output projection — applied to the merged-head output after
-        # the RMSNorm, matching TPTT's `merge_head_output`. No bias.
-        self.out_proj = nn.Linear(n_embd, n_embd, bias=False)
+        # Output projection — matches TPTT's `out_proj = Linear(...,
+        # bias=True)`. The bias is multiplied by `out_scale` post-norm,
+        # so finetune-mode "y = 0 at step 0" still holds.
+        self.out_proj = nn.Linear(n_embd, n_embd, bias=True)
 
-        # Per-channel output gain. Zero-init under finetune_mode so the
-        # pretrained backbone's residual is preserved at step 0. Survives
-        # cli/train.py's gate-ramp logic by name (`*.out_scale`).
+        # Per-channel output gain. Zero-init under finetune_mode.
         if finetune_mode:
             self.out_scale = nn.Parameter(torch.zeros(H, hd))
         else:
             self.out_scale = nn.Parameter(torch.ones(H, hd))
 
+        # VirtualTokenExpander kernel — pre-normalized binomial
+        # coefficients with alternating signs. Fixed buffer (NOT a
+        # parameter). Only needed for order > 1; order=1 short-circuits.
+        if order > 1:
+            coeffs = [(-1) ** k * math.comb(order - 1, k) for k in range(order)]
+            kernel = torch.tensor(coeffs, dtype=torch.float32)
+            kernel = kernel / kernel.abs().sum()
+            self.register_buffer("_virtual_kernel", kernel, persistent=False)
+
         self._init_weights()
 
     def _init_weights(self) -> None:
         """Match PyTorch Linear's default kaiming init for each per-head
-        slice, plus the standard Linear init on `out_proj`."""
+        slice on stacked tensors; out_proj inherits PyTorch's Linear
+        default."""
         hd = self.head_dim
         bound = 1.0 / math.sqrt(hd)
         with torch.no_grad():
             nn.init.uniform_(self.q_proj_weight, -bound, bound)
-            for i in range(self.order):
-                nn.init.uniform_(self.k_proj_weights[i], -bound, bound)
-                nn.init.uniform_(self.v_proj_weights[i], -bound, bound)
-        # out_proj uses PyTorch's Linear default (kaiming_uniform_) on
-        # construction — no override needed.
+            nn.init.uniform_(self.k_proj_weight, -bound, bound)
+            nn.init.uniform_(self.v_proj_weight, -bound, bound)
 
     # ------------------------------------------------------------------
     # State + projections
     # ------------------------------------------------------------------
 
     def init_state(self, B: int, device) -> tuple:
-        """Per-sample-batched zero-initialized M plus per-order rolling
-        buffers of the last 2 raw K values.
+        """Per-sample-batched initial state.
 
-        Returns a 2-tuple `(M, k_raw_history)`:
-          - `M` shape `[B, n_heads, head_dim, head_dim]` — recurrent state.
-          - `k_raw_history` list of `order` tensors, each shape
-            `[B, 2, n_heads, head_dim]` — the last 2 raw K projections
-            for each sub-step, threaded across forward_chunk calls so the
-            CausalAvgPool sees continuous context. Zero-initialized at
-            fresh state, which is equivalent to "no prior tokens" (the
-            pool's first-position replicate-pad reproduces from
-            x[:, 0] either way).
+        Returns a 3-tuple `(M, k_raw_buf, qkvb_buf)`:
+          - `M`: [B, n_heads, head_dim, head_dim] — 1e-6 fill (TPTT's
+            `state` initial fill_value for "stability if unlinear
+            activation"). Pretrained-mode finetuning preserves the
+            backbone's residual at step 0 via `out_scale = 0`, not via
+            M = 0, so 1e-6 here doesn't affect step-0 behavior.
+          - `k_raw_buf`: [B, 2, n_heads, head_dim] — last 2 raw K
+            projections for the CausalAvgPool's 3-token window.
+          - `qkvb_buf`: tuple (q, k, v, β) each [B, order-1, n_heads,
+            head_dim] for the VirtualTokenExpander's (order-1)-token
+            window. None at order=1.
         """
-        M = torch.zeros(
-            B, self.n_heads, self.head_dim, self.head_dim,
+        H, hd = self.n_heads, self.head_dim
+        M = torch.full(
+            (B, H, hd, hd),
+            fill_value=1e-6,
             device=device, dtype=torch.float32,
         )
-        k_buf = [
-            torch.zeros(
-                B, 2, self.n_heads, self.head_dim,
-                device=device, dtype=torch.float32,
+        k_raw_buf = torch.zeros(
+            B, 2, H, hd, device=device, dtype=torch.float32,
+        )
+        if self.order > 1:
+            n_minus_1 = self.order - 1
+            qkvb_buf = tuple(
+                torch.zeros(
+                    B, n_minus_1, H, hd,
+                    device=device, dtype=torch.float32,
+                )
+                for _ in range(4)  # q, k, v, β
             )
-            for _ in range(self.order)
-        ]
-        return (M, k_buf)
+        else:
+            qkvb_buf = None
+        return (M, k_raw_buf, qkvb_buf)
 
-    def _project_kvb(self, x_chunk: torch.Tensor, k_buf_in: list):
-        """Batched per-head projections for the whole chunk.
+    def _project_kvb(
+        self, x_chunk: torch.Tensor, k_raw_buf_in: torch.Tensor, qkvb_buf_in,
+    ):
+        """Project x_chunk → (virtual_q, virtual_k, virtual_v, virtual_β)
+        with cross-chunk continuity for both the CausalAvgPool gating
+        and the VirtualTokenExpander.
 
-        x_chunk: [B, T, n_embd]
-        k_buf_in: list[order] of [B, 2, H, hd] — prior-call raw K values
-            for continuous CausalAvgPool context.
-
-        Returns (q, ks, vs, bs, k_buf_out):
-            q  [B, T, H, hd] — SiLU + L2-normalized
-            ks list[order] of [B, T, H, hd] — SiLU + L2-normalized
-            vs list[order] of [B, T, H, hd] — scaled by 1/√head_dim
-            bs list[order] of [B, T, H, hd] — vector β = σ(CausalAvgPool(k_raw_extended))
-            k_buf_out list[order] of [B, 2, H, hd] — last 2 raw K values
-                of the combined (buffer + chunk) sequence, ready for the
-                next call.
-
-        β is computed from the RAW K projection (before SiLU+L2) so the
-        gating depends on the un-normalized signal, matching TPTT's
-        `compute_gate(k_raw, v_raw)` placement before SiLU+L2 normalize.
-
-        The CausalAvgPool runs over the BUFFER-EXTENDED sequence
-        `[k_buf_in, k_raw]` so the leading 2 positions of the chunk see
-        the prior call's last 2 raw K values, not replicate-padded zeros.
-        Without this, splitting a continuous stream into multiple
-        forward_chunk calls would produce different β at the chunk head
-        than a single-shot forward — see test_state_continuity_split_chunk_matches_full.
+        Returns:
+            q_virt   [B, T, n, H, hd] — virtual queries from expander
+            k_virt   [B, T, n, H, hd] — virtual keys (SiLU+L2 then expander)
+            v_virt   [B, T, n, H, hd] — virtual values (scaled then expander)
+            beta_virt [B, T, n, H, hd] — virtual β (vector, expanded)
+            k_raw_buf_out [B, 2, H, hd] — new pool buffer
+            qkvb_buf_out  tuple(4) of [B, order-1, H, hd] — new expander
+                buffer (None at order=1)
         """
         B, T, _ = x_chunk.shape
         H, hd = self.n_heads, self.head_dim
+        n = self.order
         x_h = x_chunk.view(B, T, H, hd)
 
-        # Q: project, then SiLU + L2 normalize.
+        # Single Q, K, V projections.
         q_raw = torch.einsum("bthd,hde->bthe", x_h, self.q_proj_weight)
+        k_raw = torch.einsum("bthd,hde->bthe", x_h, self.k_proj_weight)
+        v_raw = torch.einsum("bthd,hde->bthe", x_h, self.v_proj_weight)
+
+        # β = σ(CausalAvgPool(k_raw_extended_with_buf)).
+        k_raw_pool_input = torch.cat([k_raw_buf_in, k_raw], dim=1)
+        beta_full = torch.sigmoid(_causal_avg_pool_3(k_raw_pool_input))
+        beta = beta_full[:, 2:]  # [B, T, H, hd]
+        k_raw_buf_out = k_raw_pool_input[:, -2:]
+
+        # SiLU+L2 on Q and K; V scaled by 1/√head_dim.
         q = F.normalize(F.silu(q_raw), p=2, dim=-1, eps=1e-6)
+        k = F.normalize(F.silu(k_raw), p=2, dim=-1, eps=1e-6)
+        v = v_raw * self._v_scale
 
-        ks, vs, bs = [], [], []
-        k_buf_out = []
-        for i in range(self.order):
-            # K_raw: project x; concat with prior buffer for continuous
-            # pool context across forward_chunk boundaries.
-            k_raw = torch.einsum("bthd,hde->bthe", x_h, self.k_proj_weights[i])
-            k_raw_ext = torch.cat([k_buf_in[i], k_raw], dim=1)  # [B, 2+T, H, hd]
+        # VirtualTokenExpander on q, k, v, β. For n=1 the expansion is
+        # an identity (add a length-1 sub-step dim). For n>1 we prepend
+        # the per-tensor (n-1)-token buffer for cross-chunk continuity.
+        if n == 1:
+            q_virt = q.unsqueeze(2)        # [B, T, 1, H, hd]
+            k_virt = k.unsqueeze(2)
+            v_virt = v.unsqueeze(2)
+            beta_virt = beta.unsqueeze(2)
+            qkvb_buf_out = None
+        else:
+            # Concat per-tensor expander buffers; expand the longer
+            # sequence; slice off the prepended portion so the output
+            # length is exactly T.
+            q_ext = torch.cat([qkvb_buf_in[0], q], dim=1)
+            k_ext = torch.cat([qkvb_buf_in[1], k], dim=1)
+            v_ext = torch.cat([qkvb_buf_in[2], v], dim=1)
+            beta_ext = torch.cat([qkvb_buf_in[3], beta], dim=1)
 
-            # β = σ(CausalAvgPool(k_raw_ext))[buffer_len:]  -> matches the
-            # current chunk's T positions exactly.
-            beta_full = torch.sigmoid(_causal_avg_pool_3(k_raw_ext))
-            beta_i = beta_full[:, 2:]  # [B, T, H, hd]
+            kernel = self._virtual_kernel
+            q_virt_full = _virtual_token_expand(q_ext, n, kernel)
+            k_virt_full = _virtual_token_expand(k_ext, n, kernel)
+            v_virt_full = _virtual_token_expand(v_ext, n, kernel)
+            beta_virt_full = _virtual_token_expand(beta_ext, n, kernel)
 
-            # k_normed for the WY math (computed from the current chunk's
-            # k_raw, NOT the buffer-extended version — the buffer is
-            # purely for pool continuity).
-            k_normed = F.normalize(F.silu(k_raw), p=2, dim=-1, eps=1e-6)
-            ks.append(k_normed)
-            bs.append(beta_i)
+            # The expander output has length (T + n - 1). Slice the last
+            # T positions, which correspond to the current chunk's real
+            # tokens with the prior-chunk context baked into the early
+            # sub-steps.
+            q_virt = q_virt_full[:, -T:]
+            k_virt = k_virt_full[:, -T:]
+            v_virt = v_virt_full[:, -T:]
+            beta_virt = beta_virt_full[:, -T:]
 
-            # New buffer: last 2 raw K values of the combined sequence.
-            # For T >= 2 this is just k_raw[:, -2:]; for T < 2 the cat
-            # form handles the short-chunk case correctly.
-            k_buf_out.append(k_raw_ext[:, -2:])
-
-            # V: project, scale by 1/√head_dim (no SiLU, no L2 normalize).
-            v_i = (
-                torch.einsum("bthd,hde->bthe", x_h, self.v_proj_weights[i])
-                * self._v_scale
+            # New buffer: last (n-1) of the extended post-projection
+            # tensors (TPTT saves them BEFORE the expander, line ~553
+            # in modeling_tptt.py).
+            qkvb_buf_out = (
+                q_ext[:, -(n - 1):],
+                k_ext[:, -(n - 1):],
+                v_ext[:, -(n - 1):],
+                beta_ext[:, -(n - 1):],
             )
-            vs.append(v_i)
 
-        return q, ks, vs, bs, k_buf_out
+        return (
+            q_virt, k_virt, v_virt, beta_virt,
+            k_raw_buf_out, qkvb_buf_out,
+        )
 
     def _apply_out_norm_and_proj(
         self, y_BTHd: torch.Tensor, dtype,
     ) -> torch.Tensor:
-        """TPTT-style output: merge heads, manual RMSNorm, Linear out_proj,
-        per-channel `out_scale` gain.
-
-        The per-channel `out_scale` is our addition to TPTT — it preserves
-        the gate-ramp logic in cli/train.py and the finetune-mode "y = 0
-        at step 0" invariant. TPTT relies on LoRA's near-zero init for
-        the equivalent guarantee.
+        """TPTT-style output: merge heads, manual RMSNorm, Linear out_proj
+        (bias=True), per-channel `out_scale` gain.
         """
         B, T = y_BTHd.shape[:2]
         H, hd = self.n_heads, self.head_dim
 
-        # Merge heads to [B, T, n_embd].
         y = y_BTHd.reshape(B, T, H * hd)
-
-        # Manual RMSNorm (no learnable scale, matches TPTT eq. 6 verbatim).
         rms = y.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
         y = y / rms
-
-        # Out projection (Linear, no bias).
         y = self.out_proj(y.to(dtype))
-
-        # Per-channel gain. out_scale is [H, hd] for parity with multi-
-        # head shape; reshape to [n_embd] for the merged-head application.
         y = y * self.out_scale.to(dtype).reshape(H * hd)
         return y
 
@@ -352,53 +402,54 @@ class DeltaProductMemory(nn.Module):
     ) -> tuple:
         """Per-token recurrent forward — reference correctness path.
 
-        Bit-equivalent to T calls to `step_with_conv`. The chunkwise path
-        (block_size>1) is checked against this for correctness.
-
-        Per-token update with vector β:
-            k_β = β_i ⊙ k_i,    v_β = β_i ⊙ v_i
-            M ← M + (v_β − M·k_β) · k_iᵀ       — un-gated k on the right
+        The chunkwise path (block_size>1) is checked against this for
+        correctness. Iterates over the T·n virtual writes with the
+        delta-rule update, reading at every n-th virtual position using
+        the corresponding virtual Q.
         """
-        M, k_buf_in = state_in  # M: [B, H, hd, hd], k_buf_in: list of [B, 2, H, hd]
+        M, k_raw_buf_in, qkvb_buf_in = state_in
         B, T, _ = x_chunk.shape
         H, hd = self.n_heads, self.head_dim
+        n = self.order
 
         M_dtype = M.dtype
-        q, ks, vs, bs, k_buf_out = self._project_kvb(x_chunk, k_buf_in)
+        q_virt, k_virt, v_virt, beta_virt, k_raw_buf_out, qkvb_buf_out = (
+            self._project_kvb(x_chunk, k_raw_buf_in, qkvb_buf_in)
+        )
 
-        # Flatten (B, H) into the bmm batch dim.
         M_v = M.reshape(B * H, hd, hd)
 
         y_steps = []
         for t in range(T):
+            # Doc-boundary reset for this real token (BEFORE its first
+            # virtual write). M is per-row; broadcast over heads.
             if doc_boundaries is not None:
-                reset_mask = doc_boundaries[:, t]  # [B] bool
+                reset_mask = doc_boundaries[:, t]
                 if reset_mask.any():
                     rm = reset_mask.view(B, 1).expand(B, H).reshape(B * H, 1, 1)
                     M_v = torch.where(rm, torch.zeros_like(M_v), M_v)
 
-            for i in range(self.order):
-                k_i = ks[i][:, t].to(M_dtype).reshape(B * H, hd)
-                v_i = vs[i][:, t].to(M_dtype).reshape(B * H, hd)
-                beta_i = bs[i][:, t].to(M_dtype).reshape(B * H, hd)
-
-                k_beta = beta_i * k_i              # [B*H, hd]
-                v_beta = beta_i * v_i              # [B*H, hd]
-                # M · (β ⊙ k)  →  [B*H, hd]
+            # n virtual writes for real token t.
+            for k in range(n):
+                k_i = k_virt[:, t, k].to(M_dtype).reshape(B * H, hd)
+                v_i = v_virt[:, t, k].to(M_dtype).reshape(B * H, hd)
+                beta_i = beta_virt[:, t, k].to(M_dtype).reshape(B * H, hd)
+                k_beta = beta_i * k_i
+                v_beta = beta_i * v_i
                 Mk = torch.bmm(M_v, k_beta.unsqueeze(-1)).squeeze(-1)
                 err = v_beta - Mk
-                # Rank-1 outer product with UN-GATED k on the right.
                 delta = torch.bmm(err.unsqueeze(-1), k_i.unsqueeze(-2))
                 M_v = M_v + delta
 
-            q_t = q[:, t].to(M_dtype).reshape(B * H, hd)
+            # Read at the last sub-step using virtual_q[t, n-1].
+            q_t = q_virt[:, t, n - 1].to(M_dtype).reshape(B * H, hd)
             y_t = torch.bmm(M_v, q_t.unsqueeze(-1)).squeeze(-1)
             y_steps.append(y_t.view(B, H, hd))
 
         y_BTHhd = torch.stack(y_steps, dim=1)  # [B, T, H, hd]
         y = self._apply_out_norm_and_proj(y_BTHhd, x_chunk.dtype)
         M_out = M_v.view(B, H, hd, hd)
-        return y, (M_out, k_buf_out)
+        return y, (M_out, k_raw_buf_out, qkvb_buf_out)
 
     # ------------------------------------------------------------------
     # Chunkwise WY parallel path
@@ -411,16 +462,15 @@ class DeltaProductMemory(nn.Module):
         doc_boundaries=None,
     ) -> tuple:
         """Chunkwise parallel forward — closed-form WY representation
-        with vector β.
+        with vector β over the virtual sequence.
 
-        Bit-equivalent to the sequential per-token recurrence: one WY
-        triangular solve per contiguous document segment.
+        One WY solve per contiguous document segment.
         """
-        M, k_buf_in = state_in  # M: [B, H, hd, hd], k_buf_in: list of [B, 2, H, hd]
+        M, k_raw_buf_in, qkvb_buf_in = state_in
         B, T, _ = x_chunk.shape
 
-        q_all, ks_all, vs_all, bs_all, k_buf_out = self._project_kvb(
-            x_chunk, k_buf_in,
+        q_virt, k_virt, v_virt, beta_virt, k_raw_buf_out, qkvb_buf_out = (
+            self._project_kvb(x_chunk, k_raw_buf_in, qkvb_buf_in)
         )
 
         splits = {0, T}
@@ -444,12 +494,12 @@ class DeltaProductMemory(nn.Module):
                     torch.zeros_like(M),
                     M,
                 )
-            q_seg = q_all[:, t_lo:t_hi]
-            ks_seg = [k[:, t_lo:t_hi] for k in ks_all]
-            vs_seg = [v[:, t_lo:t_hi] for v in vs_all]
-            bs_seg = [b[:, t_lo:t_hi] for b in bs_all]
+            q_seg = q_virt[:, t_lo:t_hi]
+            k_seg = k_virt[:, t_lo:t_hi]
+            v_seg = v_virt[:, t_lo:t_hi]
+            b_seg = beta_virt[:, t_lo:t_hi]
             y_seg_raw, M = self._chunkwise_solve_raw(
-                M, q_seg, ks_seg, vs_seg, bs_seg,
+                M, q_seg, k_seg, v_seg, b_seg,
             )
             y_segments.append(y_seg_raw)
 
@@ -458,90 +508,79 @@ class DeltaProductMemory(nn.Module):
             else torch.cat(y_segments, dim=1)
         )
         y = self._apply_out_norm_and_proj(y_raw, x_chunk.dtype)
-        return y, (M, k_buf_out)
+        return y, (M, k_raw_buf_out, qkvb_buf_out)
 
     def _chunkwise_solve_raw(
         self,
         M_in: torch.Tensor,
-        q: torch.Tensor,
-        ks: list,
-        vs: list,
-        bs: list,
+        q_virt: torch.Tensor,
+        k_virt: torch.Tensor,
+        v_virt: torch.Tensor,
+        beta_virt: torch.Tensor,
     ) -> tuple:
-        """Core WY chunkwise solve with vector β, all heads batched.
+        """Core WY chunkwise solve with vector β over the virtual sequence.
 
-        M_in: [B, H, hd, hd]; q: [B, T, H, hd]; ks/vs/bs: list of [B, T, H, hd].
+        Inputs are pre-expanded virtual tensors of shape [B, T, n, H, hd]
+        (or [B, T, n, H, 1] for β if we were using scalar β; here β is
+        vector so it's [B, T, n, H, hd]).
 
         Returns (y_raw [B, T, H, hd], M_out [B, H, hd, hd]).
 
-        Math (per (B, H) slice):
-            K_β  = β ⊙ K,     V_β = β ⊙ V          (element-wise)
-            G[s, j] = (β_s ⊙ k_s) · k_j = (K_β @ Kᵀ)[s, j]   for j < s
-            R[s]    = (β_s ⊙ v_s) − M_in (β_s ⊙ k_s) = V_β − K_β @ M_inᵀ
-            (I + G) U = R                          (unit-lower-tri solve)
-            M_out   = M_in + Uᵀ K                  (un-gated K on the right)
-            y[t]    = M_in q_t + Σ_{s ≤ (t+1)N − 1} (q_t · k_s) u_s
+        The read at each real token t uses the virtual Q at the LAST
+        sub-step `q_virt[:, t, n-1]`. M_out reflects all T·n virtual
+        writes for the chunk.
         """
         M_dtype = M_in.dtype
-        B, T, H, hd = q.shape
-        N = len(ks)
-        TN = T * N
+        B, T, n, H, hd = q_virt.shape
+        TN = T * n
 
-        # Stack to virtual sequence [B, T, N, H, hd]; permute to put H
-        # before TN; flatten (B, H) into the bmm batch dim.
-        K_stack = torch.stack(ks, dim=2)
-        V_stack = torch.stack(vs, dim=2)
-        beta_stack = torch.stack(bs, dim=2)
-
+        # Reshape virtual sequence: collapse the (T, n) dims into TN.
+        # Layout: virtual position N·t + k for real t, sub-step k.
+        # The natural reshape gives this layout when the n dim is
+        # adjacent to T (which it is: [B, T, n, H, hd]).
         K_virt = (
-            K_stack.permute(0, 3, 1, 2, 4).reshape(B, H, TN, hd).to(M_dtype)
+            k_virt.permute(0, 3, 1, 2, 4).reshape(B, H, TN, hd).to(M_dtype)
         )
         V_virt = (
-            V_stack.permute(0, 3, 1, 2, 4).reshape(B, H, TN, hd).to(M_dtype)
+            v_virt.permute(0, 3, 1, 2, 4).reshape(B, H, TN, hd).to(M_dtype)
         )
-        beta_virt = (
-            beta_stack.permute(0, 3, 1, 2, 4).reshape(B, H, TN, hd).to(M_dtype)
+        beta_virt_r = (
+            beta_virt.permute(0, 3, 1, 2, 4).reshape(B, H, TN, hd).to(M_dtype)
         )
-        Q_BH = q.permute(0, 2, 1, 3).to(M_dtype)  # [B, H, T, hd]
+
+        # Virtual queries at the last sub-step for each real token.
+        # Shape: [B, T, H, hd] → permute → [B, H, T, hd].
+        q_last = q_virt[:, :, n - 1].permute(0, 2, 1, 3).to(M_dtype)
 
         K_v = K_virt.reshape(B * H, TN, hd)
         V_v = V_virt.reshape(B * H, TN, hd)
-        beta_v = beta_virt.reshape(B * H, TN, hd)
-        Q_v = Q_BH.reshape(B * H, T, hd)
+        beta_v = beta_virt_r.reshape(B * H, TN, hd)
+        Q_v = q_last.reshape(B * H, T, hd)
         M_in_v = M_in.reshape(B * H, hd, hd)
 
-        # β-gated K and V (element-wise on the head_dim axis).
         K_beta_v = beta_v * K_v
         V_beta_v = beta_v * V_v
 
-        # Mk_β[b, s] = M_in · (β_s ⊙ k_s) — uses K_beta on the row side.
         Mk_beta = torch.bmm(K_beta_v, M_in_v.transpose(-1, -2))
         R = V_beta_v - Mk_beta
 
-        # G[b, s, j] = (β_s ⊙ k_s) · k_j  —  asymmetric Gram.
-        # K_beta on rows, K (un-gated) on cols.
         mask_lt, I_TN, real_mask = _chunkwise_aux_tensors(
-            K_v.device, T, N, M_dtype,
+            K_v.device, T, n, M_dtype,
         )
         G_full = torch.bmm(K_beta_v, K_v.transpose(-1, -2))
         G = G_full * mask_lt
-
-        # (I + G) U = R via unit-lower-triangular solve.
         LhS = I_TN.unsqueeze(0) + G
         U = torch.linalg.solve_triangular(
             LhS, R, upper=False, unitriangular=True,
         )
 
-        # M_out = M_in + Uᵀ K  (K un-gated — rank-1 outer products use
-        # the right-side k unchanged).
         M_out_v = M_in_v + torch.bmm(U.transpose(-1, -2), K_v)
 
-        # Reads: y_t uses M_t = M_in + Σ_{s ≤ Nt+N-1} u_s k_sᵀ.
         QKt = torch.bmm(Q_v, K_v.transpose(-1, -2))  # [B*H, T, TN]
         A_rv = QKt * real_mask
         y_init = torch.bmm(Q_v, M_in_v.transpose(-1, -2))
         y_acc = torch.bmm(A_rv, U)
-        y_raw_v = y_init + y_acc  # [B*H, T, hd]
+        y_raw_v = y_init + y_acc
 
         M_out = M_out_v.view(B, H, hd, hd)
         y_raw = y_raw_v.view(B, H, T, hd).permute(0, 2, 1, 3).contiguous()
@@ -567,13 +606,6 @@ class DeltaProductMemory(nn.Module):
         Same per-token recurrence as `_forward_chunk_sequential` with T=1.
         Name kept as `step_with_conv` for polymorphism with NMM at the
         call site — DeltaProduct itself has no conv preprocessing.
-
-        Args:
-            x_t: [B, n_embd] — single-token post-LN input.
-            state: (M,) — current recurrent state.
-
-        Returns:
-            (y_t [B, n_embd], new_state).
         """
         x_unsq = x_t.unsqueeze(1)
         y_chunk, new_state = self._forward_chunk_sequential(

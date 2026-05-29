@@ -188,14 +188,20 @@ def _detach_per_layer(layer_state):
         return None
     if isinstance(layer_state, list):
         return [_detach_per_layer(s) for s in layer_state]
-    # DeltaProductMemory state is a 2-tuple (M, k_buf_list) where M is
-    # a tensor and k_buf_list is a list of tensors (per-order CausalAvgPool
-    # context buffers). Distinguish from NMM by inspecting the first
-    # entry — NMM's M is a dict of named tensors, DeltaProduct's is a
-    # tensor.
+    # DeltaProductMemory state is a 3-tuple (M, k_raw_buf, qkvb_buf):
+    # M is a tensor [B, H, hd, hd]; k_raw_buf is a tensor [B, 2, H, hd]
+    # for the CausalAvgPool 3-token window; qkvb_buf is None (order=1)
+    # or a tuple of 4 tensors (q, k, v, β) each [B, order-1, H, hd] for
+    # the VirtualTokenExpander's continuity. Distinguish from NMM by
+    # inspecting the first entry: NMM's M is a dict, DeltaProduct's
+    # is a tensor.
     if isinstance(layer_state[0], torch.Tensor):
-        M_t, k_buf_list = layer_state
-        return (M_t.detach(), [k.detach() for k in k_buf_list])
+        M_t, k_raw_buf, qkvb_buf = layer_state
+        qkvb_det = (
+            None if qkvb_buf is None
+            else tuple(b.detach() for b in qkvb_buf)
+        )
+        return (M_t.detach(), k_raw_buf.detach(), qkvb_det)
     M, S, conv_buf = layer_state
     M_det = {k: v.detach() for k, v in M.items()}
     if isinstance(S, (list, tuple)):

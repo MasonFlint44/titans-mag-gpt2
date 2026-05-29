@@ -228,27 +228,55 @@ which sidesteps that adaptation problem. The TPTT paper formalizes
 exactly this pattern as the production pretrained-adaptation recipe.
 
 **Formulation:** our implementation follows TPTT's specific design
-choices verbatim (modulo our N-projection per-order vs TPTT's
-VirtualTokenExpander). From TPTT Section 3.1:
+choices verbatim. From TPTT Section 3.1 and the source at
+`fabienfrfr/tptt/src/tptt/modeling_tptt.py`:
 
+- **Single Q, K, V projections.** No N independent per-order projections —
+  there's one Q, one K, one V projection per layer regardless of `order`.
+  The N virtual writes per real token come from the VirtualTokenExpander.
 - **Projections (eq. 4)**: `q_normed = L2_normalize(SiLU(q_raw))`,
   `k_normed = L2_normalize(SiLU(k_raw))`, `v_scaled = v_raw / √head_dim`.
   Q and K get SiLU + L2 normalize; V is just scaled by the standard
   attention factor.
 - **β gating (eq. 5)**: `β = σ(CausalAvgPool3(k_raw))` — a vector per
   head, per token, per dim. The pool is a fixed-weight kernel-3
-  causal moving average (NOT learnable; matches TPTT's
-  `CausalAvgPool1d` with `weights = [1/3, 1/3, 1/3]`). β is computed
-  from the RAW K projection (before SiLU+L2) so the gating depends
-  on the un-normalized signal.
-- **Per-token update with vector β**: `M ← M + (β⊙v − M·(β⊙k))·kᵀ`.
-  The K on the right is un-gated.
-- **Output (eq. 6)**: `y = RMSNorm(y_raw) · out_proj · out_scale`.
-  Manual RMSNorm (no learnable scale), Linear out_proj
-  (`Linear(n_embd, n_embd, bias=False)`), then per-channel `out_scale`
-  gain. The `out_scale` is our addition to preserve the gate-ramp
-  logic in `cli/train.py` and the finetune-mode "y = 0 at step 0"
-  invariant (TPTT relies on LoRA's near-zero init for the equivalent).
+  causal moving average (NOT learnable; weights `[1/3, 1/3, 1/3]`).
+  β is computed from the RAW K projection (before SiLU+L2).
+- **VirtualTokenExpander ("dt" derivative trick)**: each (q, k, v, β)
+  is expanded to N virtual tokens via a fixed binomial-coefficient
+  convolution. For order N, the normalized kernel is
+  `deriv[k] = (-1)^k · C(N-1, k) / sum(|coeffs|)`. After
+  flip-and-permute, `virtual[s, k] = x_padded[s + (N-1-k)] · deriv[N-1-k]`,
+  so sub-step 0 carries the current token and sub-step N-1 carries
+  the oldest. The N virtual tokens form the T·N virtual sequence the
+  WY solve operates on.
+- **Per-token update with vector β over virtual sequence**:
+  `M ← M + (β⊙v − M·(β⊙k))·kᵀ` per virtual write. The K on the right
+  is un-gated.
+- **Reads at virtual position N·t + (N−1)**: TPTT reads at all virtual
+  positions internally but takes only the last sub-step's output for
+  each real token (`output[..., -1, :]` at line 1407 of modeling_tptt.py).
+  We do the equivalent: read at each real token using
+  `virtual_q[t, N−1]`, the last sub-step's expanded query.
+- **Output (eq. 6)**: `y = RMSNorm(y_raw) · out_proj(bias=True) · out_scale`.
+  Manual RMSNorm (no learnable scale), Linear `out_proj(n_embd, n_embd,
+  bias=True)`, then per-channel `out_scale` gain. The `out_scale` is
+  our addition to preserve the gate-ramp logic in `cli/train.py` and
+  the finetune-mode "y = 0 at step 0" invariant.
+
+**What we don't replicate from TPTT**:
+- The parallel linear-attention integration (LiZA). TPTT runs linear
+  attention in parallel with softmax attention combined via MaG. We
+  apply DeltaProduct as the memory path under the original Titans MAG
+  formulation (memory output gates attention output). The user
+  explicitly chose to keep our attention topology unchanged.
+- The alpha gate. TPTT's default `alpha_gate = "c"` makes alpha =
+  constant ones, which is a no-op in the WY math. We don't carry an
+  alpha parameter at all; equivalent under default config.
+- Grouped-query attention (`num_key_value_heads ≠ num_heads`). Not
+  needed at gpt2_small scale.
+- Initial state fill of 1e-6 → we now match this for "stability if
+  unlinear activation" per TPTT.
 
 ### Flags
 
@@ -276,23 +304,28 @@ selecting delta_product (saves you from a typo silently no-op'ing).
   speed path. Doc-boundary aware: splits the chunk at boundary positions
   and runs one WY solve per segment.
 
-State is a 2-tuple `(M, k_buf_list)` where `M ∈ R^(B, n_heads, head_dim,
-head_dim)` and `k_buf_list` is a per-order list of `[B, 2, n_heads,
-head_dim]` buffers holding the last 2 raw K projections — threaded
-across `forward_chunk` calls so the CausalAvgPool sees continuous
-context (without this, splitting a stream into multiple chunks would
-produce different β at chunk heads than a single-shot forward). State
-serialization (`model/state_io.py`) recognizes `memory_type` in the
-fingerprint so a checkpoint from one mechanism can't silently load
-into the other.
+State is a 3-tuple `(M, k_raw_buf, qkvb_buf)`:
+- `M ∈ R^(B, n_heads, head_dim, head_dim)` — recurrent state, initialized
+  to 1e-6 (TPTT's "stability if unlinear activation" fill).
+- `k_raw_buf ∈ R^(B, 2, n_heads, head_dim)` — last 2 raw K projections
+  for the CausalAvgPool's 3-token window.
+- `qkvb_buf` — tuple of 4 tensors (q, k, v, β), each
+  `R^(B, order-1, n_heads, head_dim)`, for the VirtualTokenExpander's
+  (order-1)-token continuity. `None` at order=1 (expander is identity).
 
-**Doc-boundary caveat**: the pool's 2-token memory leaks across doc
-boundaries within a chunk. A boundary correctly resets M, but β at the
-boundary head and the following 1 position still see the pre-boundary
-k_raw values via the pool's [t-2, t-1, t] window. For our use case
-(needle scenarios with ~100+ token contexts), the 2-position leak at
-boundary transitions is a small effect. The tradeoff is documented in
-`test_doc_boundaries_reset_M_to_zero`.
+Both buffers are threaded across `forward_chunk` calls so the pool and
+the expander see continuous context (without these, splitting a stream
+into multiple chunks would produce different β AND different virtual
+tokens at chunk heads than a single-shot forward). State serialization
+(`model/state_io.py`) recognizes `memory_type` in the fingerprint so a
+checkpoint from one mechanism can't silently load into the other.
+
+**Doc-boundary caveat**: the pool's 2-token memory and the expander's
+(order-1)-token memory leak across doc boundaries within a chunk. M
+correctly resets at boundaries, but β and the virtual tokens at the
+boundary position and the next few positions still see pre-boundary
+context. For our use case (needle scenarios with ~100+ token contexts),
+the leak is a small effect.
 
 ### Multi-head (`delta_n_heads > 1`)
 
