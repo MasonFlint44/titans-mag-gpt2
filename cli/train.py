@@ -287,6 +287,106 @@ def compute_aux_retrieval_loss(
     )
 
 
+# GPT-2 BPE token ids for the answer marker "A:" in the needle corpus's
+# Q-then-A scaffold ("?\nA:"). We detect answer positions by matching this
+# 2-token suffix; the position whose `label` is the answer's first BPE
+# token is the one immediately following ":". Verified at module-load
+# time by tests; if the tokenizer changes these IDs must be updated.
+NEEDLE_ANSWER_MARKER_TOKENS = (32, 25)  # ("A", ":")
+
+
+def find_answer_positions(
+    input_ids: torch.Tensor, marker_token_ids=NEEDLE_ANSWER_MARKER_TOKENS,
+) -> torch.Tensor:
+    """Locate positions whose NEXT-TOKEN label is the first answer token.
+
+    The needle corpus ends each example with `... ?\nA:` followed by the
+    needle answer. The marker `"A:"` BPE-tokenizes as a stable 2-token
+    sequence `(32, 25)` regardless of context. A position `t` in the
+    logits-slice `logits[:, :-1]` is an "answer position" if
+    `input_ids[t-1] == 32` and `input_ids[t] == 25` — its CE label
+    `input_ids[t+1]` is then the answer's first BPE token.
+
+    Returns a `[B, T-1]` bool mask aligned with the standard LM loss
+    slicing (`logits[:, :-1]` vs `input_ids[:, 1:]`).
+    """
+    B, T = input_ids.shape
+    M = len(marker_token_ids)
+    if T < M + 1:
+        return torch.zeros(
+            B, max(T - 1, 0), dtype=torch.bool, device=input_ids.device,
+        )
+    marker = torch.tensor(marker_token_ids, device=input_ids.device)
+    # For each candidate position t in [M-1, T-2], the window
+    # input_ids[:, t-M+1:t+1] must equal `marker`.
+    mask = torch.zeros(B, T - 1, dtype=torch.bool, device=input_ids.device)
+    for t in range(M - 1, T - 1):
+        window = input_ids[:, t - M + 1: t + 1]  # [B, M]
+        mask[:, t] = (window == marker.unsqueeze(0)).all(dim=1)
+    return mask
+
+
+def compute_contrastive_needle_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    answer_position_mask: torch.Tensor,
+    top_k: int = 10,
+) -> torch.Tensor:
+    """Top-K hard-negative contrastive loss at answer positions.
+
+    Intuition: standard cross-entropy lets the model win by smearing
+    probability across the empirical answer-token distribution
+    (the "marginal-output trap" — see CLAUDE.md "Contrastive needle
+    loss"). At each answer position we instead require:
+        log P(correct) > log P(wrong) for the top-K most-confident wrong
+    predictions, via an InfoNCE softmax over `[correct, top_k_wrong]`.
+    The model cannot satisfy this by hedging across plausible answer
+    tokens; it must commit to the specific correct token, which can
+    only be done by reading the prompt — i.e., by using the memory
+    pathway for cross-chunk needles.
+
+    Inputs are already sliced to the LM-loss convention:
+        logits: [B, T-1, V]
+        labels: [B, T-1]
+        answer_position_mask: [B, T-1] bool
+
+    Returns a scalar. When the mask has zero True positions the loss is
+    a finite zero (computed via `mean()` over an empty selection would
+    give NaN; we guard).
+    """
+    # No answer positions in this batch — nothing to compute.
+    if not answer_position_mask.any():
+        return torch.zeros(
+            (), device=logits.device, dtype=logits.dtype,
+        )
+
+    flat_logits = logits[answer_position_mask]  # [N, V]
+    flat_labels = labels[answer_position_mask]  # [N]
+
+    # Mask out the correct label so it doesn't appear among the "wrong"
+    # top-K candidates. Use a finite large-negative value rather than
+    # `-inf` so a subsequent log/softmax over this tensor stays well-defined
+    # (-inf can produce NaN if everything in a row is masked).
+    very_negative = torch.finfo(flat_logits.dtype).min / 2
+    logits_no_correct = flat_logits.scatter(
+        1, flat_labels.unsqueeze(1), very_negative,
+    )
+
+    K = min(top_k, logits_no_correct.size(-1) - 1)
+    top_k_wrong_logits, _ = logits_no_correct.topk(K, dim=-1)  # [N, K]
+
+    correct_logits = flat_logits.gather(1, flat_labels.unsqueeze(1))  # [N, 1]
+
+    # InfoNCE-style softmax over [correct, top_k_wrong]. Target is class 0
+    # (correct is concatenated first). Cross-entropy on this small (K+1)-way
+    # problem is the contrastive loss.
+    combined = torch.cat([correct_logits, top_k_wrong_logits], dim=1)
+    targets = torch.zeros(
+        combined.size(0), dtype=torch.long, device=combined.device,
+    )
+    return F.cross_entropy(combined, targets)
+
+
 def gate_ramp_value(step: int, ramp_steps: int, target: float) -> float:
     """Linear ramp schedule value at training `step`. The schedule reaches
     `target` exactly at `step == ramp_steps - 1` (the LAST in-ramp step),
@@ -881,6 +981,8 @@ def run_training(
     aux_loss_weight: float = 0.0,
     aux_capture: dict | None = None,
     bptt_window: int = 1,
+    needle_contrastive_loss_weight: float = 0.0,
+    needle_contrastive_top_k: int = 10,
 ) -> None:
     """Top-level training loop covering both Phase 4.4 (fine-tune) and 4.5
     (from-scratch). One optimizer.step per accumulation cycle of `accum_steps`
@@ -1142,19 +1244,36 @@ def run_training(
                             logits, nmm_states = model(
                                 input_ids, nmm_states, doc_boundaries,
                             )
+                            # Standard LM cross-entropy.
+                            sliced_logits = logits[:, :-1]
+                            sliced_labels = input_ids[:, 1:]
                             lm_loss = F.cross_entropy(
-                                logits[:, :-1].reshape(-1, logits.size(-1)),
-                                input_ids[:, 1:].reshape(-1),
+                                sliced_logits.reshape(-1, logits.size(-1)),
+                                sliced_labels.reshape(-1),
                             )
+                            chunk_loss = lm_loss
                             if aux_enabled and "y_mem" in aux_capture:
                                 aux_loss = compute_aux_retrieval_loss(
                                     aux_capture["y_mem"], input_ids, model,
                                 )
-                                chunk_loss = (
-                                    lm_loss + aux_loss_weight * aux_loss
+                                chunk_loss = chunk_loss + (
+                                    aux_loss_weight * aux_loss
                                 )
-                            else:
-                                chunk_loss = lm_loss
+                            # Optional anti-marginal-output contrastive loss
+                            # at needle answer positions ("A:" marker). See
+                            # CLAUDE.md "Contrastive needle loss" for the
+                            # full rationale. When the weight is 0 (default)
+                            # we skip the whole block — answer-position
+                            # detection is non-trivial in a hot loop.
+                            if needle_contrastive_loss_weight > 0:
+                                ans_mask = find_answer_positions(input_ids)
+                                contrastive = compute_contrastive_needle_loss(
+                                    sliced_logits, sliced_labels, ans_mask,
+                                    top_k=needle_contrastive_top_k,
+                                )
+                                chunk_loss = chunk_loss + (
+                                    needle_contrastive_loss_weight * contrastive
+                                )
                             window_loss_terms.append(chunk_loss)
                             chunks_in_window += 1
 

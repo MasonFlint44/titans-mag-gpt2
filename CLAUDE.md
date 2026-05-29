@@ -127,6 +127,83 @@ cliff at exactly `d == chunk_size` under K=1; this flag is the fix.
 `bptt_window` is in `SAVED_TRAINING_ARGS`, so resume drift detection
 warns if you resume with a different K than was saved.
 
+### Contrastive needle loss (`--needle-contrastive-loss-weight`) + `--needle-format alnum20`
+
+Two interventions targeting the **marginal-output failure mode** we
+diagnosed across the 8 prior DeltaProduct experiments: the optimizer
+reliably converges to "output the empirical distribution over plausible
+answer tokens" rather than learning retrieval, because the marginal-
+output basin is mechanically easier to find than the retrieval basin
+under LM cross-entropy alone. The single-needle and 4-needle overfit
+diagnostics confirmed this: even when forced into a setting where
+constant output was provably suboptimal, the model output the same
+fixed probability distribution at every answer position regardless of
+needle content.
+
+**Data side: `--needle-format alnum20` in `scripts.prepare_needle_corpus`.**
+Replaces the default `XX-NNNN` needles (~461 unique first BPE tokens,
+heavily concentrated on common capital letters) with random 20-char
+alphanumeric strings (~812 unique first BPE tokens with a flatter
+distribution). The marginal-output strategy's per-prompt accuracy is
+bounded by `1/n_unique_first_tokens`; widening the distribution
+mechanically lowers the ceiling.
+
+**Loss side: `--needle-contrastive-loss-weight λ` (default 0).** Adds a
+top-K hard-negative contrastive term at positions whose label is the
+needle's first answer token. We detect these positions by matching the
+`"A:"` marker (GPT-2 BPE token sequence `(32, 25)`) at indices
+`[t-1, t]`. The contrastive term at each answer position is
+`F.cross_entropy([correct_logit, top_k_wrong_logits], target=0)` — an
+InfoNCE softmax over the correct answer concatenated with the K most
+confident wrong predictions. The model can't satisfy this by hedging
+across plausible needle tokens; it has to commit to the specific
+correct token, which can only be done by reading the prompt's needle.
+
+`--needle-contrastive-top-k` (default 10) controls how many of the
+model's currently-most-confident wrong predictions act as negatives;
+higher K = stronger pressure but also more compute and more risk of
+suppressing rare-but-plausible tokens.
+
+**Recipe usage:**
+
+```bash
+# Generate the alnum20 corpus once
+uv run python -m scripts.prepare_needle_corpus \
+    --out-dir corpora/needle_alnum20 \
+    --needle-format alnum20 \
+    --max-distance 3072
+
+# Finetune with the contrastive loss enabled
+uv run python -m cli.finetune \
+    --size small --data corpora/needle_alnum20/needle_train.txt \
+    --memory-type delta_product --memory-topology liza \
+    --delta-order 2 --delta-n-heads 12 --delta-block-size 64 \
+    --freeze-embeddings \
+    --nmm-gate-ramp-steps 100 --nmm-gate-ramp-target 0.1 \
+    --bptt-window 2 \
+    --needle-contrastive-loss-weight 0.5 \
+    --needle-contrastive-top-k 10 \
+    --max-steps 1000 --warmup-steps 100 \
+    --compile-model --optim8bit \
+    --save-dir ckpts/needle_anti_marginal/
+```
+
+**Two caveats and one tuning tip:**
+
+- The contrastive loss only fires at chunks that contain at least one
+  answer position (every full needle example contributes one). At
+  `batch_size=1, chunk_size=1024` with average example length ~1500
+  tokens, this is roughly half of chunks. Increasing `batch_size` (if
+  VRAM allows) gives more answer positions per backward.
+- Implementation lives in `cli/train.py::compute_contrastive_needle_loss`;
+  the marker tokens `NEEDLE_ANSWER_MARKER_TOKENS = (32, 25)` are
+  hard-coded for the GPT-2 tokenizer. If you swap tokenizers, regenerate
+  this constant (`tok.encode("A:")`).
+- Start with `λ = 0.5`. Too high (`λ > 2`) tends to destabilize early
+  training because the contrastive signal is high-magnitude at random
+  init; too low (`λ < 0.1`) won't meaningfully alter the optimization
+  landscape.
+
 ### `--freeze-embeddings`
 
 Freezes only the input/output representation params: `wte`, `wpe`,

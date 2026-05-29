@@ -81,22 +81,51 @@ class NeedleRecord:
         return cls(id=d["id"], needle=d["needle"])
 
 
-def generate_needle(rng: random.Random) -> str:
-    """Random 2-letter + 4-digit code, e.g. 'XK-7281'."""
-    letters = "".join(rng.choices(NEEDLE_LETTERS, k=2))
-    digits = "".join(rng.choices(NEEDLE_DIGITS, k=4))
-    return f"{letters}-{digits}"
+NEEDLE_ALNUM = string.ascii_letters + string.digits  # 62 chars
+
+NEEDLE_FORMATS = ("alpha", "alnum20")
+
+
+def generate_needle(rng: random.Random, format: str = "alpha") -> str:
+    """Random needle in the requested format.
+
+    Formats:
+      - "alpha" (default, backward-compatible): 2-letter + 4-digit code
+        like 'XK-7281'. ~461 unique first BPE tokens but distribution
+        heavily concentrated on common capital letters (' X', ' Y', etc.).
+        Marginal-output strategy gets ~4-5% accuracy at first-token
+        argmax.
+
+      - "alnum20": 20-character random alphanumeric like 'k3F9pZ2x7vQ8aB5cD1eR'.
+        ~812 unique first BPE tokens with a flatter distribution. Makes
+        the marginal-output strategy structurally weaker at first-token
+        scoring, since no single common prefix covers >2% of needles.
+        Used in conjunction with --needle-contrastive-loss-weight to
+        attack the marginal-output failure mode from both data and
+        loss directions.
+    """
+    if format == "alpha":
+        letters = "".join(rng.choices(NEEDLE_LETTERS, k=2))
+        digits = "".join(rng.choices(NEEDLE_DIGITS, k=4))
+        return f"{letters}-{digits}"
+    if format == "alnum20":
+        return "".join(rng.choices(NEEDLE_ALNUM, k=20))
+    raise ValueError(
+        f"Unknown needle format {format!r}. Supported: {NEEDLE_FORMATS}."
+    )
 
 
 def generate_unique_needles(
     n: int,
     rng: random.Random,
     exclude: set[str] | None = None,
+    format: str = "alpha",
 ) -> list[str]:
     """Generate `n` distinct needles, avoiding any in `exclude` (used to
     keep train/eval sets disjoint). Uses a simple draw-and-reject loop —
-    at ~52K needles drawn from ~6.7M-space the collision rate is ~1%, so
-    rejection sampling terminates quickly."""
+    at ~52K needles drawn from ~6.7M-space (alpha) or 62^20-space (alnum20)
+    the collision rate is essentially zero, so rejection sampling
+    terminates immediately."""
     exclude = set(exclude or ())
     seen = set(exclude)
     out: list[str] = []
@@ -106,7 +135,7 @@ def generate_unique_needles(
     max_draws = max(n * 100, 1000)
     draws = 0
     while len(out) < n and draws < max_draws:
-        needle = generate_needle(rng)
+        needle = generate_needle(rng, format=format)
         draws += 1
         if needle in seen:
             continue
@@ -194,12 +223,12 @@ def generate_train_corpus(
 
 
 def generate_eval_records(
-    n_records: int, rng: random.Random,
+    n_records: int, rng: random.Random, format: str = "alpha",
 ) -> list[NeedleRecord]:
     """Generate held-out eval records. Each record is just an id + needle;
     padding is sampled at eval time from the saved pool (so the same
     record can be evaluated across multiple distance buckets)."""
-    needles = generate_unique_needles(n_records, rng)
+    needles = generate_unique_needles(n_records, rng, format=format)
     return [
         NeedleRecord(id=f"needle_{i:05d}", needle=needle)
         for i, needle in enumerate(needles)
@@ -280,6 +309,18 @@ def main() -> None:
         help="Seed for needle generation, distance draw, padding sampling. "
              "Default: 0.",
     )
+    parser.add_argument(
+        "--needle-format", choices=list(NEEDLE_FORMATS), default="alpha",
+        help="Needle string format. 'alpha' (default) is XX-NNNN (2 letters + "
+             "4 digits) — backward-compatible. 'alnum20' is a 20-character "
+             "random alphanumeric string, giving ~812 unique first BPE tokens "
+             "with a flatter distribution than alpha (~461 unique, heavily "
+             "concentrated on common capital-letter starts). alnum20 is "
+             "designed to make the marginal-output failure mode "
+             "structurally weaker — combine with the "
+             "--needle-contrastive-loss-weight finetune flag for the full "
+             "anti-marginal-output recipe.",
+    )
     args = parser.parse_args()
 
     tokenizer = Tokenizer()
@@ -311,14 +352,18 @@ def main() -> None:
 
     # Generate eval needles FIRST so we can exclude them when generating
     # train needles — keeps train/eval sets disjoint at the needle level.
-    print(f"[needle] generating {args.n_eval} eval needles...", flush=True)
-    eval_records = generate_eval_records(args.n_eval, rng)
+    print(f"[needle] generating {args.n_eval} eval needles "
+          f"(format={args.needle_format})...", flush=True)
+    eval_records = generate_eval_records(
+        args.n_eval, rng, format=args.needle_format,
+    )
     eval_needle_set = {r.needle for r in eval_records}
 
     print(f"[needle] generating {args.n_train} training needles...",
           flush=True)
     train_needles = generate_unique_needles(
         args.n_train, rng, exclude=eval_needle_set,
+        format=args.needle_format,
     )
 
     print(f"[needle] building {args.n_train} training scenarios...",

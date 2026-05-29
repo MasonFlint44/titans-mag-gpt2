@@ -70,6 +70,69 @@ def test_generate_unique_needles_respects_exclude_set():
     assert eval_set.isdisjoint(needles)
 
 
+# ---------------------------------------------------------------------------
+# alnum20 format (anti-marginal-output recipe)
+# ---------------------------------------------------------------------------
+
+_ALNUM20_RE = re.compile(r"^[A-Za-z0-9]{20}$")
+
+
+def test_alnum20_format_produces_20_char_alphanumeric():
+    """The alnum20 format must produce exactly 20 alphanumeric chars,
+    no separators. The eval metric (first-BPE-token argmax) and the
+    contrastive loss both depend on this length / charset contract."""
+    from scripts.prepare_needle_corpus import generate_needle
+    rng = random.Random(0)
+    for _ in range(100):
+        needle = generate_needle(rng, format="alnum20")
+        assert _ALNUM20_RE.match(needle), f"malformed alnum20: {needle!r}"
+
+
+def test_alnum20_format_first_bpe_token_distribution_is_flatter_than_alpha():
+    """The whole point of alnum20 is to spread the first-BPE-token
+    distribution wider than the alpha format. We don't need a precise
+    threshold here — just that alnum20's first-token entropy is
+    meaningfully larger than alpha's. If this regresses we've broken
+    the anti-marginal-output property."""
+    from collections import Counter
+    from data.tokenizer import Tokenizer
+    from scripts.prepare_needle_corpus import generate_needle
+
+    tok = Tokenizer()
+    rng_a = random.Random(0)
+    rng_b = random.Random(0)
+    alpha_first = Counter(
+        tok.encode(f" {generate_needle(rng_a, format='alpha')}")[0]
+        for _ in range(2000)
+    )
+    alnum_first = Counter(
+        tok.encode(f" {generate_needle(rng_b, format='alnum20')}")[0]
+        for _ in range(2000)
+    )
+    # alnum20 should produce strictly more distinct first tokens.
+    assert len(alnum_first) > len(alpha_first), (
+        f"alnum20 produced {len(alnum_first)} unique first BPE tokens; "
+        f"alpha produced {len(alpha_first)}. alnum20 should be wider."
+    )
+
+
+def test_generate_needle_rejects_unknown_format():
+    from scripts.prepare_needle_corpus import generate_needle
+    rng = random.Random(0)
+    with pytest.raises(ValueError, match="Unknown needle format"):
+        generate_needle(rng, format="hex8")
+
+
+def test_generate_unique_needles_format_passes_through():
+    """generate_unique_needles must respect the format argument so the
+    eval pool and training pool both use the same scheme."""
+    from scripts.prepare_needle_corpus import generate_unique_needles
+    rng = random.Random(0)
+    needles = generate_unique_needles(10, rng, format="alnum20")
+    for n in needles:
+        assert _ALNUM20_RE.match(n), f"format not respected: {n!r}"
+
+
 def test_generate_unique_needles_raises_when_space_exhausted():
     """If the user asks for more needles than the namespace can provide
     (after exclusion), we should fail loud, not spin forever."""

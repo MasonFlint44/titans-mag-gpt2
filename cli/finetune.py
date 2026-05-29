@@ -209,6 +209,32 @@ def build_parser() -> argparse.ArgumentParser:
              "pathway, pressuring k_proj/q_proj alignment and the update "
              "rule. Default 0.0 (disabled).",
     )
+    parser.add_argument(
+        "--needle-contrastive-loss-weight",
+        type=float,
+        default=0.0,
+        help="If > 0, add a top-K hard-negative contrastive loss at needle "
+             "answer positions (detected via the 'A:' marker token sequence "
+             "32,25). The contrastive term forces the correct first answer "
+             "token to outscore the top-K most-confident WRONG predictions "
+             "by an InfoNCE margin, defeating the marginal-output failure "
+             "mode where the optimizer hedges across plausible answer "
+             "tokens. Default 0 (disabled). Reasonable starting weights: "
+             "0.3-1.0 alongside the standard LM loss. Use with "
+             "--needle-format alnum20 from scripts.prepare_needle_corpus "
+             "for the full anti-marginal-output recipe.",
+    )
+    parser.add_argument(
+        "--needle-contrastive-top-k",
+        type=int,
+        default=10,
+        help="K for the top-K-hard-negative formulation of the contrastive "
+             "needle loss. Higher K = stronger pressure (more wrong "
+             "predictions the correct token must outrank), but also more "
+             "compute and more risk of pushing rare-but-plausible tokens "
+             "below correct. Default 10. Only used when "
+             "--needle-contrastive-loss-weight > 0.",
+    )
     from cli.nmm_cli import add_nmm_args
     add_nmm_args(parser)
     return parser
@@ -372,6 +398,8 @@ def main():
         aux_loss_weight=args.nmm_aux_loss_weight,
         aux_capture=aux_capture,
         bptt_window=args.bptt_window,
+        needle_contrastive_loss_weight=args.needle_contrastive_loss_weight,
+        needle_contrastive_top_k=args.needle_contrastive_top_k,
     )
 
 
