@@ -45,6 +45,17 @@ import numpy as np
 
 from data.tokenizer import Tokenizer
 
+# Empirical: the HuggingFace `datasets` streaming iterator's __exit__ /
+# generator close hangs for an indefinite time after we break out of the
+# main loop — observed on the FineWeb-Edu sample-10BT smoke run, process
+# stays alive with no further file writes for many seconds. Once our work
+# is done (target token count reached, file closed and flushed by the
+# `with open(...)` __exit__), there's nothing in the iterator we need to
+# clean up. Using `os._exit(0)` bypasses Python's normal shutdown,
+# skipping the streaming-dataset teardown. We do NOT want sys.exit() —
+# that still runs the iterator's __exit__ via gc/atexit.
+_FINAL_EXIT_CODE = 0
+
 
 def _format_count(n: int) -> str:
     if n >= 1_000_000_000:
@@ -211,6 +222,9 @@ def main() -> None:
         f"Wrote {out_path} ({out_path.stat().st_size / 1e9:.2f} GB).",
         file=sys.stderr,
     )
+    sys.stderr.flush()
+    # Bypass the HF streaming iterator's teardown — see comment at top.
+    os._exit(_FINAL_EXIT_CODE)
 
 
 if __name__ == "__main__":
