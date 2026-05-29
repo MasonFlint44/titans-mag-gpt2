@@ -79,6 +79,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-size", type=int, default=1024)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--grad-accum", type=int, default=16)
+    parser.add_argument(
+        "--bptt-window",
+        type=int,
+        default=1,
+        help="Chunks per BPTT window. K=1 (default) is classical TBPTT — "
+             "memory state is detached between training steps, so gradient "
+             "from the loss at chunk t cannot reach the memory-write "
+             "projections from chunk t-1 or earlier. K>1 keeps the autograd "
+             "graph alive across K consecutive chunks, so loss at chunk K-1 "
+             "backprops through M's recurrence into projections that wrote "
+             "into M during chunks 0..K-2. This is the path that lets the "
+             "memory pathway learn cross-chunk retrieval (e.g. needle-in-"
+             "haystack at distances > chunk_size). Each optimizer step now "
+             "processes accum_steps * bptt_window chunks. Memory cost grows "
+             "linearly with K (full forward graph for K chunks). For the "
+             "needle corpus (max_distance=3072, chunk_size=1024), K=4 spans "
+             "the longest example.",
+    )
     parser.add_argument("--max-steps", type=int, default=5000)
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--log-every", type=int, default=50)
@@ -358,6 +376,7 @@ def main():
         gate_ramp_target=args.nmm_gate_ramp_target,
         aux_loss_weight=args.nmm_aux_loss_weight,
         aux_capture=aux_capture,
+        bptt_window=args.bptt_window,
     )
 
 

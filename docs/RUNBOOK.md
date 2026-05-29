@@ -346,6 +346,34 @@ If you find detach materially hurts your task, the alternatives are:
 
 ---
 
+## Long-distance retrieval stuck at chance (cross-chunk gradient cut)
+
+**Symptom.** Needle-in-haystack (or any similar long-distance retrieval probe) achieves ~99% accuracy at distances `≤ chunk_size` but collapses to chance (~`1/vocab_eff`) at distances `> chunk_size`. The cliff is *exactly* at `chunk_size`, not gradual. The same shape persists across architecture changes (NMM vs DeltaProduct, MAG vs LiZA, with or without aux loss).
+
+### Cause
+
+Default training uses classical truncated BPTT (TBPTT): `cli/train.py` calls `_detach_states(nmm_states)` at the start of every training step. Each step processes one chunk of `chunk_size` tokens. The recurrent state `(M, ...)` enters the next chunk with `grad_fn=None`, so backward at step `t` cannot reach the memory-write projections (Q/K/V/β) that fired during step `t-1` or earlier.
+
+For tasks where the supervising loss lives in a chunk *after* the chunk that contains the relevant context, this means the memory pathway never receives gradient that pressures it to encode retrievable structure across the chunk boundary. The memory pathway can still learn intra-chunk retrieval (which is why `d ≤ chunk_size` works fine), but it has no learning signal for the cross-chunk case.
+
+This is correct behavior for streaming language-model training, where you don't want to backprop across an entire corpus. It's the wrong behavior for fixed-length retrieval tasks.
+
+### Diagnose
+
+1. Compare the failure-distance cliff against `chunk_size`. If they coincide exactly, this is the diagnosis.
+2. Look at `y_mem` cosine alignment with the correct answer at the failing distance — a probe like `scripts/probe_y_mem_alignment.py` will show essentially-noise alignment, confirming that M at long distance is not being trained to be retrievable.
+3. Symptom is architecture-independent: swapping NMM ↔ DeltaProduct or MAG ↔ LiZA does not change the cliff location.
+
+### Fix
+
+Set `--bptt-window K` with K large enough to span your longest training example. For the `corpora/needle/` corpus at `max_distance=3072` and `chunk_size=1024`, K=4 covers the longest example. With K>1 the optimizer step processes `accum_steps × K` chunks; the autograd graph stays alive across the K-chunk window, so loss at chunk K-1 can backprop through M's recurrence into chunk-0's write projections.
+
+Memory cost grows linearly in K (the K-chunk forward graph is held until backward). If you OOM, lower `accum_steps` to compensate, or enable activation checkpointing per chunk forward.
+
+`bptt_window` is in `SAVED_TRAINING_ARGS`, so resume drift detection will flag a mismatch if you resume with a different K.
+
+---
+
 ## Long-context generation drift
 
 **Symptom.** Generation quality degrades sharply past `block_size` (1024 tokens for GPT-2 small). Sometimes degrades earlier.

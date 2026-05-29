@@ -138,6 +138,7 @@ passed to `TitansConfig`. Quick reference:
 | `--nmm-expansion N` | int | MemoryMLP hidden-dim multiplier (paper default 4; set 1 for ~4× smaller state at minor capacity cost) |
 | `--nmm-layer-indices I,J,K` | csv ints | Subset of blocks that get NMM (others become plain GPT-2 blocks) |
 | `--nmm-detach-state-between-blocks` | flag | Truncated BPTT at block boundaries (requires `--nmm-block-size > 1`) |
+| `--bptt-window K` | int | Cross-chunk BPTT window: K=1 (default) detaches state between training steps (classical TBPTT); K>1 keeps the autograd graph alive across K consecutive chunks, letting the loss at chunk K-1 backprop through M into projections that wrote in chunk 0. Required for tasks like needle-in-haystack at distances larger than `chunk_size`. See "Cross-chunk BPTT" section below. |
 | `--nmm-ns5-steps N` | int | Newton-Schulz iteration count (default 5). **Lowering speeds up training significantly but drifts the spectral norm of NS5(g) — measured at gpt2_small: steps=4 ~16% faster + ~12% LR drift; steps=3 ~33% faster + ~20% LR drift.** Validate convergence on your data before lowering. |
 | `--nmm-use-gram-ns5` | flag | Replace stock NS5 with the Gram-iteration variant (Tri Dao et al., POLAR_EXPRESS coefficients + reset at iter 2). Standard NS5 does 2T rectangular matmuls; Gram-NS5 does 2 rectangular matmuls + T cheap n×n Gram-matrix iterations. Implemented locally in `model/nmm.py` — no external dependency. Overrides `--nmm-ns5-steps`. Mutually exclusive with `--nmm-use-cans`. |
 | `--nmm-use-cans` | flag | Replace stock NS5 with 3-step CANS-stationary (arxiv 2506.10935). Same polynomial form as NS5 but with `(a, b, c) = (3.8641, -9.7196, 9.7101)` — minimax-optimised over the post-F-norm singular value range of gpt2_small NMM gradients. At recipe shapes (768×3072 / 3072×768, batch=1): **~4.6× better orthogonalisation error in 3 iterations than NS5 in 5, at ~1.6× the kernel speed.** Slower than gram-NS5 (torch backend) but better quality. No extra dependency, pure PyTorch. Coefficients are recipe-specific — re-derive via `scripts/benchmark_ns5.py` if you change d / expansion / low_rank. Overrides `--nmm-ns5-steps`. Mutually exclusive with `--nmm-use-gram-ns5`. |
@@ -498,6 +499,18 @@ For long-context generation (e.g., 8K tokens cached across 12 layers), this is ~
 | `nmm_detach_state_between_blocks` | `bool` | `False` | When `True` AND `nmm_block_size > 1`, detaches `(M, S)` at every block boundary in the blockwise path. Backward graph spans ONE block instead of the whole chunk — peak transient memory drops roughly proportionally to `T / block_size`. Standard truncated-BPTT trade: outer params (k_proj, q_proj, v_proj, W_*, gamma_mem, NMM weight inits) only learn from within-block gradients; cross-block "remember earlier in chunk" signal via the recurrent (M, S) is cut. Validation: rejected at `block_size = 1` (would silently no-op). |
 
 **When to enable**: training contexts longer than what one chunk can hold — e.g., 4K context split into 4 chunks of 1024. Without detach, backward through 4 chunks accumulates the full 4× per-chunk graph. With detach, only one chunk's worth of state is alive at a time. At single-chunk training (T = chunk_size = block_size) the effect is bounded by the number of blocks in a chunk.
+
+### Cross-chunk BPTT — `--bptt-window K`
+
+| CLI flag | Type | Default | Notes |
+|---|---|---|---|
+| `--bptt-window K` | `int` | `1` | Number of consecutive chunks per BPTT window. K=1 (default) is classical TBPTT — recurrent state is detached at every training step. K>1 keeps the autograd graph alive across K chunks, so loss at chunk K-1 backprops through M's recurrence into the Q/K/V/β projections that wrote into M during chunks 0..K-2. Per optimizer step processes `accum_steps × bptt_window` chunks. Forward-graph memory grows linearly with K. Persists in `SAVED_TRAINING_ARGS` so resume drift detection flags mismatch. |
+
+**When to set K>1**: when your end-task loss lives in a chunk *after* the chunk that contains the supervising context. The canonical case is needle-in-haystack at distances larger than `chunk_size`: the answer position's loss must reach the needle's write through M's recurrence, which requires K to span both chunks.
+
+**Sizing K**: pick K so `K × chunk_size` covers your longest single training example. For the `corpora/needle/` corpus at `max_distance=3072` + `chunk_size=1024`, K=4 captures the longest example. Larger K than needed wastes memory without adding gradient signal.
+
+**Interaction with `--nmm-detach-state-between-blocks`**: orthogonal. The block-level detach acts *within* a single chunk's NMM forward (which has multiple internal NMM-block updates per chunk). `--bptt-window` acts *between* chunks (which are forward passes through the entire model). Both can be enabled; each independently truncates a different gradient path.
 
 ### Lookahead value
 

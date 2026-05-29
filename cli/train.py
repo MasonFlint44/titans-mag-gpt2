@@ -44,6 +44,7 @@ SAVED_TRAINING_ARGS = (
     "warmup_steps",
     "max_steps",
     "save_every",
+    "bptt_window",
 )
 
 
@@ -876,6 +877,7 @@ def run_training(
     gate_ramp_target: float = 0.0,
     aux_loss_weight: float = 0.0,
     aux_capture: dict | None = None,
+    bptt_window: int = 1,
 ) -> None:
     """Top-level training loop covering both Phase 4.4 (fine-tune) and 4.5
     (from-scratch). One optimizer.step per accumulation cycle of `accum_steps`
@@ -957,9 +959,16 @@ def run_training(
         "warmup_steps": warmup_steps,
         "max_steps": max_steps,
         "save_every": save_every,
+        "bptt_window": bptt_window,
     }
     if batch_size is not None:
         training_args["batch_size"] = batch_size
+
+    if bptt_window < 1:
+        raise ValueError(
+            f"bptt_window must be >= 1 (got {bptt_window}); use 1 for the "
+            f"streaming-LM TBPTT default."
+        )
 
     base_lrs = base_lrs_from_constants()
     model.train()
@@ -1055,42 +1064,20 @@ def run_training(
             cycle_completed = True
 
             for accum_i in range(accum_steps):
-                try:
-                    batch = next(micro_batches)
-                except StopIteration:
-                    batch = None
-
-                if batch is None and accum_i == 0:
-                    # Loader exhausted exactly at cycle boundary. If we still
-                    # have steps left, restart the iterator (next epoch); reset
-                    # nmm_states since the new pass through the corpus is a
-                    # fresh context. Returning here would be the silent-early-
-                    # stop bug.
-                    micro_batches = iter(loader)
-                    nmm_states = None
-                    try:
-                        batch = next(micro_batches)
-                    except StopIteration:
-                        # Empty loader — nothing to do; stop.
-                        return
-
-                if is_partial_cycle(batch, accum_i):
-                    #/: under DDP, this cycle's micro-batches ran with
-                    # no_sync; per-rank .grad never AllReduce'd. Stepping would
-                    # diverge ranks permanently. Discard + stop.
-                    if is_distributed:
-                        optimizer.zero_grad(set_to_none=True)
-                        nmm_states = None  # match NaN-skip semantics
-                        return
-                    # Single-GPU: partial is safe (no AllReduce). Treat as complete.
-                    cycle_completed = False
-                    break
-
-                input_ids, doc_boundaries = batch
-                input_ids = input_ids.to(device, non_blocking=True)
-                doc_boundaries = doc_boundaries.to(device, non_blocking=True)
+                # Detach state ONCE at the START of each BPTT window. Inside
+                # a window, state is threaded across `bptt_window` chunks
+                # with the autograd graph alive — gradient at chunk K-1's
+                # loss can flow back through M's recurrence to projections
+                # that wrote into M during chunk 0. This is the path that
+                # lets the memory pathway learn cross-chunk retrieval. With
+                # `bptt_window=1` (default), every iteration detaches as
+                # before, producing classical TBPTT (one chunk per
+                # backward).
                 nmm_states = _detach_states(nmm_states)
-                tokens_since_last_step += input_ids.numel()
+
+                window_loss_terms = []
+                chunks_in_window = 0
+                window_aborted = False
 
                 is_last_accum = (accum_i == accum_steps - 1)
                 sync_ctx = (
@@ -1101,12 +1088,56 @@ def run_training(
                 )
 
                 with sync_ctx:
-                    if autocast_dtype is not None:
-                        with torch.autocast(
-                            device_type=device.type, dtype=autocast_dtype
-                        ):
+                    autocast_ctx = (
+                        torch.autocast(
+                            device_type=device.type, dtype=autocast_dtype,
+                        )
+                        if autocast_dtype is not None
+                        else contextlib.nullcontext()
+                    )
+                    with autocast_ctx:
+                        for w in range(bptt_window):
+                            try:
+                                batch = next(micro_batches)
+                            except StopIteration:
+                                batch = None
+
+                            if batch is None and accum_i == 0 and w == 0:
+                                # Loader exhausted exactly at cycle boundary
+                                # — restart the iterator (next epoch) and
+                                # reset nmm_states since the new pass is a
+                                # fresh context. Returning here would be the
+                                # silent-early-stop bug.
+                                micro_batches = iter(loader)
+                                nmm_states = None
+                                try:
+                                    batch = next(micro_batches)
+                                except StopIteration:
+                                    # Empty loader — nothing to do; stop.
+                                    return
+
+                            if batch is None:
+                                # Loader exhausted mid-cycle (accum_i > 0)
+                                # OR mid-window (w > 0). Treat as a partial
+                                # cycle: discard everything accumulated so
+                                # far under DDP, accept-and-step under
+                                # single-GPU. The exact rule is the same as
+                                # the legacy `is_partial_cycle` check (which
+                                # used to fire only on a missing chunk-0
+                                # batch); the window case (w > 0) inherits
+                                # the same DDP-asymmetry concern.
+                                window_aborted = True
+                                break
+
+                            input_ids, doc_boundaries = batch
+                            input_ids = input_ids.to(device, non_blocking=True)
+                            doc_boundaries = doc_boundaries.to(
+                                device, non_blocking=True,
+                            )
+                            tokens_since_last_step += input_ids.numel()
+
                             logits, nmm_states = model(
-                                input_ids, nmm_states, doc_boundaries
+                                input_ids, nmm_states, doc_boundaries,
                             )
                             lm_loss = F.cross_entropy(
                                 logits[:, :-1].reshape(-1, logits.size(-1)),
@@ -1116,28 +1147,58 @@ def run_training(
                                 aux_loss = compute_aux_retrieval_loss(
                                     aux_capture["y_mem"], input_ids, model,
                                 )
-                                total_loss = lm_loss + aux_loss_weight * aux_loss
+                                chunk_loss = (
+                                    lm_loss + aux_loss_weight * aux_loss
+                                )
                             else:
-                                total_loss = lm_loss
-                            loss = total_loss / accum_steps
-                    else:
-                        logits, nmm_states = model(
-                            input_ids, nmm_states, doc_boundaries
-                        )
-                        lm_loss = F.cross_entropy(
-                            logits[:, :-1].reshape(-1, logits.size(-1)),
-                            input_ids[:, 1:].reshape(-1),
-                        )
-                        if aux_enabled and "y_mem" in aux_capture:
-                            aux_loss = compute_aux_retrieval_loss(
-                                aux_capture["y_mem"], input_ids, model,
-                            )
-                            total_loss = lm_loss + aux_loss_weight * aux_loss
-                        else:
-                            total_loss = lm_loss
-                        loss = total_loss / accum_steps
+                                chunk_loss = lm_loss
+                            window_loss_terms.append(chunk_loss)
+                            chunks_in_window += 1
+
+                    if window_aborted and chunks_in_window == 0:
+                        # No chunks at all this window — partial cycle.
+                        if is_distributed:
+                            # DDP: this cycle's earlier micro-batches ran
+                            # with no_sync; per-rank .grad never
+                            # AllReduce'd. Stepping would diverge ranks
+                            # permanently. Discard + stop.
+                            optimizer.zero_grad(set_to_none=True)
+                            nmm_states = None  # match NaN-skip semantics
+                            return
+                        # Single-GPU: partial is safe (no AllReduce). Treat
+                        # as complete.
+                        cycle_completed = False
+                        break
+
+                    # Mean over chunks-in-window keeps per-token gradient
+                    # scale comparable to the K=1 path. (Each chunk's
+                    # `lm_loss` is already a per-token mean; mean-of-means
+                    # over K chunks of identical token count is the same
+                    # per-token mean.) The outer division by accum_steps
+                    # then makes the optimizer-step gradient match what a
+                    # single batch of accum_steps × bptt_window chunks
+                    # would have produced.
+                    window_loss = sum(window_loss_terms) / chunks_in_window
+                    loss = window_loss / accum_steps
                     loss.backward()
+
                 cycle_ran_any_microbatch = True
+
+                if window_aborted:
+                    # Partial window with at least one chunk completed under
+                    # single-GPU. Treat as the last micro-batch of the cycle
+                    # — already backward'd; just exit the accumulation loop
+                    # so we step on what we have.
+                    if is_distributed:
+                        # Same DDP discard rule as the empty-window case
+                        # above. We already called .backward() under
+                        # no_sync (or final all-reduce); discarding here
+                        # zeroes the unsynchronized grads.
+                        optimizer.zero_grad(set_to_none=True)
+                        nmm_states = None
+                        return
+                    cycle_completed = False
+                    break
 
             if not cycle_ran_any_microbatch:
                 break
@@ -1301,6 +1362,20 @@ def main():
     parser.add_argument("--chunk-size", type=int, default=1024)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--grad-accum", type=int, default=16)
+    parser.add_argument(
+        "--bptt-window",
+        type=int,
+        default=1,
+        help="Chunks per BPTT window. K=1 (default) is classical TBPTT — "
+             "memory state is detached between training steps. K>1 keeps "
+             "the autograd graph alive across K consecutive chunks, so "
+             "loss at chunk K-1 backprops through M's recurrence into "
+             "projections that wrote into M during chunks 0..K-2. Required "
+             "for the memory pathway to learn cross-chunk retrieval. Each "
+             "optimizer step processes accum_steps * bptt_window chunks; "
+             "memory cost grows linearly with K. See cli/finetune.py for "
+             "fuller help text.",
+    )
     parser.add_argument("--max-steps", type=int, default=5000)
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--log-every", type=int, default=50)
@@ -1519,6 +1594,7 @@ def main():
             is_distributed=is_distributed,
             start_step=start_step,
             batch_size=args.batch_size,
+            bptt_window=args.bptt_window,
         )
     finally:
         #/— NCCL cleanup on exception path. Consistent 4-space indent.

@@ -76,6 +76,11 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python -m cli.finetune \
     --compile-model --optim8bit
 ```
 
+For tasks that need cross-chunk retrieval (needle-in-haystack at
+distances > chunk_size), add `--bptt-window K` with K large enough to
+span your longest training example (e.g. K=4 for the needle corpus's
+3072-token max distance at chunk_size=1024). See the section below.
+
 The training-regime flags at the bottom — `--freeze-embeddings` and
 `--nmm-gate-ramp-*` — were added after needle-in-haystack diagnostics
 showed that vanilla fine-tuning produces a too-weak NMM signal
@@ -88,6 +93,39 @@ supervision on `y_mem`. It's preserved as a diagnostic tool (defaults
 to 0.0, disabled) but is **NOT** in the default recipe — see the flag
 description below for what it tested and why it doesn't help at our
 scale.
+
+### `--bptt-window K` (cross-chunk gradient flow)
+
+The training loop's default (`K=1`) is classical truncated BPTT:
+recurrent state is detached at every chunk boundary, so the gradient
+from chunk `t`'s loss cannot reach memory-write projections that fired
+in chunk `t-1` or earlier. Under TBPTT, the memory pathway only gets
+end-task supervision *within* a single chunk — fine for streaming
+language-model training, but the wrong recipe for tasks that demand
+cross-chunk retrieval (e.g. needle-in-haystack at distances larger
+than `chunk_size`).
+
+Setting `--bptt-window K` keeps the autograd graph alive across `K`
+consecutive chunks. The loss at chunk `K-1` then backprops through
+`M`'s recurrence into the Q/K/V/β projections that wrote into `M`
+during chunks `0..K-2` — the path required for the memory pathway to
+learn that "this key now will be looked up later." Per-optimizer-step
+chunks become `accum_steps * bptt_window`. Memory cost grows linearly
+in `K` (the full forward graph for `K` chunks is held until the single
+backward at window end).
+
+**Why this matters for the needle corpus:** training examples in
+`corpora/needle/` carry distances drawn uniformly from `[0, 3072]`
+tokens. At `chunk_size=1024`, examples longer than ~900 tokens span
+multiple chunks, so the answer position's loss can never reach the
+needle's write under K=1 — leaving the memory pathway unsupervised at
+long distance. K=4 spans the longest example, restoring the gradient
+path. Five separate architectures (NMM, pre-TPTT DeltaProduct,
+TPTT-MAG, TPTT-LiZA, aux-loss NMM) all hit the same ~chance accuracy
+cliff at exactly `d == chunk_size` under K=1; this flag is the fix.
+
+`bptt_window` is in `SAVED_TRAINING_ARGS`, so resume drift detection
+warns if you resume with a different K than was saved.
 
 ### `--freeze-embeddings`
 
