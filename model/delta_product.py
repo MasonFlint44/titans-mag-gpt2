@@ -62,7 +62,6 @@ between the two via `config.memory_type` without other changes:
     step_with_conv(x_t, state) -> (y_t, new_state)
 """
 
-import functools
 import math
 
 import torch
@@ -70,7 +69,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-@functools.lru_cache(maxsize=128)
 def _chunkwise_aux_tensors(device, T: int, N: int, dtype):
     """Static auxiliary tensors used by every WY solve.
 
@@ -83,9 +81,12 @@ def _chunkwise_aux_tensors(device, T: int, N: int, dtype):
         `dtype`, used to scope each real token's read to its own
         write-window.
 
-    Caching by `(device, T, N, dtype)` because they're deterministic
-    functions of those args and re-allocating per layer per forward
-    costs ~150 MB/s of allocator pressure at training scale.
+    No cache. The earlier `functools.lru_cache` triggered Dynamo's
+    "potential silent incorrectness" warning under `torch.compile`,
+    and under compile the tensors become graph constants anyway
+    (Dynamo specializes on the constant (T, N, device, dtype) args
+    and bakes the results in). In eager mode the per-call alloc cost
+    is small relative to the WY solve itself.
     """
     TN = T * N
     mask_lt = torch.tril(
@@ -472,7 +473,13 @@ class DeltaProductMemory(nn.Module):
         """Chunkwise parallel forward — closed-form WY representation
         with vector β over the virtual sequence.
 
-        One WY solve per contiguous document segment.
+        The boundary-aware segment loop is delegated to `_run_segments`,
+        which is marked `@torch.compiler.disable` because the number of
+        segments per chunk varies with `doc_boundaries`. Without that,
+        Dynamo recompiles on every new split layout and hits its
+        recompile limit on multi-document training corpora. The
+        surrounding projections (`_project_kvb`) and the output
+        (`_apply_out_norm_and_proj`) stay compile-eligible.
         """
         M, k_raw_buf_in, qkvb_buf_in = state_in
         B, T, _ = x_chunk.shape
@@ -481,6 +488,32 @@ class DeltaProductMemory(nn.Module):
             self._project_kvb(x_chunk, k_raw_buf_in, qkvb_buf_in)
         )
 
+        M_new, y_raw = self._run_segments(
+            M, q_virt, k_virt, v_virt, beta_virt, doc_boundaries, B, T,
+        )
+
+        y = self._apply_out_norm_and_proj(y_raw, x_chunk.dtype)
+        return y, (M_new, k_raw_buf_out, qkvb_buf_out)
+
+    @torch.compiler.disable
+    def _run_segments(
+        self,
+        M: torch.Tensor,
+        q_virt: torch.Tensor,
+        k_virt: torch.Tensor,
+        v_virt: torch.Tensor,
+        beta_virt: torch.Tensor,
+        doc_boundaries,
+        B: int,
+        T: int,
+    ) -> tuple:
+        """Boundary-aware segment loop — eager.
+
+        Walks the chunk in one WY solve per contiguous document segment.
+        Calls `_chunkwise_solve_raw` per segment; that function runs
+        eagerly too (since this scope is eager) but its CUDA ops
+        (bmm + solve_triangular) execute as efficient kernels regardless.
+        """
         splits = {0, T}
         if doc_boundaries is not None:
             any_boundary = doc_boundaries.any(dim=0)
@@ -515,8 +548,7 @@ class DeltaProductMemory(nn.Module):
             y_segments[0] if len(y_segments) == 1
             else torch.cat(y_segments, dim=1)
         )
-        y = self._apply_out_norm_and_proj(y_raw, x_chunk.dtype)
-        return y, (M, k_raw_buf_out, qkvb_buf_out)
+        return M, y_raw
 
     def _chunkwise_solve_raw(
         self,

@@ -525,20 +525,12 @@ def test_multihead_blockwise_matches_sequential():
     assert torch.allclose(s_seq[0], s_blk[0], atol=1e-5)
 
 
-# -- Chunkwise auxiliary-tensor cache -------------------------------------
+# -- Chunkwise auxiliary tensors ------------------------------------------
 
 
-def test_chunkwise_aux_cache_returns_identical_tensors_on_repeat_call():
-    _chunkwise_aux_tensors.cache_clear()
-    device = torch.device("cpu")
-    a = _chunkwise_aux_tensors(device, T=8, N=2, dtype=torch.float32)
-    b = _chunkwise_aux_tensors(device, T=8, N=2, dtype=torch.float32)
-    for t_a, t_b in zip(a, b):
-        assert t_a is t_b
-
-
-def test_chunkwise_aux_cache_separates_by_T_and_N():
-    _chunkwise_aux_tensors.cache_clear()
+def test_chunkwise_aux_shapes_by_T_and_N():
+    """Mask + identity + read-window mask have the right shapes for each
+    (T, N)."""
     device = torch.device("cpu")
     dtype = torch.float32
     mask_a, _, real_a = _chunkwise_aux_tensors(device, T=4, N=2, dtype=dtype)
@@ -547,13 +539,11 @@ def test_chunkwise_aux_cache_separates_by_T_and_N():
     assert mask_a.shape == (8, 8) and real_a.shape == (4, 8)
     assert mask_b.shape == (12, 12) and real_b.shape == (4, 12)
     assert mask_c.shape == (16, 16) and real_c.shape == (8, 16)
-    assert mask_a is not mask_b
-    assert mask_a is not mask_c
-    assert real_a is not real_b
 
 
 def test_chunkwise_aux_real_mask_semantics():
-    _chunkwise_aux_tensors.cache_clear()
+    """real_mask[t, s] = 1 iff s < (t+1)·N — scopes each read to its
+    own write-window."""
     device = torch.device("cpu")
     _, _, real_mask = _chunkwise_aux_tensors(
         device, T=3, N=2, dtype=torch.float32,
