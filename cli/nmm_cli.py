@@ -199,6 +199,19 @@ def add_nmm_args(parser: argparse.ArgumentParser) -> None:
              "for a future memory-bounded sub-chunking path. Only "
              "meaningful with --memory-type delta_product.",
     )
+    dp_group.add_argument(
+        "--memory-topology",
+        choices=["mag", "liza"],
+        default=None,
+        help="How the memory output integrates with the block. "
+             "'mag' (default) = paper-strict Titans: memory MODULATES "
+             "attention multiplicatively (o = y_attn + SiLU(γ·y_mem)·y_attn). "
+             "'liza' = TPTT topology: softmax attention and DeltaProduct "
+             "linear attention run IN PARALLEL on the same shared pre-norm, "
+             "outputs combined via Memory-as-Gate. Memory gets a direct "
+             "path to the residual stream rather than only gating attention. "
+             "Only meaningful with --memory-type delta_product.",
+    )
 
 
 def nmm_kwargs_from_args(args: argparse.Namespace) -> dict:
@@ -253,6 +266,8 @@ def nmm_kwargs_from_args(args: argparse.Namespace) -> dict:
         kwargs["delta_n_heads"] = args.delta_n_heads
     if getattr(args, "delta_block_size", None) is not None:
         kwargs["delta_block_size"] = args.delta_block_size
+    if getattr(args, "memory_topology", None) is not None:
+        kwargs["memory_topology"] = args.memory_topology
     _validate_delta_flags(args)
     return kwargs
 

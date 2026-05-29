@@ -4,7 +4,9 @@ from model.block import (
     CausalSelfAttention,
     GPT2MLP,
     KVCacheInt8,
+    MemoryAsGate,
     PlainGPT2Block,
+    TitansLizaBlock,
     TitansMAGBlock,
 )
 from model.nmm import (
@@ -24,11 +26,13 @@ __all__ = [
     "CausalSelfAttention",
     "GPT2MLP",
     "KVCacheInt8",
+    "MemoryAsGate",
     "MemoryMLP",
     "MultiHeadNMM",
     "NeuralMemoryModule",
     "PlainGPT2Block",
     "StateConfigMismatch",
+    "TitansLizaBlock",
     "TitansMAGBlock",
     "TitansMAGGPT2",
     "_unwrap",

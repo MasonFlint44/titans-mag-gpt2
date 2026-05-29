@@ -435,6 +435,27 @@ class TitansConfig:
     #   Only meaningful when memory_type="delta_product".
     delta_block_size: int = 1
 
+    # memory_topology: how the DeltaProduct memory output integrates with
+    #   the block.
+    #   "mag" (default, paper-strict Titans MAG): DeltaProductMemory runs
+    #     SEPARATELY from softmax attention on its own input pre-norm
+    #     (ln_nmm), and its output gates attention's output multiplicatively:
+    #         o = y_attn + SiLU(gamma_mem · y_mem) · y_attn.
+    #     Memory's role is to MODULATE attention; it cannot directly
+    #     contribute information to the residual stream.
+    #   "liza" (TPTT's published topology, arxiv 2506.17671): softmax
+    #     attention and DeltaProduct-as-linear-attention run in PARALLEL
+    #     on the same shared pre-normed input, and their outputs are
+    #     combined via Memory-as-Gate (MaG):
+    #         o = MaG(y_lin, y_attn)
+    #     Memory has a direct path to the residual stream alongside
+    #     attention. This is TPTT's mechanistic explanation for why
+    #     pretrained adaptation works at their scale — memory's gradient
+    #     signal comes from "did your contribution improve the prediction"
+    #     rather than "did your modulation help attention". Only meaningful
+    #     when memory_type="delta_product"; ignored for NMM.
+    memory_topology: str = "mag"
+
     def __post_init__(self):
         # raise ValueError (never assert): `python -O` strips asserts, which
         # would let invalid configs ship silently in production.
@@ -540,6 +561,28 @@ class TitansConfig:
                 f"{self.delta_n_heads} * {head_dim} = "
                 f"{self.delta_n_heads * head_dim}, not {self.n_embd}."
             )
+        if self.memory_topology not in ("mag", "liza"):
+            raise ValueError(
+                f"memory_topology must be 'mag' or 'liza' (got "
+                f"{self.memory_topology!r}). 'mag' = paper-strict Titans "
+                f"(memory modulates attention multiplicatively). 'liza' = "
+                f"TPTT's parallel topology (memory runs alongside attention, "
+                f"outputs combined via MaG)."
+            )
+        if self.memory_topology == "liza" and self.memory_type != "delta_product":
+            raise ValueError(
+                f"memory_topology='liza' requires memory_type='delta_product' "
+                f"(got memory_type={self.memory_type!r}). LiZA is TPTT's "
+                f"DeltaProduct-specific parallel-attention topology; the NMM "
+                f"has no equivalent."
+            )
+        if self.memory_topology == "liza" and self.nmm_n_persistent != 0:
+            # TPTT's LiZA topology has no persistent prefix. Silently
+            # override (rather than erroring) so the user only has to set
+            # one flag — `--memory-topology liza` — for a clean LiZA run.
+            # The override is logged via __post_init__ exit behavior;
+            # callers that want both can use the MAG topology.
+            self.nmm_n_persistent = 0
         if self.delta_block_size < 1:
             raise ValueError(
                 f"delta_block_size must be >= 1 (got {self.delta_block_size}); "

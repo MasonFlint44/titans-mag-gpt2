@@ -723,3 +723,205 @@ class TitansMAGBlock(nn.Module):
         x = x_new + o
         x = x + self.mlp(self.ln_2(x))
         return x, new_nmm_state, new_k_cache, new_v_cache
+
+
+# ---------------------------------------------------------------------------
+# LiZA topology: parallel softmax + DeltaProduct attention via MaG
+# ---------------------------------------------------------------------------
+
+
+class MemoryAsGate(nn.Module):
+    """Combines two parallel attention outputs via a learnable per-channel
+    additive gate.
+
+    Matches TPTT's `MemoryAsGate` topology (additive combination of
+    `O_lin` and `O_base`), but uses a learnable per-channel gate instead
+    of TPTT's fixed `mag_ratio=0.5` scalar. The change is motivated by
+    our finetune-mode invariant: at step 0 we want
+    `output = softmax_attn(x)` exactly (no linear-attention contribution
+    yet), so the pretrained backbone's behavior is preserved. Zero-init
+    the gate under `finetune_mode=True` to enforce this; the optimizer
+    then ramps the gate up token-by-token as it learns when the linear-
+    attention path is useful.
+
+    Forward: `o = o_base + gate * o_lin`.
+        - `o_base`: softmax-attention output, shape [B, T, n_embd].
+        - `o_lin`: DeltaProduct linear-attention output, same shape.
+        - `gate`: per-channel learnable scaling [n_embd].
+
+    Why per-channel instead of scalar: different feature dims may want
+    different mix ratios (some dims are short-range, attention-dominated;
+    others may want the linear-attention contribution to dominate). A
+    scalar gate forces a single mix everywhere.
+    """
+
+    def __init__(self, hidden_dim: int, finetune_mode: bool = True):
+        super().__init__()
+        # Zero-init under finetune_mode → output = o_base exactly at
+        # step 0. Half-init under from-scratch mode → roughly equal mix.
+        if finetune_mode:
+            self.gate = nn.Parameter(torch.zeros(hidden_dim))
+        else:
+            self.gate = nn.Parameter(torch.full((hidden_dim,), 0.5))
+
+    def forward(self, o_lin: torch.Tensor, o_base: torch.Tensor) -> torch.Tensor:
+        return o_base + self.gate * o_lin
+
+
+class TitansLizaBlock(nn.Module):
+    """TPTT-style block: parallel softmax + DeltaProduct attention via MaG.
+
+    Block flow:
+        x_norm   = LN(x)
+        y_attn   = softmax_attention(x_norm)
+        y_lin, s = delta_product_linear_attn(x_norm, state, doc_boundaries)
+        o        = MaG(y_lin, y_attn)            # additive combine
+        x        = x + o
+        x        = x + MLP(LN(x))
+
+    Differences from `TitansMAGBlock` (the original Titans MAG topology):
+      - **Parallel attention paths**: softmax attention and DeltaProduct
+        linear attention run on the SAME shared pre-normed input. In
+        TitansMAGBlock the memory path has its own pre-norm (`ln_nmm`)
+        and only modulates attention's output. Here both paths see
+        identical inputs and produce outputs that BOTH directly
+        contribute to the residual.
+      - **Additive MaG instead of multiplicative MAG**: the gate
+        is `o = o_base + gate · o_lin` (additive), not
+        `o = y_attn + SiLU(γ · y_mem) · y_attn` (multiplicative).
+        Memory gets a direct path to the residual stream rather than
+        being constrained to modulate attention.
+      - **No persistent prefix**: TPTT doesn't use one. The model's
+        config auto-sets `nmm_n_persistent=0` when
+        `memory_topology="liza"`.
+      - **Standard causal mask**: no block-structured mask for a
+        persistent prefix (since there is none).
+
+    The DeltaProductMemory's own RMSNorm + out_proj already cast its
+    output to attention-compatible [B, T, n_embd]; MaG just adds it in.
+
+    Name-keeps polymorphism with TitansMAGBlock at the model-level state
+    threading: `self.nmm` is the recurrent memory module (here, the
+    linear-attention path), so `model.forward` can iterate uniformly.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        if config.memory_type != "delta_product":
+            raise ValueError(
+                f"TitansLizaBlock requires memory_type='delta_product' "
+                f"(got {config.memory_type!r}); LiZA is TPTT's "
+                f"DeltaProduct-specific topology."
+            )
+        if config.nmm_n_persistent != 0:
+            raise ValueError(
+                f"TitansLizaBlock requires nmm_n_persistent=0 (got "
+                f"{config.nmm_n_persistent}); TPTT's LiZA topology has no "
+                f"persistent prefix. The config validator should auto-set "
+                f"this — if you're hitting this, something bypassed "
+                f"__post_init__."
+            )
+
+        self.finetune_mode = config.finetune_mode
+        self.use_swa = config.use_swa
+        self.swa_window = config.swa_window
+        self.memory_type = "delta_product"
+
+        # Shared pre-norm for both attention paths.
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+
+        # Softmax attention.
+        self.attn = CausalSelfAttention(
+            config.n_embd, config.n_head, config.dropout,
+        )
+
+        # DeltaProduct linear-attention path. Name is `nmm` (not
+        # `linear_attn`) for polymorphism with TitansMAGBlock —
+        # `model.forward` iterates `block.nmm` to thread state.
+        self.nmm = DeltaProductMemory(
+            n_embd=config.n_embd,
+            n_heads=config.delta_n_heads,
+            order=config.delta_order,
+            finetune_mode=config.finetune_mode,
+            block_size=config.delta_block_size,
+        )
+
+        # MaG combiner. Zero-init under finetune_mode so the block
+        # reproduces standard softmax attention at step 0.
+        self.mag = MemoryAsGate(config.n_embd, config.finetune_mode)
+
+        # Pre-norm for MLP, then MLP.
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp = GPT2MLP(config.n_embd, config.dropout)
+
+    def _causal_mask(self, T: int, device, dtype):
+        """Standard upper-triangular causal mask (with optional banded SWA).
+
+        No block structure for a persistent prefix — LiZA doesn't use one.
+        """
+        mask = torch.triu(
+            torch.full((T, T), float("-inf"), device=device, dtype=dtype),
+            diagonal=1,
+        )
+        if self.use_swa:
+            far_past = torch.tril(
+                torch.full((T, T), float("-inf"), device=device, dtype=dtype),
+                diagonal=-self.swa_window,
+            )
+            mask = mask + far_past
+        return mask
+
+    def forward(self, x: torch.Tensor, nmm_state, doc_boundaries=None):
+        B, T, _ = x.shape
+        x_norm = self.ln_1(x)
+
+        # Softmax attention.
+        mask = self._causal_mask(T, x.device, x.dtype)
+        y_attn = self.attn(x_norm, mask=mask)
+
+        # DeltaProduct linear-attention path on the SAME pre-normed input.
+        y_lin, new_state = self.nmm.forward_chunk(
+            x_norm, nmm_state, doc_boundaries,
+        )
+
+        # MaG combine: o = y_attn + gate · y_lin.
+        o = self.mag(y_lin, y_attn)
+        x = x + o
+        x = x + self.mlp(self.ln_2(x))
+        return x, new_state
+
+    def init_decode_cache(
+        self, x_prompt: torch.Tensor, nmm_state, int8_kv_cache: bool = False,
+    ) -> tuple:
+        """Seed the per-block KV cache from a warm-up prompt. LiZA has
+        no persistent prefix, so this is just a project_kv on the
+        ln_1-normalized prompt."""
+        x_norm = self.ln_1(x_prompt)
+        k_cache, v_cache = self.attn.project_kv(
+            x_norm, int8_kv_cache=int8_kv_cache,
+        )
+        return k_cache, v_cache
+
+    def forward_step(
+        self,
+        x_new: torch.Tensor,
+        nmm_state,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+    ) -> tuple:
+        """Single-token decode forward through one LiZA block."""
+        x_norm = self.ln_1(x_new)
+        y_attn, new_k_cache, new_v_cache = self.attn.forward_with_kv_cache(
+            x_norm, k_cache, v_cache,
+            swa_window=self.swa_window if self.use_swa else None,
+            n_persistent=0,  # LiZA: no persistent prefix
+        )
+        # DeltaProduct step on the same pre-normed input.
+        x_norm_t = x_norm.squeeze(1)  # [B, d]
+        y_lin_t, new_nmm_state = self.nmm.step_with_conv(x_norm_t, nmm_state)
+        y_lin = y_lin_t.unsqueeze(1)
+
+        o = self.mag(y_lin, y_attn)
+        x = x_new + o
+        x = x + self.mlp(self.ln_2(x))
+        return x, new_nmm_state, new_k_cache, new_v_cache

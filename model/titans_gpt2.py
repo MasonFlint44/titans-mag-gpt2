@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 
-from model.block import PlainGPT2Block, TitansMAGBlock
+from model.block import PlainGPT2Block, TitansLizaBlock, TitansMAGBlock
 
 
 class TitansMAGGPT2(nn.Module):
@@ -53,8 +53,16 @@ class TitansMAGGPT2(nn.Module):
             nmm_idx_set = set(range(config.n_layer))
         else:
             nmm_idx_set = set(config.nmm_layer_indices)
+        # Block factory: pick the topology based on config.
+        #   "mag" → TitansMAGBlock (original Titans MAG: memory modulates attn)
+        #   "liza" → TitansLizaBlock (TPTT parallel: softmax + linear via MaG)
+        # Non-NMM layers always get PlainGPT2Block regardless of topology.
+        if config.memory_topology == "liza":
+            mem_block_cls = TitansLizaBlock
+        else:
+            mem_block_cls = TitansMAGBlock
         self.blocks = nn.ModuleList([
-            TitansMAGBlock(config) if i in nmm_idx_set else PlainGPT2Block(config)
+            mem_block_cls(config) if i in nmm_idx_set else PlainGPT2Block(config)
             for i in range(config.n_layer)
         ])
         # Cache the boolean mask for fast per-block dispatch in forward.
