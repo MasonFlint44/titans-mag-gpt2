@@ -213,6 +213,37 @@ def add_nmm_args(parser: argparse.ArgumentParser) -> None:
              "Only meaningful with --memory-type delta_product.",
     )
 
+    # LoRA on backbone attention. TPTT (arxiv 2506.17671 §4.1) uses these
+    # exact defaults: rank=8, alpha=16, dropout=0.05 applied to q/k/v/o.
+    lora_group = parser.add_argument_group("backbone LoRA")
+    lora_group.add_argument(
+        "--lora-rank",
+        type=int,
+        default=None,
+        metavar="R",
+        help="Wrap each backbone attention projection (q/k/v/proj) in a "
+             "rank-R LoRA adapter. Base weights freeze; only LoRA adapters "
+             "and the memory pathway train. 0 (or omitted) = LoRA OFF "
+             "(plain nn.Linear). TPTT's recipe uses R=8.",
+    )
+    lora_group.add_argument(
+        "--lora-alpha",
+        type=float,
+        default=None,
+        metavar="A",
+        help="LoRA scaling factor. Effective LoRA contribution is "
+             "(alpha/rank) · B·A·x. TPTT default 16. Only meaningful with "
+             "--lora-rank > 0.",
+    )
+    lora_group.add_argument(
+        "--lora-dropout",
+        type=float,
+        default=None,
+        metavar="P",
+        help="Dropout on the LoRA path's input. TPTT default 0.05. Only "
+             "meaningful with --lora-rank > 0.",
+    )
+
 
 def nmm_kwargs_from_args(args: argparse.Namespace) -> dict:
     """Convert parsed args to a TitansConfig kwargs dict. Only includes
@@ -268,6 +299,12 @@ def nmm_kwargs_from_args(args: argparse.Namespace) -> dict:
         kwargs["delta_block_size"] = args.delta_block_size
     if getattr(args, "memory_topology", None) is not None:
         kwargs["memory_topology"] = args.memory_topology
+    if getattr(args, "lora_rank", None) is not None:
+        kwargs["lora_rank"] = args.lora_rank
+    if getattr(args, "lora_alpha", None) is not None:
+        kwargs["lora_alpha"] = args.lora_alpha
+    if getattr(args, "lora_dropout", None) is not None:
+        kwargs["lora_dropout"] = args.lora_dropout
     _validate_delta_flags(args)
     return kwargs
 

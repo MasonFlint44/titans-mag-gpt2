@@ -152,7 +152,15 @@ class CausalSelfAttention(nn.Module):
     `attn_mask=None` attends to all positions; always pass an explicit mask.
     """
 
-    def __init__(self, n_embd: int, n_head: int, dropout: float = 0.0):
+    def __init__(
+        self,
+        n_embd: int,
+        n_head: int,
+        dropout: float = 0.0,
+        lora_rank: int = 0,
+        lora_alpha: float = 16.0,
+        lora_dropout: float = 0.05,
+    ):
         super().__init__()
         if n_embd % n_head != 0:
             head_dim = n_embd // n_head
@@ -164,10 +172,27 @@ class CausalSelfAttention(nn.Module):
         self.n_head = n_head
         self.head_dim = n_embd // n_head
         # HF GPT-2 c_attn and c_proj both have biases — required for parity.
-        self.q_proj = nn.Linear(n_embd, n_embd, bias=True)
-        self.k_proj = nn.Linear(n_embd, n_embd, bias=True)
-        self.v_proj = nn.Linear(n_embd, n_embd, bias=True)
-        self.proj = nn.Linear(n_embd, n_embd, bias=True)
+        # When lora_rank > 0 wrap each projection in a LoRALinear (base weights
+        # frozen, rank-r adapter trains). This matches TPTT's recipe (q/k/v/o
+        # are the LoRA targets). MLP and embeddings are NOT wrapped here.
+        if lora_rank > 0:
+            from model.lora import LoRALinear
+
+            def make_proj():
+                return LoRALinear(
+                    n_embd, n_embd, bias=True,
+                    rank=lora_rank, alpha=lora_alpha, dropout=lora_dropout,
+                    freeze_base=True,
+                )
+            self.q_proj = make_proj()
+            self.k_proj = make_proj()
+            self.v_proj = make_proj()
+            self.proj = make_proj()
+        else:
+            self.q_proj = nn.Linear(n_embd, n_embd, bias=True)
+            self.k_proj = nn.Linear(n_embd, n_embd, bias=True)
+            self.v_proj = nn.Linear(n_embd, n_embd, bias=True)
+            self.proj = nn.Linear(n_embd, n_embd, bias=True)
         self.resid_dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
@@ -337,7 +362,10 @@ class PlainGPT2Block(nn.Module):
         self.N_p = config.nmm_n_persistent
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(
-            config.n_embd, config.n_head, config.dropout
+            config.n_embd, config.n_head, config.dropout,
+            lora_rank=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
         )
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = GPT2MLP(config.n_embd, config.dropout)
@@ -479,7 +507,10 @@ class TitansMAGBlock(nn.Module):
 
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(
-            config.n_embd, config.n_head, config.dropout
+            config.n_embd, config.n_head, config.dropout,
+            lora_rank=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
         )
 
         # Separate from ln_1; memory pathway has its own pre-norm.
@@ -833,6 +864,9 @@ class TitansLizaBlock(nn.Module):
         # Softmax attention.
         self.attn = CausalSelfAttention(
             config.n_embd, config.n_head, config.dropout,
+            lora_rank=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
         )
 
         # DeltaProduct linear-attention path. Name is `nmm` (not

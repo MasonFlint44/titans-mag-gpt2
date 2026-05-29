@@ -456,6 +456,19 @@ class TitansConfig:
     #     when memory_type="delta_product"; ignored for NMM.
     memory_topology: str = "mag"
 
+    # LoRA on backbone attention projections (TPTT recipe, arxiv 2506.17671 §4.1).
+    # When `lora_rank > 0`, each block's q_proj/k_proj/v_proj/proj is wrapped
+    # in a LoRALinear; the base weights freeze, only the rank-r adapters
+    # train. Memory pathway is unaffected (stays fully trainable). MLP and
+    # embedding layers also unaffected by this flag.
+    #
+    # Default rank=0 means LoRA is OFF and attention uses plain nn.Linear
+    # everywhere — backward-compatible. Set rank=8 (TPTT's choice) to
+    # enable. alpha=16, dropout=0.05 are TPTT's defaults.
+    lora_rank: int = 0
+    lora_alpha: float = 16.0
+    lora_dropout: float = 0.05
+
     def __post_init__(self):
         # raise ValueError (never assert): `python -O` strips asserts, which
         # would let invalid configs ship silently in production.
@@ -589,6 +602,22 @@ class TitansConfig:
                 f"use 1 for the sequential reference path, >1 for the "
                 f"blockwise parallel path."
             )
+
+        if self.lora_rank < 0:
+            raise ValueError(
+                f"lora_rank must be >= 0 (got {self.lora_rank}); use 0 to "
+                f"disable LoRA (plain nn.Linear in attention)."
+            )
+        if self.lora_rank > 0:
+            if self.lora_alpha <= 0:
+                raise ValueError(
+                    f"lora_alpha must be > 0 when lora_rank > 0 "
+                    f"(got alpha={self.lora_alpha})."
+                )
+            if not (0.0 <= self.lora_dropout < 1.0):
+                raise ValueError(
+                    f"lora_dropout must be in [0, 1) (got {self.lora_dropout})."
+                )
 
         # Memory-saving knob validation.
         if self.nmm_state_dtype not in ("fp32", "bf16", "int8"):

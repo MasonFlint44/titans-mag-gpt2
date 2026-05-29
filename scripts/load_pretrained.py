@@ -59,6 +59,17 @@ def load_pretrained(model, config) -> None:
             f"n_head={hf_n_head}. Head-count mismatch is incompatible with the QKV split."
         )
 
+    def _resolve_proj(proj):
+        """Return the leaf nn.Linear holding the .weight/.bias to overwrite.
+
+        Plain `nn.Linear` returns itself. `LoRALinear` (when `lora_rank > 0`)
+        wraps the base Linear at `.linear`, so we descend one step. LoRA's A
+        and B matrices keep their fresh init (B starts at zero so the LoRA
+        contribution is exactly zero at step 0; the model matches HF GPT-2
+        logits before any LoRA training).
+        """
+        return proj.linear if hasattr(proj, "linear") else proj
+
     with torch.no_grad():
         # --- Per-block copy ---
         for our_block, hf_block in zip(model.blocks, hf_model.transformer.h):
@@ -70,14 +81,18 @@ def load_pretrained(model, config) -> None:
             W_q, W_k, W_v = c_attn_w.chunk(3, dim=1)  # each [n_embd, n_embd]
             b_q, b_k, b_v = c_attn_b.chunk(3, dim=0)  # each [n_embd]
             # Conv1D weight [in, out] -> nn.Linear weight [out, in]: transpose.
-            our_attn.q_proj.weight.copy_(W_q.T)
-            our_attn.q_proj.bias.copy_(b_q)
-            our_attn.k_proj.weight.copy_(W_k.T)
-            our_attn.k_proj.bias.copy_(b_k)
-            our_attn.v_proj.weight.copy_(W_v.T)
-            our_attn.v_proj.bias.copy_(b_v)
-            our_attn.proj.weight.copy_(hf_block.attn.c_proj.weight.T)
-            our_attn.proj.bias.copy_(hf_block.attn.c_proj.bias)
+            q_leaf = _resolve_proj(our_attn.q_proj)
+            k_leaf = _resolve_proj(our_attn.k_proj)
+            v_leaf = _resolve_proj(our_attn.v_proj)
+            p_leaf = _resolve_proj(our_attn.proj)
+            q_leaf.weight.copy_(W_q.T)
+            q_leaf.bias.copy_(b_q)
+            k_leaf.weight.copy_(W_k.T)
+            k_leaf.bias.copy_(b_k)
+            v_leaf.weight.copy_(W_v.T)
+            v_leaf.bias.copy_(b_v)
+            p_leaf.weight.copy_(hf_block.attn.c_proj.weight.T)
+            p_leaf.bias.copy_(hf_block.attn.c_proj.bias)
 
             # LayerNorms — matching layout, no transpose.
             our_block.ln_1.weight.copy_(hf_block.ln_1.weight)
