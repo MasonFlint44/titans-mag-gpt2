@@ -2,7 +2,9 @@
 
 import io
 import warnings
+from pathlib import Path
 
+import numpy as np
 import tiktoken
 import torch
 
@@ -61,3 +63,46 @@ class Tokenizer:
             ids.extend(self.enc.encode(doc, disallowed_special=()))
             ids.append(self.eot_token)
         return torch.tensor(ids, dtype=torch.long)
+
+
+def load_token_stream(path: str | Path) -> torch.Tensor:
+    """Load a token stream from disk, dispatching on file extension.
+
+    Two formats supported:
+      - `*.bin`: raw little-endian uint16 binary written by
+        `scripts.tokenize_fineweb_edu` (or any nanoGPT-compatible
+        producer). Read via numpy and cast to LongTensor.
+      - everything else (`*.txt`, no extension, etc.): text corpus.
+        Split on literal `<|endoftext|>` markers (via
+        `scripts.prepare_squad_corpus.read_eot_separated_documents`)
+        and tokenize through `Tokenizer.encode_corpus`.
+
+    The binary path skips the per-startup re-tokenization cost — at
+    ~1.5B tokens, tokenization is a multi-hour job; pre-tokenizing once
+    to a binary blob saves that on every resume / retry.
+
+    Returns a 1-D `torch.long` tensor of token ids, ready to hand to
+    `ParallelStreamLoader`.
+    """
+    path = Path(path)
+    if path.suffix == ".bin":
+        size_bytes = path.stat().st_size
+        if size_bytes % 2 != 0:
+            raise ValueError(
+                f"{path} has odd byte size ({size_bytes}); not a clean "
+                f"uint16 stream. Re-run scripts.tokenize_fineweb_edu."
+            )
+        # np.memmap + .astype(int64) does NOT load lazily on the .astype
+        # call — it materializes the converted array. So memory peak is
+        # 1× uint16 (file size) + 1× int64 (4× file size) momentarily,
+        # then the uint16 backing memmap can be dropped. For 1.5B tokens
+        # that's ~3GB + ~12GB transient. Workable on a 32GB+ box.
+        memmapped = np.memmap(path, dtype=np.uint16, mode="r")
+        # Convert to int64 (the dtype nn.Embedding expects). torch.from_numpy
+        # on a uint16 array isn't supported; go through int64 via numpy.
+        as_int64 = np.asarray(memmapped, dtype=np.int64)
+        return torch.from_numpy(as_int64)
+    # Text path — the existing recipe.
+    from scripts.prepare_squad_corpus import read_eot_separated_documents
+    tok = Tokenizer()
+    return tok.encode_corpus(read_eot_separated_documents(path))

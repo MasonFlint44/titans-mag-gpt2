@@ -86,7 +86,10 @@ GRAD_CLIP = 1.0
 #   out_scale  -- magnitude gate (init=0; decay would resist learning)
 #   gamma      -- gamma_mem / gamma_attn (init=1; decay shrinks memory branch)
 #   persistent -- persistent_mem (learned prefix; decay reduces capacity)
-NO_DECAY_SUBSTRINGS = ("bias", "ln", "norm", "out_scale", "gamma", "persistent")
+NO_DECAY_SUBSTRINGS = (
+    "bias", "ln", "norm", "out_scale", "gamma", "persistent",
+    "lora_A", "lora_B",
+)
 
 # Substring set for NMM routing. Paper-strict: only the NMM module's own
 # parameters get the 3× learning rate. `gamma_mem` / `gamma_attn` and
@@ -1552,18 +1555,15 @@ def main():
         else:
             start_step = 0
 
-        # Tokenize corpus. `read_eot_separated_documents` splits the file on
-        # any literal `<|endoftext|>` markers so `encode_corpus` can append
-        # the EOT *id* (50256) between them — the signal the dataloader uses
-        # to set `doc_boundaries[i]=True` and reset the NMM state. Without
-        # the split step, the literals BPE-tokenize as 7 ordinary tokens
-        # and the reset never fires, leaving the NMM in unbounded-
-        # accumulation mode across the whole corpus. For files with no
-        # markers the helper returns a single-element list (matches the
-        # previous whole-file-as-one-document behavior).
-        from scripts.prepare_squad_corpus import read_eot_separated_documents
+        # Load corpus. `data.tokenizer.load_token_stream` dispatches on
+        # file extension: `.bin` is a pre-tokenized uint16 binary (written
+        # by `scripts.tokenize_fineweb_edu`); anything else is a text file,
+        # tokenized via `Tokenizer.encode_corpus` after EOT-splitting. The
+        # binary path skips the multi-hour re-tokenize on every startup —
+        # critical for 1B+-token from-scratch corpora.
+        from data.tokenizer import load_token_stream
         tok = Tokenizer()
-        token_stream = tok.encode_corpus(read_eot_separated_documents(args.data))
+        token_stream = load_token_stream(args.data)
 
         loader = ParallelStreamLoader(
             token_stream,

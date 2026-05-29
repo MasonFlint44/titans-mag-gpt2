@@ -212,6 +212,95 @@ For multi-GPU from-scratch runs on a bigger box you'll want to bump
 drop the freeze flags (more data + more capacity makes the
 gradient-dilution concern less acute).
 
+## TITANS-paper from-scratch recipe
+
+For replicating the TITANS paper's published NIAH/BABILong results
+(Behrouz et al. 2024, arxiv 2501.00663) rather than the TPTT
+pretrained-adaptation recipe. Two changes from the consumer-GPU finetune
+recipe above: (a) the memory module is `nmm` not `delta_product` (paper's
+actual mechanism — the closed-form delta rule was TPTT's
+pretrained-adaptation workaround, not what the paper validated), and
+(b) training runs through `cli/train.py` rather than `cli/finetune.py`
+(no pretrained backbone load, no `--freeze-embeddings`, no gate ramp).
+
+### Tokenize the corpus once
+
+The paper uses FineWeb-Edu (the 760M model gets 30B tokens; the
+170M/340M/400M models get 15B tokens). At consumer-GPU scale we target
+~1.5B tokens; tokenize once to a uint16 binary so the multi-hour
+tokenize step isn't paid on every training restart:
+
+```bash
+uv run python -m scripts.tokenize_fineweb_edu \
+    --output corpora/fineweb_edu_1p5b.bin \
+    --max-tokens 1500000000
+```
+
+The script streams `HuggingFaceFW/fineweb-edu` `sample-10BT` from HF,
+tokenizes with GPT-2 BPE, and writes raw little-endian uint16 (~3 GB for
+1.5B tokens). Resumable — re-running picks up where the previous run
+stopped, modulo a few approximate document re-tokenizations.
+
+`cli/train.py` and `cli/finetune.py` both detect the `.bin` extension at
+load and memmap the file (`data.tokenizer.load_token_stream`); text
+inputs still flow through the legacy
+`read_eot_separated_documents → encode_corpus` path unchanged.
+
+### Training command (paper-strict NMM + MAG)
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python -m cli.train \
+    --size small \
+    --data corpora/fineweb_edu_1p5b.bin \
+    --chunk-size 1024 \
+    --batch-size 1 --grad-accum 16 \
+    --bptt-window 1 \
+    --nmm-block-size 64 \
+    --nmm-state-dtype bf16 \
+    --nmm-detach-state-between-blocks \
+    --nmm-use-gram-ns5 \
+    --max-steps 50000 \
+    --warmup-steps 2000 \
+    --log-every 100 \
+    --save-every 5000 \
+    --save-dir ckpts/titans_scratch/ \
+    --compile-model --optim8bit
+```
+
+`cli/train.py` hard-codes `finetune_mode=False` for from-scratch, which
+selects the paper's multiplicative MAG gate (`o = y_attn + SiLU(γ·y_mem)·y_attn`,
+γ init = 1) rather than the additive zero-init gate the finetune recipe
+uses. No `--freeze-embeddings`, no `--nmm-gate-ramp-*` flags — the
+memory pathway is active and load-bearing from step 0.
+
+### What each flag matches in the paper
+
+| Our flag | Paper (§5.1) | Notes |
+|---|---|---|
+| `nmm` (default `memory_type`) | Neural Memory Module | Paper's surprise-driven inner-loop gradient update |
+| `mag` (default `memory_topology`) | Memory-as-Gate | Paper's multiplicative-gate topology (Table 5 row +Attn (MAG)) |
+| `nmm_depth=2`, `nmm_expansion=4` | `L_M=2`, full-rank MemoryMLP | Deep memory — drops 11.4 NIAH points if replaced with linear |
+| `nmm_conv_kernel=4` | "1D depthwise-separable conv after Q/K/V" | §4.4; drops 6.4 NIAH points if removed |
+| `nmm_momentum_order=1`, `W_alpha` decay | momentum + weight decay | Each drops ~10 NIAH points if removed |
+| `nmm_n_persistent=4` | persistent memory | Drops 4.2 NIAH points if removed |
+| `nmm_n_heads=1` | single-head | Paper-strict |
+| `--bptt-window 1` | training length 4K, single-chunk forward | Paper uses no cross-chunk BPTT; the model extrapolates at inference |
+| `--chunk-size 1024` | training length 4K | **forced by GPT-2 wpe ceiling**; paper trains at 4K |
+| `--batch-size 1 --grad-accum 16` ≈ 16K tok/step | batch 0.5M tok/step | **forced by VRAM**; we're at ~1/32 of paper's batch |
+| LR 3e-4 (our default) | LR 4e-4 | Paper's 4e-4 is calibrated for 0.5M-tok batches; our default is safer at our batch size |
+| `--max-steps 50000` × 16K tok = 800M tok | 15B-30B tok | **forced by time budget**; we're at ~1/20-1/40 of paper's tokens |
+
+### What this experiment tests
+
+Whether the TITANS architecture acquires *any* cross-chunk retrieval
+signal at gpt2_small scale within a ~10-day NMM training budget. The
+paper's headline 92-98% NIAH accuracy came from 15B-30B tokens at
+170M-760M params; we're testing the lower bound. A clean positive result
+at d > 1024 (the chunk boundary) would replicate the paper's
+extrapolation claim at smaller scale; a negative result at ~800M tokens
+suggests the paper's numbers are more scale-dependent than the paper
+acknowledges.
+
 ## Resume flow gotchas
 
 - Architecture-affecting flags (`--size`, `--chunk-size`, `--nmm-*` that change
