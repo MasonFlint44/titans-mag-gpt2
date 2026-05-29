@@ -188,13 +188,14 @@ def _detach_per_layer(layer_state):
         return None
     if isinstance(layer_state, list):
         return [_detach_per_layer(s) for s in layer_state]
-    # DeltaProductMemory state is a 1-tuple (M,) where M is a tensor
-    # (not a dict). Detach the tensor directly. Tuple-length dispatch is
-    # the cheapest discriminator and keeps both memory backends behind
-    # the same polymorphic surface.
-    if len(layer_state) == 1:
-        (M,) = layer_state
-        return (M.detach(),)
+    # DeltaProductMemory state is a 2-tuple (M, k_buf_list) where M is
+    # a tensor and k_buf_list is a list of tensors (per-order CausalAvgPool
+    # context buffers). Distinguish from NMM by inspecting the first
+    # entry — NMM's M is a dict of named tensors, DeltaProduct's is a
+    # tensor.
+    if isinstance(layer_state[0], torch.Tensor):
+        M_t, k_buf_list = layer_state
+        return (M_t.detach(), [k.detach() for k in k_buf_list])
     M, S, conv_buf = layer_state
     M_det = {k: v.detach() for k, v in M.items()}
     if isinstance(S, (list, tuple)):

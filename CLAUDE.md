@@ -224,10 +224,31 @@ suggesting the surprise-driven update doesn't naturally produce
 retrievable key-value structure unless the backbone is co-evolved with
 it (paper-style from-scratch training). DeltaProduct's update rule
 forms key-value associations by construction (`M ← M + β·(v − M·k)·kᵀ`),
-which sidesteps that adaptation problem. The TPTT library / paper
-formalizes exactly this pattern as the production pretrained-adaptation
-recipe — same MAG-style integration, persistent prefix, and gating as
-the NMM, with the inner mechanism swapped.
+which sidesteps that adaptation problem. The TPTT paper formalizes
+exactly this pattern as the production pretrained-adaptation recipe.
+
+**Formulation:** our implementation follows TPTT's specific design
+choices verbatim (modulo our N-projection per-order vs TPTT's
+VirtualTokenExpander). From TPTT Section 3.1:
+
+- **Projections (eq. 4)**: `q_normed = L2_normalize(SiLU(q_raw))`,
+  `k_normed = L2_normalize(SiLU(k_raw))`, `v_scaled = v_raw / √head_dim`.
+  Q and K get SiLU + L2 normalize; V is just scaled by the standard
+  attention factor.
+- **β gating (eq. 5)**: `β = σ(CausalAvgPool3(k_raw))` — a vector per
+  head, per token, per dim. The pool is a fixed-weight kernel-3
+  causal moving average (NOT learnable; matches TPTT's
+  `CausalAvgPool1d` with `weights = [1/3, 1/3, 1/3]`). β is computed
+  from the RAW K projection (before SiLU+L2) so the gating depends
+  on the un-normalized signal.
+- **Per-token update with vector β**: `M ← M + (β⊙v − M·(β⊙k))·kᵀ`.
+  The K on the right is un-gated.
+- **Output (eq. 6)**: `y = RMSNorm(y_raw) · out_proj · out_scale`.
+  Manual RMSNorm (no learnable scale), Linear out_proj
+  (`Linear(n_embd, n_embd, bias=False)`), then per-channel `out_scale`
+  gain. The `out_scale` is our addition to preserve the gate-ramp
+  logic in `cli/train.py` and the finetune-mode "y = 0 at step 0"
+  invariant (TPTT relies on LoRA's near-zero init for the equivalent).
 
 ### Flags
 
@@ -255,10 +276,23 @@ selecting delta_product (saves you from a typo silently no-op'ing).
   speed path. Doc-boundary aware: splits the chunk at boundary positions
   and runs one WY solve per segment.
 
-State is a 1-tuple `(M,)` with `M ∈ R^(B, d_head, d_head)` per head —
-no momentum stack, no conv buffer. State serialization (`model/state_io.py`)
-recognizes `memory_type` in the fingerprint so a checkpoint from one
-mechanism can't silently load into the other.
+State is a 2-tuple `(M, k_buf_list)` where `M ∈ R^(B, n_heads, head_dim,
+head_dim)` and `k_buf_list` is a per-order list of `[B, 2, n_heads,
+head_dim]` buffers holding the last 2 raw K projections — threaded
+across `forward_chunk` calls so the CausalAvgPool sees continuous
+context (without this, splitting a stream into multiple chunks would
+produce different β at chunk heads than a single-shot forward). State
+serialization (`model/state_io.py`) recognizes `memory_type` in the
+fingerprint so a checkpoint from one mechanism can't silently load
+into the other.
+
+**Doc-boundary caveat**: the pool's 2-token memory leaks across doc
+boundaries within a chunk. A boundary correctly resets M, but β at the
+boundary head and the following 1 position still see the pre-boundary
+k_raw values via the pool's [t-2, t-1, t] window. For our use case
+(needle scenarios with ~100+ token contexts), the 2-position leak at
+boundary transitions is a small effect. The tradeoff is documented in
+`test_doc_boundaries_reset_M_to_zero`.
 
 ### Multi-head (`delta_n_heads > 1`)
 
@@ -276,11 +310,12 @@ per head is `head_dim × head_dim` — dramatically smaller state vs
 single-head `n_embd × n_embd`. Default 1 = simplest case, but the
 production recipe should match attention's head count.
 
-A `register_load_state_dict_pre_hook` migrates checkpoints saved when
-DeltaProduct was using per-head Linear submodules (pre-fusion: either
-`MultiHeadDeltaProduct` wrapping per-head `DeltaProductMemory`s, or a
-single-head `DeltaProductMemory` with Linear modules) — they load
-transparently into the stacked-parameter layout.
+**Checkpoint compatibility note**: the TPTT formulation is architecturally
+incompatible with prior DeltaProduct checkpoints (β was a learnable
+Linear in the old recipe; it's now derived from K via fixed
+CausalAvgPool). The legacy state-dict migration hook was removed —
+TPTT-recipe runs must train from pretrained-GPT-2 weights, not from
+an older DeltaProduct checkpoint.
 
 ### Compatibility with existing training-regime flags
 

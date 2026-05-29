@@ -253,7 +253,8 @@ class TitansMAGGPT2(nn.Module):
             # shape error inside the first block's NMM forward. Find the
             # first non-None layer state to check batch dim (with
             # nmm_layer_indices, some entries are None).
-            # Multi-head: each non-None entry is a list-of-states.
+            # Multi-head NMM: each non-None entry is a list-of-states.
+            # DeltaProduct: state[0] is a tensor [B, ...], not a dict.
             for first_layer in nmm_states:
                 if first_layer is None:
                     continue
@@ -261,10 +262,17 @@ class TitansMAGGPT2(nn.Module):
                     first_layer_M = first_layer[0][0]
                 else:
                     first_layer_M = first_layer[0]
-                any_W = next(iter(first_layer_M.values()))
-                if any_W.shape[0] != B:
+                if isinstance(first_layer_M, torch.Tensor):
+                    # DeltaProduct M is already a tensor with B as the
+                    # leading dim. No dict unwrapping needed.
+                    M_batch = first_layer_M.shape[0]
+                else:
+                    # NMM M is a dict of named tensors (one per recurrent
+                    # weight in MemoryMLP); any entry has B as the leading dim.
+                    M_batch = next(iter(first_layer_M.values())).shape[0]
+                if M_batch != B:
                     raise ValueError(
-                        f"initial_nmm_states batch dim {any_W.shape[0]} does not "
+                        f"initial_nmm_states batch dim {M_batch} does not "
                         f"match prompt batch dim {B}. The state's B must equal "
                         f"the prompt's leading dim; rebuild the state with "
                         f"nmm.init_state(B={B}, ...) or pass a prompt whose "
