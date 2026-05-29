@@ -25,7 +25,13 @@ TPTT-specific design (see TPTT Section 3.1 for the equations):
     Reshaped to virtual sequence: T·N writes per chunk.
 
   Per-token update with vector β (virtual sequence):
-    M ← M + (β⊙v − M·(β⊙k)) · kᵀ      — un-gated k on the right
+    M ← M + (β⊙v − M·(β⊙k)) · (β⊙k)ᵀ
+    The β-gated key appears on BOTH sides of the rank-1 update,
+    matching TPTT's recurrence (w · u_valᵀ outer product in
+    `modeling_tptt.py:1490`, where `w = inv_hh @ k_beta` is the
+    WY-transformed β⊙k). For scalar β this is equivalent to "β on the
+    read side only"; for vector β they differ, and TPTT's choice
+    is what we mirror.
 
   Read: at virtual position N·t + N−1 (last sub-step of real token t),
     using virtual_q at that position. The output for real token t is
@@ -438,7 +444,9 @@ class DeltaProductMemory(nn.Module):
                 v_beta = beta_i * v_i
                 Mk = torch.bmm(M_v, k_beta.unsqueeze(-1)).squeeze(-1)
                 err = v_beta - Mk
-                delta = torch.bmm(err.unsqueeze(-1), k_i.unsqueeze(-2))
+                # Rank-1 outer product with β-GATED k on the right
+                # (TPTT's `w · u_valᵀ` with `w = inv_hh @ k_beta`).
+                delta = torch.bmm(err.unsqueeze(-1), k_beta.unsqueeze(-2))
                 M_v = M_v + delta
 
             # Read at the last sub-step using virtual_q[t, n-1].
@@ -520,15 +528,25 @@ class DeltaProductMemory(nn.Module):
     ) -> tuple:
         """Core WY chunkwise solve with vector β over the virtual sequence.
 
-        Inputs are pre-expanded virtual tensors of shape [B, T, n, H, hd]
-        (or [B, T, n, H, 1] for β if we were using scalar β; here β is
-        vector so it's [B, T, n, H, hd]).
+        Inputs are pre-expanded virtual tensors of shape [B, T, n, H, hd].
 
         Returns (y_raw [B, T, H, hd], M_out [B, H, hd, hd]).
 
         The read at each real token t uses the virtual Q at the LAST
         sub-step `q_virt[:, t, n-1]`. M_out reflects all T·n virtual
         writes for the chunk.
+
+        TPTT-faithful recurrence — β-gated K appears on BOTH sides of
+        the rank-1 update (G's column side, M_out's right factor, the
+        read inner-product):
+            G[s, j]  = (β_s ⊙ k_s) · (β_j ⊙ k_j) = (K_β @ K_βᵀ)[s, j]
+            R[s]     = (β_s ⊙ v_s) − M_in · (β_s ⊙ k_s)
+            (I + G) U = R                          (unit-lower-tri solve)
+            M_out    = M_in + Uᵀ K_β               (β-gated K on right)
+            y[t]     = M_in q_t + Σ_{s ≤ (t+1)N − 1} (q_t · (β_s ⊙ k_s)) u_s
+
+        For scalar β this is equivalent to "β only on the read side";
+        for vector β the two formulations differ, and we mirror TPTT.
         """
         M_dtype = M_in.dtype
         B, T, n, H, hd = q_virt.shape
@@ -567,16 +585,19 @@ class DeltaProductMemory(nn.Module):
         mask_lt, I_TN, real_mask = _chunkwise_aux_tensors(
             K_v.device, T, n, M_dtype,
         )
-        G_full = torch.bmm(K_beta_v, K_v.transpose(-1, -2))
+        # Gram of β-gated keys on BOTH sides (TPTT recurrence).
+        G_full = torch.bmm(K_beta_v, K_beta_v.transpose(-1, -2))
         G = G_full * mask_lt
         LhS = I_TN.unsqueeze(0) + G
         U = torch.linalg.solve_triangular(
             LhS, R, upper=False, unitriangular=True,
         )
 
-        M_out_v = M_in_v + torch.bmm(U.transpose(-1, -2), K_v)
+        # M_out uses β-gated K on the right of the rank-1 outer product.
+        M_out_v = M_in_v + torch.bmm(U.transpose(-1, -2), K_beta_v)
 
-        QKt = torch.bmm(Q_v, K_v.transpose(-1, -2))  # [B*H, T, TN]
+        # Reads' inner-product is q_t · (β_s ⊙ k_s), so use K_β here too.
+        QKt = torch.bmm(Q_v, K_beta_v.transpose(-1, -2))  # [B*H, T, TN]
         A_rv = QKt * real_mask
         y_init = torch.bmm(Q_v, M_in_v.transpose(-1, -2))
         y_acc = torch.bmm(A_rv, U)
