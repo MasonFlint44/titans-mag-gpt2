@@ -204,6 +204,76 @@ uv run python -m cli.finetune \
   init; too low (`λ < 0.1`) won't meaningfully alter the optimization
   landscape.
 
+### Phased training (`--freeze-attention-steps N`)
+
+Targets a specific failure observed in the anti-marginal-output NMM
+finetune (commit history May 29): even when the marginal-output trap is
+broken by `--needle-contrastive-loss-weight`, the pretrained model
+satisfies the retrieval constraint via softmax attention rather than
+recruiting the memory pathway. The eval cleanly showed 95% accuracy at
+d=768 (within attention window) but 2.8% at d=1024+ (past attention
+window) — attention was doing all the work; y_mem was anti-aligned
+(cos = −0.088) with the correct answer.
+
+The mechanism: pretrained attention is already so competent at retrieval
+that the optimizer never has any pressure to develop the memory pathway.
+Phased training removes that pressure release: for the first N steps the
+attention q/k/v/proj projections are frozen (`requires_grad=False`), so
+the optimizer cannot tweak attention. The memory pathway + MLP +
+LayerNorms must absorb the gradient signal. At step N the freeze
+releases and normal training resumes.
+
+The hypothesis is that by the time attention unfreezes, the memory
+pathway has already learned to do retrieval (because contrastive loss
+forced *something* to satisfy the retrieval constraint and attention
+was off-limits), and that capability survives the transition. Whether
+it survives is the empirical open question.
+
+**Recipe usage:**
+
+```bash
+uv run python -m cli.finetune \
+    --size small --data corpora/needle_alnum20_d900/needle_train.txt \
+    --freeze-embeddings \
+    --nmm-gate-ramp-steps 100 --nmm-gate-ramp-target 0.1 \
+    --bptt-window 1 \
+    --needle-contrastive-loss-weight 0.5 \
+    --needle-contrastive-top-k 10 \
+    --freeze-attention-steps 500 \
+    --max-steps 1000 --warmup-steps 100 \
+    --nmm-block-size 64 --nmm-state-dtype bf16 \
+    --nmm-detach-state-between-blocks --nmm-use-gram-ns5 \
+    --compile-model --optim8bit
+```
+
+This is the consumer-GPU NMM finetune recipe plus alnum20 + contrastive
++ a 500-step attention freeze. Total 1000 steps splits as 500 phase 1
+(memory only) + 500 phase 2 (joint).
+
+**What gets frozen vs trained in phase 1:**
+
+| Component | Phase 1 (steps 0..N-1) | Phase 2 (steps N..end) |
+|---|---|---|
+| Attention q/k/v/proj | frozen (requires_grad=False) | trainable |
+| Attention LayerNorms (ln_1) | trainable | trainable |
+| MLP (c_fc, c_proj) | trainable | trainable |
+| MLP LayerNorm (ln_2) | trainable | trainable |
+| Memory pathway (NMM/DeltaProduct) | trainable | trainable |
+| Gate / out_scale | gate-ramp-controlled | trainable |
+| Embeddings (wte/wpe/ln_f) | frozen by `--freeze-embeddings` | frozen |
+
+**Important caveats:**
+
+- This is structurally different from `--freeze-backbone`, which froze
+  *everything* except the memory pathway and broke short-distance recall
+  in the earlier diagnostic. Here MLP and LayerNorms stay trainable, so
+  the model retains the ability to integrate residual-stream signals.
+- The optimizer (built before training starts) still has the attention
+  projections in its parameter groups; their AdamW moments simply don't
+  update while `requires_grad=False`. When the freeze releases, moments
+  initialize lazily on first gradient — there's no "cold start" for the
+  optimizer state.
+
 ### `--freeze-embeddings`
 
 Freezes only the input/output representation params: `wte`, `wpe`,

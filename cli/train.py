@@ -201,6 +201,40 @@ def collect_out_scale_params(model: nn.Module) -> list:
     return out
 
 
+def collect_attention_proj_params(model: nn.Module) -> list:
+    """Return every backbone-attention projection weight/bias parameter
+    (q/k/v/proj) across all NMM-bearing and plain transformer blocks.
+
+    Used by the `--freeze-attention-steps` phased-training recipe:
+    during phase 1 these params have `requires_grad=False` so the
+    optimizer can't tweak attention, forcing the memory pathway to
+    develop retrieval mechanically. At step N the freeze releases.
+
+    Handles both plain `nn.Linear` and `LoRALinear` wrapping: under
+    LoRA, the base `.linear.weight` is what we toggle (LoRA's adapter
+    matrices are independent and stay at whatever state the LoRA flags
+    configured)."""
+    from model import _unwrap
+    real_model = _unwrap(model)
+    out = []
+    for block in real_model.blocks:
+        attn = getattr(block, "attn", None)
+        if attn is None:
+            continue
+        for proj_name in ("q_proj", "k_proj", "v_proj", "proj"):
+            proj = getattr(attn, proj_name, None)
+            if proj is None:
+                continue
+            # LoRA wrap: the base Linear is at .linear. Otherwise the
+            # proj IS the Linear.
+            base = getattr(proj, "linear", proj)
+            if getattr(base, "weight", None) is not None:
+                out.append(base.weight)
+            if getattr(base, "bias", None) is not None:
+                out.append(base.bias)
+    return out
+
+
 def install_y_mem_capture(
     model: nn.Module, target_layer: int = -1,
 ) -> tuple[dict, callable]:
@@ -983,6 +1017,7 @@ def run_training(
     bptt_window: int = 1,
     needle_contrastive_loss_weight: float = 0.0,
     needle_contrastive_top_k: int = 10,
+    freeze_attention_steps: int = 0,
 ) -> None:
     """Top-level training loop covering both Phase 4.4 (fine-tune) and 4.5
     (from-scratch). One optimizer.step per accumulation cycle of `accum_steps`
@@ -1121,6 +1156,32 @@ def run_training(
         for p in out_scale_params:
             p.requires_grad = False
 
+    # Phased-training: optionally freeze backbone attention projections
+    # (q/k/v/proj) for the first `freeze_attention_steps` steps. With
+    # attention frozen, the optimizer can't satisfy the retrieval task
+    # by tweaking attention — it has to use the memory pathway. At step
+    # N the freeze releases and normal training resumes. Designed to
+    # mechanically force memory-pathway development in pretrained-
+    # backbone finetune runs where attention would otherwise dominate
+    # retrieval entirely. Memory + MLP + LayerNorms remain trainable
+    # throughout; only the attention projection linears are frozen.
+    attn_proj_params = (
+        collect_attention_proj_params(model)
+        if freeze_attention_steps > 0 else []
+    )
+    if attn_proj_params and rank == 0:
+        print(
+            f"[run_training] phase 1 attention freeze: "
+            f"{len(attn_proj_params)} attention projection params held "
+            f"frozen for the first {freeze_attention_steps} steps; "
+            f"memory pathway + MLP + LayerNorms train as usual. At step "
+            f"{freeze_attention_steps} attention unfreezes for phase 2.",
+            file=sys.stderr,
+        )
+    if attn_proj_params:
+        for p in attn_proj_params:
+            p.requires_grad = False
+
     # Auxiliary retrieval-loss setup. If the caller passed an aux_capture
     # dict (created via `install_y_mem_capture` BEFORE compile), and
     # aux_loss_weight > 0, each forward pass projects the captured
@@ -1164,6 +1225,21 @@ def run_training(
                             f"[run_training] gate ramp complete at step "
                             f"{step}; out_scale params released to optimizer."
                         )
+
+            # Phase 1 → Phase 2 transition: release the attention freeze
+            # exactly at `freeze_attention_steps`. From this point on
+            # attention can be tweaked by the optimizer normally; the
+            # memory pathway (which had to learn retrieval alone in
+            # phase 1) continues training in competition.
+            if attn_proj_params and step == freeze_attention_steps:
+                for p in attn_proj_params:
+                    p.requires_grad = True
+                if rank == 0:
+                    tqdm.write(
+                        f"[run_training] phase 1 complete at step {step}; "
+                        f"{len(attn_proj_params)} attention projection "
+                        f"params released to optimizer for phase 2."
+                    )
 
             cycle_ran_any_microbatch = False
             cycle_completed = True

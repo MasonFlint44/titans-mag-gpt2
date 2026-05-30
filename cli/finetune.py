@@ -235,6 +235,20 @@ def build_parser() -> argparse.ArgumentParser:
              "below correct. Default 10. Only used when "
              "--needle-contrastive-loss-weight > 0.",
     )
+    parser.add_argument(
+        "--freeze-attention-steps",
+        type=int,
+        default=0,
+        help="Phased training: freeze backbone attention's Q/K/V/O "
+             "projections for the first N optimizer steps, then unfreeze. "
+             "During phase 1 the optimizer can't tweak attention, so the "
+             "memory pathway + MLP + LayerNorms must absorb the gradient "
+             "signal — mechanically forces memory-pathway development in "
+             "pretrained-backbone finetune runs where attention would "
+             "otherwise dominate retrieval. Default 0 (disabled). For our "
+             "1000-step needle recipe a good starting value is N=500 "
+             "(half memory-only, half joint).",
+    )
     from cli.nmm_cli import add_nmm_args
     add_nmm_args(parser)
     return parser
@@ -400,6 +414,7 @@ def main():
         bptt_window=args.bptt_window,
         needle_contrastive_loss_weight=args.needle_contrastive_loss_weight,
         needle_contrastive_top_k=args.needle_contrastive_top_k,
+        freeze_attention_steps=args.freeze_attention_steps,
     )
 
 
