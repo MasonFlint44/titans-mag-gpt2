@@ -838,12 +838,6 @@ class TitansLizaBlock(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        if config.memory_type != "delta_product":
-            raise ValueError(
-                f"TitansLizaBlock requires memory_type='delta_product' "
-                f"(got {config.memory_type!r}); LiZA is TPTT's "
-                f"DeltaProduct-specific topology."
-            )
         if config.nmm_n_persistent != 0:
             raise ValueError(
                 f"TitansLizaBlock requires nmm_n_persistent=0 (got "
@@ -856,7 +850,7 @@ class TitansLizaBlock(nn.Module):
         self.finetune_mode = config.finetune_mode
         self.use_swa = config.use_swa
         self.swa_window = config.swa_window
-        self.memory_type = "delta_product"
+        self.memory_type = config.memory_type
 
         # Shared pre-norm for both attention paths.
         self.ln_1 = nn.LayerNorm(config.n_embd)
@@ -869,16 +863,54 @@ class TitansLizaBlock(nn.Module):
             lora_dropout=config.lora_dropout,
         )
 
-        # DeltaProduct linear-attention path. Name is `nmm` (not
-        # `linear_attn`) for polymorphism with TitansMAGBlock —
-        # `model.forward` iterates `block.nmm` to thread state.
-        self.nmm = DeltaProductMemory(
-            n_embd=config.n_embd,
-            n_heads=config.delta_n_heads,
-            order=config.delta_order,
-            finetune_mode=config.finetune_mode,
-            block_size=config.delta_block_size,
-        )
+        # Linear-attention / memory path. Name is `nmm` (not `linear_attn`)
+        # for polymorphism with TitansMAGBlock — `model.forward` iterates
+        # `block.nmm` to thread state. LiZA's combination math (additive
+        # MaG) only requires the memory module to produce a
+        # `[B, T, n_embd]` output via `forward_chunk(x, state,
+        # doc_boundaries)`; both DeltaProductMemory and the paper-strict
+        # NMM satisfy that contract.
+        if config.memory_type == "delta_product":
+            self.nmm = DeltaProductMemory(
+                n_embd=config.n_embd,
+                n_heads=config.delta_n_heads,
+                order=config.delta_order,
+                finetune_mode=config.finetune_mode,
+                block_size=config.delta_block_size,
+            )
+        else:
+            # NMM paper-strict path. The persistent-prefix handling that
+            # TitansMAGBlock owns at the block level is irrelevant here
+            # because LiZA forces nmm_n_persistent=0; we feed real-token
+            # input straight in.
+            nmm_kwargs = dict(
+                n_embd=config.n_embd,
+                expansion=config.nmm_expansion,
+                kernel_size=config.nmm_conv_kernel,
+                spectral_norm=config.nmm_spectral_norm,
+                finetune_mode=config.finetune_mode,
+                retrieval_from_M_prev=config.retrieval_from_M_prev,
+                state_dtype=config.nmm_state_dtype,
+                low_rank=config.nmm_low_rank,
+                softclamp_max=config.nmm_softclamp_max,
+                block_size=config.nmm_block_size,
+                per_token_ns5=config.nmm_per_token_ns5,
+                detach_state_between_blocks=config.nmm_detach_state_between_blocks,
+                lookahead_value=config.nmm_lookahead_value,
+                per_param_lr_modulation=config.nmm_per_param_lr_modulation,
+                momentum_order=config.nmm_momentum_order,
+                ns5_steps=config.nmm_ns5_steps,
+                use_gram_ns5=config.nmm_use_gram_ns5,
+                use_cans=config.nmm_use_cans,
+            )
+            if config.nmm_n_heads > 1:
+                self.nmm = MultiHeadNMM(
+                    n_heads=config.nmm_n_heads,
+                    per_head_learned_params=config.nmm_per_head_learned_params,
+                    **nmm_kwargs,
+                )
+            else:
+                self.nmm = NeuralMemoryModule(**nmm_kwargs)
 
         # MaG combiner. Zero-init under finetune_mode so the block
         # reproduces standard softmax attention at step 0.

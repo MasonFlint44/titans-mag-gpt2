@@ -582,13 +582,15 @@ class TitansConfig:
                 f"TPTT's parallel topology (memory runs alongside attention, "
                 f"outputs combined via MaG)."
             )
-        if self.memory_topology == "liza" and self.memory_type != "delta_product":
-            raise ValueError(
-                f"memory_topology='liza' requires memory_type='delta_product' "
-                f"(got memory_type={self.memory_type!r}). LiZA is TPTT's "
-                f"DeltaProduct-specific parallel-attention topology; the NMM "
-                f"has no equivalent."
-            )
+        # LiZA was originally authored as TPTT's DeltaProduct-specific
+        # parallel-attention topology — but mechanically the block only
+        # requires a memory module exposing `forward_chunk(x, state,
+        # doc_boundaries) -> (y, new_state)` with output shape
+        # `[B, T, n_embd]`. Both DeltaProduct and NMM satisfy that
+        # contract, so the historical block-class assertion that
+        # rejected NMM was over-defensive. The combination is allowed
+        # here; correctness of the NMM + LiZA forward is verified by
+        # `tests/unit/test_liza_block.py::test_liza_block_supports_nmm_*`.
         if self.memory_topology == "liza" and self.nmm_n_persistent != 0:
             # TPTT's LiZA topology has no persistent prefix. Silently
             # override (rather than erroring) so the user only has to set

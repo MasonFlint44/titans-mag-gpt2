@@ -86,14 +86,84 @@ def test_liza_config_auto_overrides_nmm_n_persistent_to_zero():
     assert cfg.nmm_n_persistent == 0
 
 
-def test_liza_config_rejects_nmm_memory_type():
-    """LiZA is DeltaProduct-specific; the NMM has no equivalent."""
-    with pytest.raises(ValueError, match="LiZA"):
-        TitansConfig(
-            n_layer=2, n_head=4, n_embd=16,
-            memory_type="nmm", memory_topology="liza",
-            chunk_size=64, block_size=64,
-        )
+def test_liza_block_supports_nmm_memory_type():
+    """LiZA was originally authored as TPTT's DeltaProduct-specific
+    topology, but the block's combination math (additive MaG of
+    `y_attn + gate · y_lin`) only requires the memory module to produce
+    a `[B, T, n_embd]` output via `forward_chunk(...)`. NMM satisfies
+    that contract, so the combination is allowed. This is the data-side
+    half of the anti-marginal-output experiment recipe — we keep NMM's
+    surprise-driven inner-loop update but lose MAG's multiplicative
+    bottleneck that gates memory's contribution by attention's output."""
+    cfg = TitansConfig(
+        n_layer=2, n_head=4, n_embd=16,
+        memory_type="nmm", memory_topology="liza",
+        nmm_n_persistent=4,  # nonzero — should be auto-overridden to 0
+        nmm_expansion=2,
+        chunk_size=64, block_size=64,
+        finetune_mode=True,
+    )
+    # `__post_init__` should silently zero `nmm_n_persistent` for LiZA,
+    # matching the existing TPTT-style auto-override behavior.
+    assert cfg.nmm_n_persistent == 0
+
+
+def test_liza_block_supports_nmm_construction_and_forward():
+    """End-to-end: building a LiZA block with NMM memory must produce a
+    finite, correctly-shaped forward output. Defends against any latent
+    coupling between LiZA's path and DeltaProduct's specific API
+    surface (e.g., expecting `init_state()` to return a 3-tuple)."""
+    import torch
+    from model.titans_gpt2 import TitansMAGGPT2
+    cfg = TitansConfig(
+        n_layer=2, n_head=4, n_embd=16, vocab_size=32,
+        memory_type="nmm", memory_topology="liza",
+        nmm_expansion=2,
+        chunk_size=64, block_size=64,
+        finetune_mode=True,
+    )
+    model = TitansMAGGPT2(cfg)
+    idx = torch.randint(0, 32, (1, 8))
+    out, _ = model(idx)
+    assert out.shape == (1, 8, 32)
+    assert torch.isfinite(out).all()
+
+
+def test_liza_block_nmm_backward_propagates():
+    """Gradient through the LiZA + NMM stack must reach the NMM's own
+    learnable parameters (W1/W2/W_gate, W_alpha, W_eta, W_theta, conv
+    weights). Without backward, training does nothing — defends against
+    an accidental detach somewhere in the LiZA combination math.
+
+    We use `finetune_mode=False` here so the MaG gate starts non-zero
+    (the gate is zero-init under finetune_mode, which intentionally
+    drops y_mem's contribution to zero at step 0 to preserve HF GPT-2
+    behavior; that path is tested separately). With a non-zero gate,
+    y_mem's contribution to the residual is non-zero from step 0 and
+    gradients flow into the NMM as expected.
+    """
+    import torch
+    from model.titans_gpt2 import TitansMAGGPT2
+    cfg = TitansConfig(
+        n_layer=2, n_head=4, n_embd=16, vocab_size=32,
+        memory_type="nmm", memory_topology="liza",
+        nmm_expansion=2,
+        chunk_size=64, block_size=64,
+        finetune_mode=False,
+    )
+    model = TitansMAGGPT2(cfg)
+    idx = torch.randint(0, 32, (1, 8))
+    out, _ = model(idx)
+    out.sum().backward()
+    has_grad = False
+    for n, p in model.named_parameters():
+        if "nmm" in n and p.grad is not None and p.grad.abs().sum() > 0:
+            has_grad = True
+            break
+    assert has_grad, (
+        "No NMM parameter received a non-zero gradient — backward isn't "
+        "reaching the memory pathway"
+    )
 
 
 def test_liza_block_construction_with_valid_config():
